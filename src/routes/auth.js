@@ -1,327 +1,336 @@
-const express = require("express");
-const bcrypt = require("bcryptjs");
-const jwt = require("jsonwebtoken");
-const User = require("../models/User.js");
-const { authMiddleware } = require("../middleware/authMiddleware.js");
-const { transporter } = require("../config/email.js");
+const express = require('express');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const { User, OTP } = require('../models/User');
+const { transporter } = require('../config/email');
 const crypto = require('crypto');
 
 const router = express.Router();
 
-// In-memory store for OTPs (use database in production)
-const otpStore = {};
-
-// Generate OTP
+// Helper function to generate OTP
 const generateOTP = () => {
   return Math.floor(100000 + Math.random() * 900000).toString();
 };
 
-// Send OTP to email
-router.post("/send-otp", async (req, res) => {
+// Helper function to send OTP email
+const sendOTPEmail = async (email, otp, type = 'registration') => {
+  const subject = type === 'registration' ? 'Email Verification OTP' : 'Password Reset OTP';
+  const message = type === 'registration'
+    ? `Your OTP for email verification is: ${otp}. This OTP will expire in 10 minutes.`
+    : `Your OTP for password reset is: ${otp}. This OTP will expire in 10 minutes.`;
+
+  const mailOptions = {
+    from: process.env.EMAIL_USER,
+    to: email,
+    subject: subject,
+    text: message,
+    html: `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+        <h2 style="color: #333;">${subject}</h2>
+        <p>Your OTP is:</p>
+        <div style="background-color: #f0f0f0; padding: 20px; text-align: center; font-size: 24px; font-weight: bold; letter-spacing: 5px; margin: 20px 0;">
+          ${otp}
+        </div>
+        <p style="color: #666;">This OTP will expire in 10 minutes.</p>
+        <p style="color: #666;">If you didn't request this, please ignore this email.</p>
+      </div>
+    `
+  };
+
+  await transporter.sendMail(mailOptions);
+};
+
+// Send OTP for registration
+router.post('/send-otp', async (req, res) => {
   try {
     const { email } = req.body;
-    
+
+    if (!email) {
+      return res.status(400).json({ message: 'Email is required' });
+    }
+
     // Check if user already exists
     const existingUser = await User.findOne({ email });
     if (existingUser) {
-      return res.status(400).json({ message: "User already exists" });
+      return res.status(400).json({ message: 'User already exists with this email' });
     }
 
+    // Generate OTP
     const otp = generateOTP();
-    const expires = Date.now() + 5 * 60 * 1000; // 5 minutes
 
-    otpStore[email] = { otp, expires };
+    // Delete any existing OTPs for this email
+    await OTP.deleteMany({ email, type: 'registration' });
 
-    // Send email if configured
-    if (process.env.EMAIL_USER && process.env.EMAIL_USER !== 'your-gmail@gmail.com') {
-      const mailOptions = {
-        from: process.env.EMAIL_USER,
-        to: email,
-        subject: 'MediQ - Email Verification Code',
-        text: `Your verification code is: ${otp}\n\nThis code will expire in 5 minutes.\n\nIf you didn't request this registration, please ignore this email.`,
-        html: `
-          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; background-color: #f8f9fa; padding: 20px;">
-            <div style="background-color: white; border-radius: 10px; padding: 30px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
-              <!-- Header -->
-              <div style="text-align: center; margin-bottom: 30px;">
-                <div style="display: inline-block; background-color: #000; color: white; padding: 15px 25px; border-radius: 8px; font-size: 24px; font-weight: bold;">
-                  MediQ
-                </div>
-              </div>
-              
-              <!-- Title -->
-              <h1 style="color: #333; text-align: center; margin-bottom: 20px; font-size: 24px;">
-                Email Verification
-              </h1>
-              
-              <!-- Content -->
-              <p style="color: #666; line-height: 1.6; margin-bottom: 25px;">
-                Thank you for registering with MediQ! To complete your registration, please use the verification code below.
-              </p>
-              
-              <!-- OTP Code -->
-              <div style="text-align: center; margin: 30px 0;">
-                <div style="background-color: #f8f9fa; padding: 25px; border-radius: 8px; border: 2px dashed #ddd;">
-                  <p style="color: #666; margin-bottom: 15px; font-size: 14px;">Your verification code:</p>
-                  <div style="font-size: 32px; font-weight: bold; color: #000; letter-spacing: 8px; font-family: 'Courier New', monospace;">
-                    ${otp}
-                  </div>
-                </div>
-              </div>
-              
-              <!-- Instructions -->
-              <div style="background-color: #e8f4fd; padding: 20px; border-radius: 8px; margin: 25px 0; border-left: 4px solid #007bff;">
-                <h3 style="color: #333; margin-bottom: 10px; font-size: 16px;">📋 Instructions</h3>
-                <ol style="color: #666; margin: 0; padding-left: 20px; line-height: 1.6;">
-                  <li>Return to the MediQ registration page</li>
-                  <li>Enter the verification code above</li>
-                  <li>Complete your registration</li>
-                </ol>
-              </div>
-              
-              <!-- Security Notice -->
-              <div style="background-color: #fff3cd; padding: 20px; border-radius: 8px; margin: 25px 0; border-left: 4px solid #ffc107;">
-                <h3 style="color: #333; margin-bottom: 10px; font-size: 16px;">⚠️ Important</h3>
-                <ul style="color: #666; margin: 0; padding-left: 20px; line-height: 1.6;">
-                  <li>This code will expire in <strong>5 minutes</strong></li>
-                  <li>Do not share this code with anyone</li>
-                  <li>If you didn't request this, please ignore this email</li>
-                </ul>
-              </div>
-              
-              <!-- Footer -->
-              <div style="text-align: center; margin-top: 30px; padding-top: 20px; border-top: 1px solid #eee;">
-                <p style="color: #999; font-size: 12px; margin-bottom: 10px;">
-                  This is an automated message from MediQ. Please do not reply to this email.
-                </p>
-                <p style="color: #999; font-size: 12px;">
-                  © 2024 MediQ. All rights reserved.
-                </p>
-              </div>
-            </div>
-          </div>
-        `
-      };
-
-      await transporter.sendMail(mailOptions);
-      console.log(`✅ OTP sent successfully to ${email}`);
-    }
-    
-    res.json({ message: "OTP sent to email successfully" });
-  } catch (err) {
-    console.error('Email sending error:', err.message);
-    res.status(500).json({ 
-      message: "Failed to send OTP"
+    // Save new OTP
+    const otpDoc = new OTP({
+      email,
+      otp,
+      type: 'registration'
     });
+    await otpDoc.save();
+
+    // Send OTP email
+    await sendOTPEmail(email, otp, 'registration');
+
+    res.json({ message: 'OTP sent successfully to your email' });
+  } catch (error) {
+    console.error('Send OTP error:', error);
+    res.status(500).json({ message: 'Failed to send OTP. Please try again.' });
   }
 });
 
 // Register with OTP verification
-router.post("/register", async (req, res) => {
+router.post('/register', async (req, res) => {
   try {
     const { name, email, password, phone, dob, gender, otp } = req.body;
-    
-    // Check if user already exists
+
+    // Validate required fields
+    if (!name || !email || !password || !otp) {
+      return res.status(400).json({ message: 'Name, email, password, and OTP are required' });
+    }
+
+    // Check if user exists
     const existingUser = await User.findOne({ email });
     if (existingUser) {
-      return res.status(400).json({ message: "User already exists" });
+      return res.status(400).json({ message: 'User already exists' });
     }
 
     // Verify OTP
-    const otpRecord = otpStore[email];
-    if (!otpRecord || otpRecord.otp !== otp || Date.now() > otpRecord.expires) {
-      return res.status(400).json({ message: "Invalid or expired OTP" });
+    const otpDoc = await OTP.findOne({
+      email,
+      otp,
+      type: 'registration',
+      expiresAt: { $gt: new Date() }
+    });
+
+    if (!otpDoc) {
+      return res.status(400).json({ message: 'Invalid or expired OTP' });
     }
 
     // Hash password
-    const hashedPassword = await bcrypt.hash(password, 10);
-    
-    // Create new user
+    const hashedPassword = await bcrypt.hash(password, 12);
+
+    // Create user
     const user = new User({
       name,
       email,
       password: hashedPassword,
-      phone,
-      dob,
-      gender,
+      phone: phone || '',
+      dob: dob ? new Date(dob) : undefined,
+      gender: gender || '',
+      isVerified: true // User is verified since they provided valid OTP
     });
-    
+
     await user.save();
-    
-    // Remove OTP after successful registration
-    delete otpStore[email];
-    
-    res.status(201).json({ message: "User registered successfully" });
-  } catch (err) {
-    res.status(500).json({ message: "Server error" });
+
+    // Delete the used OTP
+    await OTP.deleteOne({ _id: otpDoc._id });
+
+    // Create token
+    const token = jwt.sign({ userId: user._id }, 'your_jwt_secret', { expiresIn: '1d' });
+
+    res.status(201).json({
+      token,
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        phone: user.phone,
+        dob: user.dob,
+        gender: user.gender
+      },
+      message: 'User created successfully'
+    });
+  } catch (error) {
+    console.error('Register error:', error);
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
 // Login
-router.post("/login", async (req, res) => {
+router.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body;
+    
+    console.log('Login attempt for:', email);
+    
+    // Find user
     const user = await User.findOne({ email });
-    if (!user) return res.status(400).json({ message: "Invalid credentials" });
-
+    if (!user) {
+      console.log('User not found');
+      return res.status(400).json({ message: 'Invalid credentials' });
+    }
+    
+    // Check password
     const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) return res.status(400).json({ message: "Invalid credentials" });
-
-    const token = jwt.sign({ userId: user._id }, "your_jwt_secret", { expiresIn: "1d" });
-
-    // Exclude password from user object
-    const { password: _, ...userData } = user.toObject();
-
+    if (!isMatch) {
+      console.log('Password mismatch');
+      return res.status(400).json({ message: 'Invalid credentials' });
+    }
+    
+    // Create token
+    const token = jwt.sign({ userId: user._id }, 'your_jwt_secret', { expiresIn: '1d' });
+    
+    console.log('Login successful');
     res.json({
       token,
-      user: userData,
-      message: "Login successful"
+      user: { id: user._id, name: user.name, email: user.email },
+      message: 'Login successful'
     });
-  } catch (err) {
-    res.status(500).json({ message: "Server error" });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
-// Forgot Password
+// Clerk user synchronization
+router.post('/clerk-sync', async (req, res) => {
+  try {
+    const { clerkId, email, name, phone, profileImage } = req.body;
+    
+    if (!clerkId || !email) {
+      return res.status(400).json({ message: 'Clerk ID and email are required' });
+    }
+    
+    // Check if user already exists by Clerk ID or email
+    let user = await User.findOne({ 
+      $or: [
+        { clerkId: clerkId },
+        { email: email }
+      ]
+    });
+    
+    if (user) {
+      // Update existing user with Clerk data
+      user.clerkId = clerkId;
+      user.name = name || user.name;
+      user.phone = phone || user.phone;
+      user.profileImage = profileImage || user.profileImage;
+      user.isVerified = true; // Clerk users are pre-verified
+      user.authProvider = 'clerk';
+      
+      await user.save();
+    } else {
+      // Create new user from Clerk data
+      user = new User({
+        clerkId,
+        email,
+        name: name || 'User',
+        phone: phone || '',
+        profileImage: profileImage || '',
+        isVerified: true,
+        authProvider: 'clerk',
+        // No password needed for Clerk users
+        password: null
+      });
+      
+      await user.save();
+    }
+    
+    // Create JWT token for your backend
+    const token = jwt.sign({ userId: user._id }, 'your_jwt_secret', { expiresIn: '1d' });
+    
+    res.json({
+      token,
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        phone: user.phone,
+        profileImage: user.profileImage,
+        clerkId: user.clerkId
+      },
+      message: 'User synchronized successfully'
+    });
+    
+  } catch (error) {
+    console.error('Clerk sync error:', error);
+    res.status(500).json({ message: 'Server error during synchronization' });
+  }
+});
+
+// Forgot Password - Send OTP
 router.post('/forgot-password', async (req, res) => {
-  const { email } = req.body;
-  const user = await User.findOne({ email });
-  if (!user) return res.status(400).json({ message: 'No user with that email' });
+  try {
+    const { email } = req.body;
 
-  const token = crypto.randomBytes(32).toString('hex');
-  user.resetPasswordToken = token;
-  user.resetPasswordExpires = Date.now() + 30 * 60 * 1000; // 30 minutes
-  await user.save();
+    if (!email) {
+      return res.status(400).json({ message: 'Email is required' });
+    }
 
-      // Send email
-    const resetLink = `http://localhost:5173/reset-password/${token}`;
-    await transporter.sendMail({
-      to: user.email,
-      from: process.env.EMAIL_USER,
-      subject: 'MediQ - Password Reset Request',
-      html: `
-        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; background-color: #f8f9fa; padding: 20px;">
-          <div style="background-color: white; border-radius: 10px; padding: 30px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
-            <!-- Header -->
-            <div style="text-align: center; margin-bottom: 30px;">
-              <div style="display: inline-block; background-color: #000; color: white; padding: 15px 25px; border-radius: 8px; font-size: 24px; font-weight: bold;">
-                MediQ
-              </div>
-            </div>
-            
-            <!-- Title -->
-            <h1 style="color: #333; text-align: center; margin-bottom: 20px; font-size: 24px;">
-              Password Reset Request
-            </h1>
-            
-            <!-- Content -->
-            <p style="color: #666; line-height: 1.6; margin-bottom: 25px;">
-              Hello ${user.name || 'there'},
-            </p>
-            
-            <p style="color: #666; line-height: 1.6; margin-bottom: 25px;">
-              We received a request to reset your password for your MediQ account. If you didn't make this request, you can safely ignore this email.
-            </p>
-            
-            <!-- Button -->
-            <div style="text-align: center; margin: 30px 0;">
-              <a href="${resetLink}" style="background-color: #000; color: white; padding: 15px 30px; text-decoration: none; border-radius: 8px; font-weight: bold; display: inline-block;">
-                Reset Password
-              </a>
-            </div>
-            
-            <!-- Alternative Link -->
-            <p style="color: #666; line-height: 1.6; margin-bottom: 25px; font-size: 14px;">
-              If the button doesn't work, copy and paste this link into your browser:
-            </p>
-            <p style="color: #007bff; word-break: break-all; font-size: 14px; margin-bottom: 25px;">
-              ${resetLink}
-            </p>
-            
-            <!-- Security Notice -->
-            <div style="background-color: #f8f9fa; padding: 20px; border-radius: 8px; margin: 25px 0;">
-              <h3 style="color: #333; margin-bottom: 10px; font-size: 16px;">🔒 Security Notice</h3>
-              <ul style="color: #666; margin: 0; padding-left: 20px; line-height: 1.6;">
-                <li>This link will expire in <strong>30 minutes</strong></li>
-                <li>This link can only be used <strong>once</strong></li>
-                <li>If you didn't request this, please ignore this email</li>
-              </ul>
-            </div>
-            
-            <!-- Footer -->
-            <div style="text-align: center; margin-top: 30px; padding-top: 20px; border-top: 1px solid #eee;">
-              <p style="color: #999; font-size: 12px; margin-bottom: 10px;">
-                This is an automated message from MediQ. Please do not reply to this email.
-              </p>
-              <p style="color: #999; font-size: 12px;">
-                © 2024 MediQ. All rights reserved.
-              </p>
-            </div>
-          </div>
-        </div>
-      `
+    // Check if user exists
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.status(400).json({ message: 'No user found with this email address' });
+    }
+
+    // Generate OTP
+    const otp = generateOTP();
+
+    // Delete any existing password reset OTPs for this email
+    await OTP.deleteMany({ email, type: 'password_reset' });
+
+    // Save new OTP
+    const otpDoc = new OTP({
+      email,
+      otp,
+      type: 'password_reset'
+    });
+    await otpDoc.save();
+
+    // Send OTP email
+    await sendOTPEmail(email, otp, 'password_reset');
+
+    res.json({ message: 'Password reset OTP sent to your email' });
+  } catch (error) {
+    console.error('Forgot password error:', error);
+    res.status(500).json({ message: 'Failed to send password reset OTP. Please try again.' });
+  }
+});
+
+// Reset Password with OTP
+router.post('/reset-password', async (req, res) => {
+  try {
+    const { email, otp, password } = req.body;
+
+    if (!email || !otp || !password) {
+      return res.status(400).json({ message: 'Email, OTP, and new password are required' });
+    }
+
+    // Verify OTP
+    const otpDoc = await OTP.findOne({
+      email,
+      otp,
+      type: 'password_reset',
+      expiresAt: { $gt: new Date() }
     });
 
-  res.json({ message: 'Password reset link sent to your email' });
-});
-
-// Reset Password
-router.post('/reset-password', async (req, res) => {
-  const { token, password } = req.body;
-  const user = await User.findOne({
-    resetPasswordToken: token,
-    resetPasswordExpires: { $gt: Date.now() }
-  });
-  if (!user) return res.status(400).json({ message: 'Invalid or expired token' });
-
-  user.password = await bcrypt.hash(password, 10);
-  user.resetPasswordToken = undefined;
-  user.resetPasswordExpires = undefined;
-  await user.save();
-
-  res.json({ message: 'Password reset successful' });
-});
-
-// Get user profile (protected route)
-router.get("/profile", authMiddleware, async (req, res) => {
-  try {
-    const user = await User.findById(req.user.userId).select('-password');
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
-    res.json(user);
-  } catch (err) {
-    res.status(500).json({ message: "Server error" });
-  }
-});
-
-// Update user profile (protected route)
-router.put("/profile", authMiddleware, async (req, res) => {
-  try {
-    const { name, phone, dob, gender, address, emergencyContact } = req.body;
-    
-    const user = await User.findById(req.user.userId);
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
+    if (!otpDoc) {
+      return res.status(400).json({ message: 'Invalid or expired OTP' });
     }
 
-    // Update fields
-    if (name) user.name = name;
-    if (phone) user.phone = phone;
-    if (dob) user.dob = dob;
-    if (gender) user.gender = gender;
-    if (address) user.address = address;
-    if (emergencyContact) user.emergencyContact = emergencyContact;
+    // Find user
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.status(400).json({ message: 'User not found' });
+    }
 
+    // Hash new password
+    const hashedPassword = await bcrypt.hash(password, 12);
+
+    // Update user password
+    user.password = hashedPassword;
     await user.save();
-    
-    const userResponse = user.toObject();
-    delete userResponse.password;
-    
-    res.json({ message: "Profile updated successfully", user: userResponse });
-  } catch (err) {
-    res.status(500).json({ message: "Server error" });
+
+    // Delete the used OTP
+    await OTP.deleteOne({ _id: otpDoc._id });
+
+    res.json({ message: 'Password reset successfully' });
+  } catch (error) {
+    console.error('Reset password error:', error);
+    res.status(500).json({ message: 'Failed to reset password. Please try again.' });
   }
 });
 
-module.exports = router; 
+module.exports = router;
+
