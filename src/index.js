@@ -1,7 +1,6 @@
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
-const seedData = require("./src/seedData");
 
 const app = express();
 const PORT = 5001;
@@ -30,31 +29,20 @@ mongoose.connect("mongodb+srv://alkasony2026:alka2003@cluster0.fl4gy.mongodb.net
 
 // Import routes
 console.log("Loading auth routes...");
-const authRoutes = require("./src/routes/auth.js");
+const authRoutes = require("./routes/auth.js");
 console.log("Auth routes loaded, registering...");
 app.use("/api/auth", authRoutes);
 console.log("Auth routes registered successfully");
 
 console.log("Loading admin routes...");
-const adminRoutes = require("./src/routes/admin.js");
+const adminRoutes = require("./routes/admin.js");
 console.log("Admin routes loaded, registering...");
 app.use("/api/admin", adminRoutes);
 console.log("Admin routes registered successfully");
 
-console.log("Loading booking routes...");
-const bookingRoutes = require("./src/routes/booking.js");
-console.log("Booking routes loaded, registering...");
-app.use("/api/booking", bookingRoutes);
-console.log("Booking routes registered successfully");
-
 // Start server
-app.listen(PORT, async () => {
+app.listen(PORT, () => {
     console.log(`Server running at http://localhost:${PORT}`);
-
-    // Seed sample data (only run once or when needed)
-    if (process.env.SEED_DATA === 'true') {
-        await seedData();
-    }
-});
+}); 
 
 

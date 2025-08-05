@@ -14,61 +14,25 @@ const generateOTP = () => {
 
 // Helper function to send OTP email
 const sendOTPEmail = async (email, otp, type = 'registration') => {
-  const subject = type === 'registration' ? 'Verify Your Email Address' : 'Password Reset Verification';
+  const subject = type === 'registration' ? 'Email Verification OTP' : 'Password Reset OTP';
   const message = type === 'registration'
-    ? `Dear User,\n\nThank you for registering with our healthcare platform. To complete your account setup, please use the verification code below:\n\nVerification Code: ${otp}\n\nThis code will expire in 10 minutes for security purposes.\n\nIf you did not create this account, please disregard this email.\n\nBest regards,\nHealthcare Team`
-    : `Dear User,\n\nWe received a request to reset your password. Please use the verification code below to proceed:\n\nVerification Code: ${otp}\n\nThis code will expire in 10 minutes for security purposes.\n\nIf you did not request this password reset, please ignore this email and your password will remain unchanged.\n\nBest regards,\nHealthcare Team`;
+    ? `Your OTP for email verification is: ${otp}. This OTP will expire in 10 minutes.`
+    : `Your OTP for password reset is: ${otp}. This OTP will expire in 10 minutes.`;
 
   const mailOptions = {
-    from: `"Healthcare Platform" <${process.env.EMAIL_USER}>`,
+    from: process.env.EMAIL_USER,
     to: email,
     subject: subject,
     text: message,
     html: `
-      <div style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 600px; margin: 0 auto; background-color: #f8f9fa; padding: 20px;">
-        <div style="background-color: white; padding: 40px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
-          <div style="text-align: center; margin-bottom: 30px;">
-            <h1 style="color: #2c3e50; margin: 0; font-size: 24px;">${subject}</h1>
-          </div>
-          
-          <div style="margin-bottom: 30px;">
-            <p style="color: #34495e; font-size: 16px; line-height: 1.6; margin-bottom: 20px;">
-              Dear User,
-            </p>
-            <p style="color: #34495e; font-size: 16px; line-height: 1.6; margin-bottom: 20px;">
-              ${type === 'registration' 
-                ? 'Thank you for registering with our healthcare platform. To complete your account setup, please use the verification code below:'
-                : 'We received a request to reset your password. Please use the verification code below to proceed:'
-              }
-            </p>
-          </div>
-
-          <div style="background-color: #ecf0f1; padding: 25px; text-align: center; border-radius: 6px; margin: 30px 0;">
-            <p style="color: #2c3e50; font-size: 14px; margin-bottom: 10px; font-weight: 600;">VERIFICATION CODE</p>
-            <div style="font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #27ae60; font-family: 'Courier New', monospace;">
-              ${otp}
-            </div>
-          </div>
-
-          <div style="margin: 30px 0;">
-            <p style="color: #7f8c8d; font-size: 14px; line-height: 1.5;">
-              <strong>Important:</strong> This verification code will expire in 10 minutes for security purposes.
-            </p>
-            <p style="color: #7f8c8d; font-size: 14px; line-height: 1.5;">
-              ${type === 'registration' 
-                ? 'If you did not create this account, please disregard this email.'
-                : 'If you did not request this password reset, please ignore this email and your password will remain unchanged.'
-              }
-            </p>
-          </div>
-
-          <div style="border-top: 1px solid #ecf0f1; padding-top: 20px; text-align: center;">
-            <p style="color: #95a5a6; font-size: 12px; margin: 0;">
-              Best regards,<br>
-              <strong>Healthcare Platform Team</strong>
-            </p>
-          </div>
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+        <h2 style="color: #333;">${subject}</h2>
+        <p>Your OTP is:</p>
+        <div style="background-color: #f0f0f0; padding: 20px; text-align: center; font-size: 24px; font-weight: bold; letter-spacing: 5px; margin: 20px 0;">
+          ${otp}
         </div>
+        <p style="color: #666;">This OTP will expire in 10 minutes.</p>
+        <p style="color: #666;">If you didn't request this, please ignore this email.</p>
       </div>
     `
   };
@@ -80,61 +44,44 @@ const sendOTPEmail = async (email, otp, type = 'registration') => {
 const sendPasswordResetEmail = async (email, resetToken) => {
   const resetUrl = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/reset-password?token=${resetToken}`;
 
+  console.log('Sending password reset email to:', email);
+  console.log('Reset URL:', resetUrl);
+  console.log('Reset token:', resetToken);
+
   const mailOptions = {
-    from: `"Healthcare Platform" <${process.env.EMAIL_USER}>`,
+    from: process.env.EMAIL_USER,
     to: email,
-    subject: 'Password Reset Request - Healthcare Platform',
-    text: `Dear User,\n\nWe received a request to reset your password for your healthcare platform account.\n\nTo reset your password, please click the following link:\n${resetUrl}\n\nThis link will expire in 1 hour for security purposes.\n\nIf you did not request this password reset, please ignore this email and your password will remain unchanged.\n\nFor security reasons, please do not share this link with anyone.\n\nBest regards,\nHealthcare Platform Team`,
+    subject: 'Password Reset Request',
+    text: `You requested a password reset. Click the following link to reset your password: ${resetUrl}. This link will expire in 1 hour.`,
     html: `
-      <div style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 600px; margin: 0 auto; background-color: #f8f9fa; padding: 20px;">
-        <div style="background-color: white; padding: 40px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
-          <div style="text-align: center; margin-bottom: 30px;">
-            <h1 style="color: #2c3e50; margin: 0; font-size: 24px;">Password Reset Request</h1>
-            <p style="color: #7f8c8d; font-size: 16px; margin-top: 10px;">Healthcare Platform</p>
-          </div>
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+        <div style="text-align: center; margin-bottom: 30px;">
+          <h1 style="color: #333; margin-bottom: 10px;">Password Reset Request</h1>
+          <p style="color: #666; font-size: 16px;">We received a request to reset your password</p>
+        </div>
 
-          <div style="margin-bottom: 30px;">
-            <p style="color: #34495e; font-size: 16px; line-height: 1.6; margin-bottom: 20px;">
-              Dear User,
-            </p>
-            <p style="color: #34495e; font-size: 16px; line-height: 1.6; margin-bottom: 20px;">
-              We received a request to reset your password for your healthcare platform account. To proceed with resetting your password, please click the button below:
-            </p>
-          </div>
+        <div style="background-color: #f8f9fa; padding: 30px; border-radius: 10px; text-align: center; margin: 30px 0;">
+          <p style="color: #333; font-size: 16px; margin-bottom: 25px;">
+            Click the button below to reset your password:
+          </p>
+          <a href="${resetUrl}"
+             style="display: inline-block; background-color:rgb(0, 0, 0); color: white; padding: 15px 30px;
+                    text-decoration: none; border-radius: 5px; font-weight: bold; font-size: 16px;">
+            Reset Password
+          </a>
+        </div>
 
-          <div style="text-align: center; margin: 40px 0;">
-            <a href="${resetUrl}"
-               style="display: inline-block; background-color: #27ae60; color: white; padding: 15px 30px;
-                      text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 16px;
-                      box-shadow: 0 2px 5px rgba(39, 174, 96, 0.3);">
-              Reset My Password
-            </a>
-          </div>
-
-          <div style="background-color: #fff3cd; border: 1px solid #ffeaa7; padding: 20px; border-radius: 6px; margin: 30px 0;">
-            <p style="color: #856404; font-size: 14px; margin: 0; line-height: 1.5;">
-              <strong>Security Notice:</strong> This password reset link will expire in 1 hour for your security. If you did not request this password reset, please ignore this email and your password will remain unchanged.
-            </p>
-          </div>
-
-          <div style="margin-top: 30px;">
-            <p style="color: #7f8c8d; font-size: 14px; line-height: 1.5;">
-              If the button above doesn't work, you can copy and paste the following link into your browser:
-            </p>
-            <p style="word-break: break-all; background-color: #f8f9fa; padding: 10px; border-radius: 4px; font-family: 'Courier New', monospace; font-size: 12px; color: #2c3e50;">
-              ${resetUrl}
-            </p>
-          </div>
-
-          <div style="border-top: 1px solid #ecf0f1; padding-top: 20px; text-align: center; margin-top: 40px;">
-            <p style="color: #95a5a6; font-size: 12px; margin: 0;">
-              Best regards,<br>
-              <strong>Healthcare Platform Team</strong>
-            </p>
-            <p style="color: #bdc3c7; font-size: 11px; margin-top: 10px;">
-              Please do not reply to this email. This is an automated message.
-            </p>
-          </div>
+        <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #eee;">
+          <p style="color: #666; font-size: 14px; margin-bottom: 10px;">
+            <strong>Important:</strong> This link will expire in 1 hour for security reasons.
+          </p>
+          <p style="color: #666; font-size: 14px; margin-bottom: 10px;">
+            If you didn't request this password reset, please ignore this email.
+          </p>
+          <p style="color: #666; font-size: 14px;">
+            If the button doesn't work, copy and paste this link into your browser:<br>
+            <a href="${resetUrl}" style="color:rgb(0, 0, 0); word-break: break-all;">${resetUrl}</a>
+          </p>
         </div>
       </div>
     `
@@ -568,6 +515,4 @@ router.get('/verify-reset-token/:token', async (req, res) => {
 });
 
 module.exports = router;
-
-
 
