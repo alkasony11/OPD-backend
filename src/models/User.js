@@ -27,6 +27,33 @@ const otpSchema = new mongoose.Schema({
 // Auto-delete expired OTPs
 otpSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 
+// Password Reset Token Schema
+const passwordResetTokenSchema = new mongoose.Schema({
+  email: {
+    type: String,
+    required: true
+  },
+  token: {
+    type: String,
+    required: true,
+    unique: true
+  },
+  used: {
+    type: Boolean,
+    default: false
+  },
+  expiresAt: {
+    type: Date,
+    required: true,
+    default: () => new Date(Date.now() + 60 * 60 * 1000) // 1 hour from now
+  }
+}, {
+  timestamps: true
+});
+
+// Auto-delete expired tokens
+passwordResetTokenSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+
 const userSchema = new mongoose.Schema({
   name: {
     type: String,
@@ -53,7 +80,7 @@ const userSchema = new mongoose.Schema({
   },
   gender: {
     type: String,
-    enum: ['male', 'female', 'other'],
+    enum: ['male', 'female', 'other', ''],
     default: ''
   },
   clerkId: {
@@ -73,6 +100,14 @@ const userSchema = new mongoose.Schema({
     type: String,
     enum: ['local', 'clerk'],
     default: 'local'
+  },
+  address: {
+    type: String,
+    default: ''
+  },
+  emergencyContact: {
+    type: String,
+    default: ''
   }
 }, {
   timestamps: true
@@ -80,5 +115,6 @@ const userSchema = new mongoose.Schema({
 
 const User = mongoose.model('User', userSchema);
 const OTP = mongoose.model('OTP', otpSchema);
+const PasswordResetToken = mongoose.model('PasswordResetToken', passwordResetTokenSchema);
 
-module.exports = { User, OTP };
+module.exports = { User, OTP, PasswordResetToken };
