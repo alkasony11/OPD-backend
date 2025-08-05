@@ -29,13 +29,13 @@ mongoose.connect("mongodb+srv://alkasony2026:alka2003@cluster0.fl4gy.mongodb.net
 
 // Import routes
 console.log("Loading auth routes...");
-const authRoutes = require("./routes/auth.js");
+const authRoutes = require("./src/routes/auth.js");
 console.log("Auth routes loaded, registering...");
 app.use("/api/auth", authRoutes);
 console.log("Auth routes registered successfully");
 
 console.log("Loading admin routes...");
-const adminRoutes = require("./routes/admin.js");
+const adminRoutes = require("./src/routes/admin.js");
 console.log("Admin routes loaded, registering...");
 app.use("/api/admin", adminRoutes);
 console.log("Admin routes registered successfully");
