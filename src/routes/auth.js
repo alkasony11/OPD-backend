@@ -223,13 +223,22 @@ router.post('/login', async (req, res) => {
       return res.status(400).json({ message: 'Invalid credentials' });
     }
     
+    // Determine user role
+    let userRole = 'user'; // default role
+
     // Check if user is admin
-    const isAdmin = user.email === process.env.ADMIN_EMAIL;
+    if (user.email === process.env.ADMIN_EMAIL) {
+      userRole = 'admin';
+    }
+    // Check if user is doctor (you can add doctor emails to env or use a different method)
+    else if (user.email === process.env.DOCTOR_EMAIL || user.role === 'doctor') {
+      userRole = 'doctor';
+    }
 
     // Create token with role information
     const token = jwt.sign({
       userId: user._id,
-      role: isAdmin ? 'admin' : 'user'
+      role: userRole
     }, 'your_jwt_secret', { expiresIn: '1d' });
 
     console.log('Login successful');
@@ -239,7 +248,7 @@ router.post('/login', async (req, res) => {
         id: user._id,
         name: user.name,
         email: user.email,
-        role: isAdmin ? 'admin' : 'user'
+        role: userRole
       },
       message: 'Login successful'
     });
@@ -300,16 +309,27 @@ router.post('/clerk-sync', async (req, res) => {
       console.log('New Clerk user created:', user.email);
     }
 
+    // Determine user role
+    let userRole = 'user'; // default role
+
     // Check if user is admin
-    const isAdmin = user.email === process.env.ADMIN_EMAIL;
-    console.log('Admin check - User email:', user.email);
-    console.log('Admin check - Admin email from env:', process.env.ADMIN_EMAIL);
-    console.log('Admin check - Is admin:', isAdmin);
+    if (user.email === process.env.ADMIN_EMAIL) {
+      userRole = 'admin';
+    }
+    // Check if user is doctor
+    else if (user.email === process.env.DOCTOR_EMAIL || user.role === 'doctor') {
+      userRole = 'doctor';
+    }
+
+    console.log('Role check - User email:', user.email);
+    console.log('Role check - Admin email from env:', process.env.ADMIN_EMAIL);
+    console.log('Role check - Doctor email from env:', process.env.DOCTOR_EMAIL);
+    console.log('Role check - User role:', userRole);
 
     // Create JWT token for your backend with role information
     const token = jwt.sign({
       userId: user._id,
-      role: isAdmin ? 'admin' : 'user'
+      role: userRole
     }, 'your_jwt_secret', { expiresIn: '1d' });
 
     // Check if user profile is complete (has additional details)
@@ -327,7 +347,7 @@ router.post('/clerk-sync', async (req, res) => {
         profileImage: user.profileImage,
         clerkId: user.clerkId,
         authProvider: user.authProvider,
-        role: isAdmin ? 'admin' : 'user'
+        role: userRole
       },
       isNewUser,
       isProfileComplete,

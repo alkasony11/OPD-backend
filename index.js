@@ -1,7 +1,7 @@
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
-const seedData = require("./src/seedData");
+const seedData = require("./seed");
 
 const app = express();
 const PORT = 5001;
@@ -41,11 +41,6 @@ console.log("Admin routes loaded, registering...");
 app.use("/api/admin", adminRoutes);
 console.log("Admin routes registered successfully");
 
-console.log("Loading booking routes...");
-const bookingRoutes = require("./src/routes/booking.js");
-console.log("Booking routes loaded, registering...");
-app.use("/api/booking", bookingRoutes);
-console.log("Booking routes registered successfully");
 
 // Start server
 app.listen(PORT, async () => {
