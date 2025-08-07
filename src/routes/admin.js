@@ -326,26 +326,100 @@ router.delete('/doctors/:id', adminMiddleware, async (req, res) => {
   }
 });
 
-// Create user (Admin only)
-router.post('/users', adminMiddleware, async (req, res) => {
+// Send verification email to doctor (Admin only)
+router.post('/send-doctor-verification', adminMiddleware, async (req, res) => {
   try {
-    const { name, email, phone, role, department, specialization, experience_years } = req.body;
-    
-    // Validate role
-    if (!['doctor', 'receptionist'].includes(role)) {
-      return res.status(400).json({ message: 'Invalid role. Only doctor and receptionist can be created.' });
+    const { email, name, role = 'doctor' } = req.body;
+
+    if (!email || !name) {
+      return res.status(400).json({ message: 'Email and name are required' });
     }
-    
+
     // Check if user already exists
     const existingUser = await User.findOne({ email });
     if (existingUser) {
       return res.status(400).json({ message: 'User with this email already exists' });
     }
-    
+
+    // Generate OTP
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+
+    // Delete any existing OTPs for this email
+    await OTP.deleteMany({ email, type: 'registration' });
+
+    // Save new OTP
+    const otpDoc = new OTP({
+      email,
+      otp,
+      type: 'registration'
+    });
+    await otpDoc.save();
+
+    // Send verification email
+    const mailOptions = {
+      from: process.env.EMAIL_USER,
+      to: email,
+      subject: `MediQ ${role} Account Verification`,
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+          <h2 style="color: #333;">MediQ Account Verification</h2>
+          <p>Hello ${name},</p>
+          <p>An admin has created a ${role} account for you at MediQ. To verify your email and activate your account, please use the following verification code:</p>
+
+          <div style="background-color: #f0f0f0; padding: 20px; text-align: center; font-size: 24px; font-weight: bold; letter-spacing: 5px; margin: 20px 0;">
+            ${otp}
+          </div>
+
+          <p>This verification code will expire in 10 minutes.</p>
+          <p>If you didn't expect this email, please ignore it.</p>
+
+          <p style="margin-top: 20px; color: #666; font-size: 14px;">
+            After verification, you will receive your login credentials.
+          </p>
+        </div>
+      `
+    };
+
+    await transporter.sendMail(mailOptions);
+
+    res.json({
+      message: `Verification email sent to ${email}. Please ask the ${role} to verify their email.`,
+      email: email
+    });
+
+  } catch (error) {
+    console.error('Send doctor verification error:', error);
+    res.status(500).json({ message: 'Failed to send verification email' });
+  }
+});
+
+// Create user (Admin only) - Direct creation without OTP
+router.post('/users', adminMiddleware, async (req, res) => {
+  try {
+    const { name, email, phone, role, department, specialization, experience_years } = req.body;
+
+    console.log('Received doctor creation request:', { name, email, phone, role, department, specialization, experience_years });
+
+    // Validate required fields
+    if (!name || !email) {
+      return res.status(400).json({ message: 'Name and email are required' });
+    }
+
+    // Validate role
+    if (!['doctor', 'receptionist'].includes(role)) {
+      return res.status(400).json({ message: 'Invalid role. Only doctor and receptionist can be created.' });
+    }
+
+    // Check if user already exists
+    const existingUser = await User.findOne({ email });
+    if (existingUser) {
+      return res.status(400).json({ message: 'User with this email already exists' });
+    }
+
     // Generate temporary password
     const tempPassword = generateTempPassword();
     const hashedPassword = await bcrypt.hash(tempPassword, 12);
-    
+
     // Create user object with role-specific info
     const userData = {
       name,
@@ -355,7 +429,84 @@ router.post('/users', adminMiddleware, async (req, res) => {
       role,
       isVerified: true
     };
-    
+
+    // Add role-specific nested fields
+    if (role === 'doctor') {
+      userData.doctor_info = {
+        department: department || '',
+        specialization: specialization || '',
+        experience_years: parseInt(experience_years) || 0,
+        calendar: [],
+        status: 'active'
+      };
+    } else if (role === 'receptionist') {
+      userData.receptionist_info = {
+        department: department || ''
+      };
+    }
+
+    const user = new User(userData);
+    await user.save();
+
+    console.log('User created successfully:', user._id);
+
+    // Send credentials email
+    try {
+      console.log('Attempting to send email to:', email);
+      console.log('Email config - FROM:', process.env.EMAIL_USER);
+      console.log('Temp password:', tempPassword);
+
+      await sendAccountCredentialsEmail(email, tempPassword, role, name);
+      console.log('✅ Email sent successfully to:', email);
+    } catch (emailError) {
+      console.error('❌ Email sending failed:', emailError.message);
+      console.error('Full email error:', emailError);
+      // Don't fail the entire request if email fails
+    }
+
+    const userResponse = await User.findById(user._id).select('-password');
+    res.status(201).json({
+      user: userResponse,
+      tempPassword: tempPassword,
+      message: `${role} account created successfully. Login credentials sent to ${email}`
+    });
+
+  } catch (error) {
+    console.error('Create user error:', error);
+    res.status(500).json({ message: 'Server error: ' + error.message });
+  }
+});
+
+// Create user without email (Admin only) - Direct credential sharing
+router.post('/users-direct', adminMiddleware, async (req, res) => {
+  try {
+    const { name, email, phone, role, department, specialization, experience_years } = req.body;
+
+    // Validate role
+    if (!['doctor', 'receptionist'].includes(role)) {
+      return res.status(400).json({ message: 'Invalid role. Only doctor and receptionist can be created.' });
+    }
+
+    // Check if user already exists
+    const existingUser = await User.findOne({ email });
+    if (existingUser) {
+      return res.status(400).json({ message: 'User with this email already exists' });
+    }
+
+    // Generate temporary password
+    const tempPassword = generateTempPassword();
+    const hashedPassword = await bcrypt.hash(tempPassword, 12);
+
+    // Create user object with role-specific info
+    const userData = {
+      name,
+      email,
+      password: hashedPassword,
+      phone: phone || '',
+      role,
+      isVerified: true
+    };
+
     // Add role-specific nested fields
     if (role === 'doctor') {
       userData.doctor_info = {
@@ -370,21 +521,23 @@ router.post('/users', adminMiddleware, async (req, res) => {
         department: department || ''
       };
     }
-    
+
     const user = new User(userData);
     await user.save();
-    
-    // Send credentials email
+
+    // Send credentials email to doctor
     await sendAccountCredentialsEmail(email, tempPassword, role, name);
-    
+
+    // Return user data with temporary password for admin display
     const userResponse = await User.findById(user._id).select('-password');
     res.status(201).json({
       user: userResponse,
-      message: `${role} account created successfully. Login credentials sent to ${email}`
+      tempPassword: tempPassword, // Return password for admin to see and share if needed
+      message: `${role} account created successfully. Login credentials sent to ${email} and displayed below.`
     });
-    
+
   } catch (error) {
-    console.error('Create user error:', error);
+    console.error('Create user direct error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 });
