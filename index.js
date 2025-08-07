@@ -44,7 +44,17 @@ console.log("Admin routes registered successfully");
 app.listen(PORT, async () => {
     console.log(`Server running at http://localhost:${PORT}`);
 
-    // Sample data seeding removed - use admin panel to create doctors
+    // Test email configuration
+    const { testEmailConfig } = require('./src/config/email');
+    console.log('🔧 Testing email configuration...');
+    const emailWorking = await testEmailConfig();
+
+    if (emailWorking) {
+        console.log('✅ Email service is ready!');
+    } else {
+        console.log('⚠️  Email service not configured properly. Doctor credentials will not be sent via email.');
+    }
+
     console.log('✅ Server ready! Use admin panel to create doctors and manage users.');
 });
 
