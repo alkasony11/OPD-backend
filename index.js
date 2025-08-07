@@ -1,7 +1,8 @@
+require('dotenv').config();
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
-const seedData = require("./seed");
+// Seed file removed - use admin panel to create doctors instead
 
 const app = express();
 const PORT = 5001;
@@ -21,10 +22,7 @@ app.get('/test', (req, res) => {
 });
 
 // Connect to MongoDB
-mongoose.connect("mongodb+srv://alkasony2026:alka2003@cluster0.fl4gy.mongodb.net/Mediq?retryWrites=true&w=majority&appName=Cluster0", {
-    useNewUrlParser: true,
-    useUnifiedTopology: true
-}).then(() => {
+mongoose.connect(process.env.MONGODB_URI || "mongodb+srv://alkasony2026:alka2003@cluster0.fl4gy.mongodb.net/Mediq?retryWrites=true&w=majority&appName=Cluster0").then(() => {
     console.log("Connected to MongoDB");
 }).catch(err => console.error("Database connection error:", err));
 
@@ -46,10 +44,8 @@ console.log("Admin routes registered successfully");
 app.listen(PORT, async () => {
     console.log(`Server running at http://localhost:${PORT}`);
 
-    // Seed sample data (only run once or when needed)
-    if (process.env.SEED_DATA === 'true') {
-        await seedData();
-    }
+    // Sample data seeding removed - use admin panel to create doctors
+    console.log('✅ Server ready! Use admin panel to create doctors and manage users.');
 });
 
 
