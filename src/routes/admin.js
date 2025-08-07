@@ -1,26 +1,30 @@
 const express = require('express');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
 const { User, PasswordResetToken } = require('../models/User');
+const { transporter } = require('../config/email');
+const { extractToken } = require('../middleware/authMiddleware');
 
 const router = express.Router();
 
 // Admin middleware to check if user is admin
 const adminMiddleware = async (req, res, next) => {
   try {
-    const token = req.header('Authorization')?.replace('Bearer ', '');
+    const token = extractToken(req);
     if (!token) {
       return res.status(401).json({ message: 'No token, authorization denied' });
     }
 
-    const decoded = jwt.verify(token, 'your_jwt_secret');
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your_jwt_secret');
     const user = await User.findById(decoded.userId);
     
     if (!user) {
       return res.status(401).json({ message: 'User not found' });
     }
 
-    // Check if user is admin
-    if (user.email !== process.env.ADMIN_EMAIL) {
+    // Check if user is admin using role field
+    if (user.role !== 'admin') {
       return res.status(403).json({ message: 'Access denied. Admin privileges required.' });
     }
 
@@ -32,6 +36,44 @@ const adminMiddleware = async (req, res, next) => {
   }
 };
 
+// Generate temporary password
+const generateTempPassword = () => {
+  return crypto.randomBytes(8).toString('hex');
+};
+
+// Send account credentials email
+const sendAccountCredentialsEmail = async (email, password, role, name) => {
+  const loginUrl = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/login`;
+  
+  const mailOptions = {
+    from: process.env.EMAIL_USER,
+    to: email,
+    subject: `Your MediQ ${role} login details`,
+    html: `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+        <h2 style="color: #333;">Welcome to MediQ</h2>
+        <p>Hello ${name},</p>
+        <p>Your ${role} account has been created. Here are your login credentials:</p>
+        
+        <div style="background-color: #f5f5f5; padding: 20px; border-radius: 5px; margin: 20px 0;">
+          <p><strong>Email:</strong> ${email}</p>
+          <p><strong>Temporary Password:</strong> ${password}</p>
+          <p><strong>Role:</strong> ${role}</p>
+        </div>
+        
+        <p>Please login and change your password immediately:</p>
+        <a href="${loginUrl}" style="background-color: #007bff; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">Login to MediQ</a>
+        
+        <p style="margin-top: 20px; color: #666; font-size: 14px;">
+          For security reasons, please change your password after your first login.
+        </p>
+      </div>
+    `
+  };
+
+  await transporter.sendMail(mailOptions);
+};
+
 // Get all users (Admin only)
 router.get('/users', adminMiddleware, async (req, res) => {
   try {
@@ -39,15 +81,22 @@ router.get('/users', adminMiddleware, async (req, res) => {
       .select('-password')
       .sort({ createdAt: -1 });
 
-    // Add role information
-    const usersWithRoles = users.map(user => ({
-      ...user.toObject(),
-      role: user.email === process.env.ADMIN_EMAIL ? 'admin' : 'user'
-    }));
-
-    res.json(usersWithRoles);
+    res.json(users);
   } catch (error) {
     console.error('Get users error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get doctors
+router.get('/doctors', adminMiddleware, async (req, res) => {
+  try {
+    const doctors = await User.find({ role: 'doctor' })
+      .select('-password')
+      .sort({ createdAt: -1 });
+    res.json(doctors);
+  } catch (error) {
+    console.error('Get doctors error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -62,7 +111,7 @@ router.get('/users/:id', adminMiddleware, async (req, res) => {
 
     const userWithRole = {
       ...user.toObject(),
-      role: user.email === process.env.ADMIN_EMAIL ? 'admin' : 'user'
+      role: user.email === process.env.ADMIN_EMAIL ? 'admin' : user.role
     };
 
     res.json(userWithRole);
@@ -93,7 +142,7 @@ router.put('/users/:id', adminMiddleware, async (req, res) => {
     const updatedUser = await User.findById(user._id).select('-password');
     const userWithRole = {
       ...updatedUser.toObject(),
-      role: updatedUser.email === process.env.ADMIN_EMAIL ? 'admin' : 'user'
+      role: updatedUser.email === process.env.ADMIN_EMAIL ? 'admin' : updatedUser.role
     };
 
     res.json(userWithRole);
@@ -277,5 +326,71 @@ router.delete('/doctors/:id', adminMiddleware, async (req, res) => {
   }
 });
 
+// Create user (Admin only)
+router.post('/users', adminMiddleware, async (req, res) => {
+  try {
+    const { name, email, phone, role, department, specialization, experience_years } = req.body;
+    
+    // Validate role
+    if (!['doctor', 'receptionist'].includes(role)) {
+      return res.status(400).json({ message: 'Invalid role. Only doctor and receptionist can be created.' });
+    }
+    
+    // Check if user already exists
+    const existingUser = await User.findOne({ email });
+    if (existingUser) {
+      return res.status(400).json({ message: 'User with this email already exists' });
+    }
+    
+    // Generate temporary password
+    const tempPassword = generateTempPassword();
+    const hashedPassword = await bcrypt.hash(tempPassword, 12);
+    
+    // Create user object with role-specific info
+    const userData = {
+      name,
+      email,
+      password: hashedPassword,
+      phone: phone || '',
+      role,
+      isVerified: true
+    };
+    
+    // Add role-specific nested fields
+    if (role === 'doctor') {
+      userData.doctor_info = {
+        department: department || '',
+        specialization: specialization || '',
+        experience_years: experience_years || 0,
+        calendar: [],
+        status: 'active'
+      };
+    } else if (role === 'receptionist') {
+      userData.receptionist_info = {
+        department: department || ''
+      };
+    }
+    
+    const user = new User(userData);
+    await user.save();
+    
+    // Send credentials email
+    await sendAccountCredentialsEmail(email, tempPassword, role, name);
+    
+    const userResponse = await User.findById(user._id).select('-password');
+    res.status(201).json({
+      user: userResponse,
+      message: `${role} account created successfully. Login credentials sent to ${email}`
+    });
+    
+  } catch (error) {
+    console.error('Create user error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 module.exports = router;
+
+
+
 

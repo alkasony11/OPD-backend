@@ -173,7 +173,12 @@ router.post('/register', async (req, res) => {
       phone: phone || '',
       dob: dob ? new Date(dob) : undefined,
       gender: gender || '',
-      isVerified: true // User is verified since they provided valid OTP
+      role: 'patient', // Force patient role for public registration
+      isVerified: true,
+      patient_info: {
+        family_members: [],
+        booking_history: []
+      }
     });
 
     await user.save();
@@ -182,7 +187,7 @@ router.post('/register', async (req, res) => {
     await OTP.deleteOne({ _id: otpDoc._id });
 
     // Create token
-    const token = jwt.sign({ userId: user._id }, 'your_jwt_secret', { expiresIn: '1d' });
+    const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET || 'your_jwt_secret', { expiresIn: '1d' });
 
     res.status(201).json({
       token,
@@ -192,7 +197,8 @@ router.post('/register', async (req, res) => {
         email: user.email,
         phone: user.phone,
         dob: user.dob,
-        gender: user.gender
+        gender: user.gender,
+        role: user.role
       },
       message: 'User created successfully'
     });
@@ -223,23 +229,30 @@ router.post('/login', async (req, res) => {
       return res.status(400).json({ message: 'Invalid credentials' });
     }
     
-    // Determine user role
-    let userRole = 'user'; // default role
-
-    // Check if user is admin
-    if (user.email === process.env.ADMIN_EMAIL) {
-      userRole = 'admin';
-    }
-    // Check if user is doctor (you can add doctor emails to env or use a different method)
-    else if (user.email === process.env.DOCTOR_EMAIL || user.role === 'doctor') {
-      userRole = 'doctor';
+    // Determine redirect URL based on role
+    let redirectTo = '/';
+    switch (user.role) {
+      case 'patient':
+        redirectTo = '/';
+        break;
+      case 'doctor':
+        redirectTo = '/doctor/dashboard';
+        break;
+      case 'receptionist':
+        redirectTo = '/'; // No specific receptionist dashboard yet
+        break;
+      case 'admin':
+        redirectTo = '/admin/dashboard';
+        break;
+      default:
+        redirectTo = '/';
     }
 
     // Create token with role information
     const token = jwt.sign({
       userId: user._id,
-      role: userRole
-    }, 'your_jwt_secret', { expiresIn: '1d' });
+      role: user.role
+    }, process.env.JWT_SECRET || 'your_jwt_secret', { expiresIn: '1d' });
 
     console.log('Login successful');
     res.json({
@@ -248,8 +261,9 @@ router.post('/login', async (req, res) => {
         id: user._id,
         name: user.name,
         email: user.email,
-        role: userRole
+        role: user.role
       },
+      redirectTo,
       message: 'Login successful'
     });
   } catch (error) {
@@ -268,30 +282,35 @@ router.post('/clerk-sync', async (req, res) => {
       return res.status(400).json({ message: 'Clerk ID and email are required' });
     }
 
-    // Check if user already exists by Clerk ID or email
     let user = await User.findOne({
-      $or: [
-        { clerkId: clerkId },
-        { email: email }
-      ]
+      $or: [{ clerkId: clerkId }, { email: email }]
     });
 
     let isNewUser = false;
 
     if (user) {
-      // Update existing user with Clerk data
+      // Update existing user and check for admin role
       user.clerkId = clerkId;
       user.name = name || user.name;
       user.phone = phone || user.phone;
       user.profileImage = profileImage || user.profileImage;
-      user.isVerified = true; // Clerk users are pre-verified
+      user.isVerified = true;
       user.authProvider = 'clerk';
+
+      // Check if this should be an admin user
+      if (email === process.env.ADMIN_EMAIL && user.role !== 'admin') {
+        user.role = 'admin';
+        user.admin_info = {
+          permissions: ['all']
+        };
+      }
 
       await user.save();
     } else {
-      // Create new user from Clerk data
-      console.log('Creating new user for Clerk ID:', clerkId);
+      // Create new user - default to patient role, but check for admin
       isNewUser = true;
+      const userRole = email === process.env.ADMIN_EMAIL ? 'admin' : 'patient';
+
       user = new User({
         clerkId,
         email,
@@ -300,39 +319,28 @@ router.post('/clerk-sync', async (req, res) => {
         profileImage: profileImage || '',
         isVerified: true,
         authProvider: 'clerk',
-        // No password needed for Clerk users
-        password: null
+        role: userRole,
+        patient_info: userRole === 'patient' ? {
+          family_members: [],
+          booking_history: []
+        } : undefined,
+        admin_info: userRole === 'admin' ? {
+          permissions: ['all']
+        } : undefined
       });
-
-      console.log('About to save new user:', user);
       await user.save();
-      console.log('New Clerk user created:', user.email);
     }
 
-    // Determine user role
-    let userRole = 'user'; // default role
+    // Use the role field directly
+    const userRole = user.role;
 
-    // Check if user is admin
-    if (user.email === process.env.ADMIN_EMAIL) {
-      userRole = 'admin';
-    }
-    // Check if user is doctor
-    else if (user.email === process.env.DOCTOR_EMAIL || user.role === 'doctor') {
-      userRole = 'doctor';
-    }
-
-    console.log('Role check - User email:', user.email);
-    console.log('Role check - Admin email from env:', process.env.ADMIN_EMAIL);
-    console.log('Role check - Doctor email from env:', process.env.DOCTOR_EMAIL);
-    console.log('Role check - User role:', userRole);
-
-    // Create JWT token for your backend with role information
+    // Create JWT token
     const token = jwt.sign({
       userId: user._id,
       role: userRole
-    }, 'your_jwt_secret', { expiresIn: '1d' });
+    }, process.env.JWT_SECRET || 'your_jwt_secret', { expiresIn: '1d' });
 
-    // Check if user profile is complete (has additional details)
+    // Check if profile is complete
     const isProfileComplete = !!(user.phone && user.dob && user.gender);
 
     res.json({
@@ -356,8 +364,6 @@ router.post('/clerk-sync', async (req, res) => {
 
   } catch (error) {
     console.error('Clerk sync error:', error);
-    console.error('Error details:', error.message);
-    console.error('Stack trace:', error.stack);
     res.status(500).json({ message: 'Server error during synchronization', error: error.message });
   }
 });
@@ -370,7 +376,7 @@ router.get('/profile', async (req, res) => {
       return res.status(401).json({ message: 'No token provided' });
     }
 
-    const decoded = jwt.verify(token, 'your_jwt_secret');
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your_jwt_secret');
     const user = await User.findById(decoded.userId).select('-password');
 
     if (!user) {
@@ -392,7 +398,7 @@ router.put('/profile', async (req, res) => {
       return res.status(401).json({ message: 'No token provided' });
     }
 
-    const decoded = jwt.verify(token, 'your_jwt_secret');
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your_jwt_secret');
     const user = await User.findById(decoded.userId);
 
     if (!user) {
@@ -535,4 +541,7 @@ router.get('/verify-reset-token/:token', async (req, res) => {
 });
 
 module.exports = router;
+
+
+
 

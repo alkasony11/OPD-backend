@@ -55,64 +55,67 @@ const passwordResetTokenSchema = new mongoose.Schema({
 passwordResetTokenSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 
 const userSchema = new mongoose.Schema({
-  name: {
+  name: { type: String, required: true },
+  email: { type: String, required: true, unique: true },
+  password: { 
+    type: String, 
+    required: function() { return !this.clerkId; }
+  },
+  phone: { type: String, default: '' },
+  dob: { type: Date },
+  gender: { type: String },
+  clerkId: { type: String },
+  profileImage: { type: String },
+  role: {
     type: String,
-    required: true
+    enum: ['patient', 'doctor', 'receptionist', 'admin'],
+    default: 'patient'
   },
-  email: {
-    type: String,
-    required: true,
-    unique: true
-  },
-  password: {
-    type: String,
-    required: function() {
-      // Password is required only if clerkId is not present
-      return !this.clerkId;
-    }
-  },
-  phone: {
-    type: String,
-    default: ''
-  },
-  dob: {
-    type: Date
-  },
-  gender: {
-    type: String,
-    enum: ['male', 'female', 'other', ''],
-    default: ''
-  },
-  clerkId: {
-    type: String,
-    unique: true,
-    sparse: true // Allows null values while maintaining uniqueness
-  },
-  profileImage: {
-    type: String,
-    default: ''
-  },
-  isVerified: {
-    type: Boolean,
-    default: false
-  },
+  profile_photo: { type: String, default: '' },
+  isVerified: { type: Boolean, default: false },
   authProvider: {
     type: String,
     enum: ['local', 'clerk'],
     default: 'local'
   },
-  address: {
-    type: String,
-    default: ''
+  
+  // Role-specific nested fields
+  patient_info: {
+    family_members: [{
+      member_id: mongoose.Schema.Types.ObjectId,
+      name: String,
+      age: Number,
+      relation: String,
+      gender: String,
+      medical_history: [String]
+    }],
+    booking_history: [mongoose.Schema.Types.ObjectId]
   },
-  emergencyContact: {
-    type: String,
-    default: ''
+  
+  doctor_info: {
+    department: String,
+    specialization: String,
+    experience_years: Number,
+    calendar: [{
+      date: Date,
+      is_available: Boolean,
+      start_time: String,
+      end_time: String,
+      leave_reason: String
+    }],
+    status: {
+      type: String,
+      enum: ['active', 'on_leave'],
+      default: 'active'
+    }
   },
-  role: {
-    type: String,
-    enum: ['user', 'doctor', 'admin'],
-    default: 'user'
+  
+  receptionist_info: {
+    department: String
+  },
+  
+  admin_info: {
+    permissions: [String]
   }
 }, {
   timestamps: true
@@ -123,3 +126,5 @@ const OTP = mongoose.model('OTP', otpSchema);
 const PasswordResetToken = mongoose.model('PasswordResetToken', passwordResetTokenSchema);
 
 module.exports = { User, OTP, PasswordResetToken };
+
+
