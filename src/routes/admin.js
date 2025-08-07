@@ -239,4 +239,43 @@ router.get('/health', adminMiddleware, async (req, res) => {
   }
 });
 
+router.get('/patients', adminMiddleware, async (req, res) => {
+  try {
+    const patients = await User.find({}).select('-password');
+    res.json(patients);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch patients' });
+  }
+});
+
+// Get all doctors
+router.get('/doctors', adminMiddleware, async (req, res) => {
+  try {
+    const doctors = await User.find({ role: 'doctor' })
+      .select('-password')
+      .sort({ createdAt: -1 });
+    res.json(doctors);
+  } catch (error) {
+    console.error('Get doctors error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Delete doctor
+router.delete('/doctors/:id', adminMiddleware, async (req, res) => {
+  try {
+    const doctor = await User.findById(req.params.id);
+    if (!doctor || doctor.role !== 'doctor') {
+      return res.status(404).json({ message: 'Doctor not found' });
+    }
+    
+    await User.findByIdAndDelete(req.params.id);
+    res.json({ message: 'Doctor deleted successfully' });
+  } catch (error) {
+    console.error('Delete doctor error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 module.exports = router;
+

@@ -108,6 +108,11 @@ const userSchema = new mongoose.Schema({
   emergencyContact: {
     type: String,
     default: ''
+  },
+  role: {
+    type: String,
+    enum: ['user', 'doctor', 'admin'],
+    default: 'user'
   }
 }, {
   timestamps: true
