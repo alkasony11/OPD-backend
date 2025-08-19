@@ -93,9 +93,18 @@ const userSchema = new mongoose.Schema({
   },
   
   doctor_info: {
-    department: String,
+    department: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Department'
+    },
     specialization: String,
     experience_years: Number,
+    consultation_fee: {
+      type: Number,
+      default: 500
+    },
+    qualifications: String,
+    bio: String,
     calendar: [{
       date: Date,
       is_available: Boolean,
@@ -107,11 +116,38 @@ const userSchema = new mongoose.Schema({
       type: String,
       enum: ['active', 'on_leave'],
       default: 'active'
+    },
+    default_working_hours: {
+      start_time: {
+        type: String,
+        default: '09:00'
+      },
+      end_time: {
+        type: String,
+        default: '17:00'
+      }
+    },
+    default_break_time: {
+      start_time: {
+        type: String,
+        default: '13:00'
+      },
+      end_time: {
+        type: String,
+        default: '14:00'
+      }
+    },
+    default_slot_duration: {
+      type: Number,
+      default: 30
     }
   },
   
   receptionist_info: {
-    department: String
+    department: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Department'
+    }
   },
   
   admin_info: {
@@ -121,10 +157,244 @@ const userSchema = new mongoose.Schema({
   timestamps: true
 });
 
+// Appointment Schema
+const appointmentSchema = new mongoose.Schema({
+  // Patient Information
+  patientId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+  patientName: {
+    type: String,
+    required: true
+  },
+  patientEmail: {
+    type: String,
+    required: true
+  },
+  patientPhone: {
+    type: String,
+    required: true
+  },
+
+  // Doctor Information
+  doctorId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+  doctorName: {
+    type: String,
+    required: true
+  },
+
+  // Appointment Details
+  appointmentDate: {
+    type: Date,
+    required: true
+  },
+  appointmentTime: {
+    type: String,
+    required: true
+  },
+  department: {
+    type: String,
+    required: true
+  },
+  appointmentType: {
+    type: String,
+    enum: ['consultation', 'follow-up', 'emergency', 'routine-checkup'],
+    default: 'consultation'
+  },
+
+  // Status and Progress
+  status: {
+    type: String,
+    enum: ['pending', 'confirmed', 'in-progress', 'completed', 'cancelled', 'no-show'],
+    default: 'pending'
+  },
+
+  // Medical Information
+  symptoms: {
+    type: String,
+    required: true
+  },
+  diagnosis: {
+    type: String,
+    default: ''
+  },
+
+  // Doctor's Notes and Prescriptions
+  doctorNotes: {
+    type: String,
+    default: ''
+  },
+  prescriptions: [{
+    medicationName: {
+      type: String,
+      required: true
+    },
+    dosage: {
+      type: String,
+      required: true
+    },
+    frequency: {
+      type: String,
+      required: true
+    },
+    duration: {
+      type: String,
+      required: true
+    },
+    instructions: {
+      type: String,
+      default: ''
+    },
+    prescribedAt: {
+      type: Date,
+      default: Date.now
+    }
+  }],
+
+  // Booking Information
+  tokenNumber: {
+    type: String,
+    unique: true,
+    sparse: true
+  },
+  estimatedWaitTime: {
+    type: Number,
+    default: 0
+  },
+
+  // Payment Information
+  paymentMethod: {
+    type: String,
+    enum: ['card', 'cash', 'insurance'],
+    default: 'cash'
+  },
+  paymentStatus: {
+    type: String,
+    enum: ['pending', 'paid', 'refunded'],
+    default: 'pending'
+  },
+  consultationFee: {
+    type: Number,
+    default: 0
+  },
+
+  // Timestamps
+  bookedAt: {
+    type: Date,
+    default: Date.now
+  },
+  completedAt: {
+    type: Date
+  },
+  cancelledAt: {
+    type: Date
+  },
+  cancellationReason: {
+    type: String
+  }
+}, {
+  timestamps: true
+});
+
+// Indexes for better query performance
+appointmentSchema.index({ doctorId: 1, appointmentDate: 1 });
+appointmentSchema.index({ patientId: 1, appointmentDate: 1 });
+appointmentSchema.index({ status: 1 });
+appointmentSchema.index({ tokenNumber: 1 });
+
+// Token Schema (for your tokens collection)
+const tokenSchema = new mongoose.Schema({
+  patient_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+  family_member_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User'
+  },
+  doctor_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+  department: {
+    type: String,
+    required: true
+  },
+  symptoms: {
+    type: String,
+    required: true
+  },
+  booking_date: {
+    type: Date,
+    required: true
+  },
+  time_slot: {
+    type: String,
+    required: true
+  },
+  status: {
+    type: String,
+    enum: ['booked', 'in_queue', 'consulted', 'cancelled', 'missed'],
+    default: 'booked'
+  },
+  estimated_wait_time: {
+    type: Number,
+    default: 0
+  },
+  payment_status: {
+    type: String,
+    enum: ['paid', 'pending', 'refunded'],
+    default: 'pending'
+  },
+  priority_flag: {
+    type: Boolean,
+    default: false
+  },
+  created_by: {
+    type: String,
+    enum: ['patient', 'receptionist', 'whatsapp_bot'],
+    default: 'patient'
+  },
+  emergency_redirected: {
+    type: Boolean,
+    default: false
+  },
+  token_pdf_url: {
+    type: String
+  },
+  token_number: {
+    type: String,
+    unique: true,
+    sparse: true
+  },
+  cancellation_reason: {
+    type: String,
+    default: ''
+  }
+}, {
+  timestamps: true
+});
+
+// Indexes for better query performance
+tokenSchema.index({ doctor_id: 1, booking_date: 1 });
+tokenSchema.index({ patient_id: 1, booking_date: 1 });
+tokenSchema.index({ status: 1 });
+tokenSchema.index({ token_number: 1 });
+
 const User = mongoose.model('User', userSchema);
 const OTP = mongoose.model('OTP', otpSchema);
 const PasswordResetToken = mongoose.model('PasswordResetToken', passwordResetTokenSchema);
+const Appointment = mongoose.model('Appointment', appointmentSchema);
+const Token = mongoose.model('Token', tokenSchema);
 
-module.exports = { User, OTP, PasswordResetToken };
+module.exports = { User, OTP, PasswordResetToken, Appointment, Token };
 
 

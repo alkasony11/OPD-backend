@@ -2,7 +2,9 @@ const express = require('express');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
-const { User, PasswordResetToken } = require('../models/User');
+const { User, PasswordResetToken, OTP } = require('../models/User');
+const Department = require('../models/Department');
+const DoctorSchedule = require('../models/DoctorSchedule');
 const { transporter } = require('../config/email');
 const { extractToken } = require('../middleware/authMiddleware');
 
@@ -93,6 +95,7 @@ router.get('/doctors', adminMiddleware, async (req, res) => {
   try {
     const doctors = await User.find({ role: 'doctor' })
       .select('-password')
+      .populate('doctor_info.department', 'name description')
       .sort({ createdAt: -1 });
     res.json(doctors);
   } catch (error) {
@@ -290,22 +293,57 @@ router.get('/health', adminMiddleware, async (req, res) => {
 
 router.get('/patients', adminMiddleware, async (req, res) => {
   try {
-    const patients = await User.find({}).select('-password');
+    const patients = await User.find({ role: 'patient' })
+      .select('-password')
+      .sort({ createdAt: -1 });
     res.json(patients);
   } catch (err) {
+    console.error('Get patients error:', err);
     res.status(500).json({ error: 'Failed to fetch patients' });
   }
 });
 
-// Get all doctors
-router.get('/doctors', adminMiddleware, async (req, res) => {
+
+
+// Update doctor
+router.put('/doctors/:id', adminMiddleware, async (req, res) => {
   try {
-    const doctors = await User.find({ role: 'doctor' })
-      .select('-password')
-      .sort({ createdAt: -1 });
-    res.json(doctors);
+    const { name, email, phone, doctor_info } = req.body;
+    
+    const doctor = await User.findById(req.params.id);
+    if (!doctor || doctor.role !== 'doctor') {
+      return res.status(404).json({ message: 'Doctor not found' });
+    }
+
+    // Check if email is being changed and if it already exists
+    if (email !== doctor.email) {
+      const existingUser = await User.findOne({ email, _id: { $ne: req.params.id } });
+      if (existingUser) {
+        return res.status(400).json({ message: 'Email already exists' });
+      }
+    }
+
+    // Update doctor information
+    const updatedDoctor = await User.findByIdAndUpdate(
+      req.params.id,
+      {
+        name,
+        email,
+        phone,
+        doctor_info: {
+          ...doctor.doctor_info,
+          ...doctor_info
+        }
+      },
+      { new: true }
+    ).populate('doctor_info.department', 'name description');
+
+    res.json({ 
+      message: 'Doctor updated successfully',
+      doctor: updatedDoctor
+    });
   } catch (error) {
-    console.error('Get doctors error:', error);
+    console.error('Update doctor error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -396,9 +434,23 @@ router.post('/send-doctor-verification', adminMiddleware, async (req, res) => {
 // Create user (Admin only) - Direct creation without OTP
 router.post('/users', adminMiddleware, async (req, res) => {
   try {
-    const { name, email, phone, role, department, specialization, experience_years } = req.body;
+    const { 
+      name, 
+      email, 
+      phone, 
+      role, 
+      department, 
+      specialization, 
+      experience_years, 
+      consultation_fee,
+      qualifications,
+      bio 
+    } = req.body;
 
-    console.log('Received doctor creation request:', { name, email, phone, role, department, specialization, experience_years });
+    console.log('Received doctor creation request:', { 
+      name, email, phone, role, department, specialization, 
+      experience_years, consultation_fee, qualifications, bio 
+    });
 
     // Validate required fields
     if (!name || !email) {
@@ -430,18 +482,38 @@ router.post('/users', adminMiddleware, async (req, res) => {
       isVerified: true
     };
 
+    // Validate department exists if provided
+    if (department) {
+      const departmentExists = await Department.findById(department);
+      if (!departmentExists) {
+        return res.status(400).json({ message: 'Invalid department selected' });
+      }
+    }
+
     // Add role-specific nested fields
     if (role === 'doctor') {
       userData.doctor_info = {
-        department: department || '',
+        department: department || null,
         specialization: specialization || '',
         experience_years: parseInt(experience_years) || 0,
+        consultation_fee: parseInt(consultation_fee) || 500,
+        qualifications: qualifications || '',
+        bio: bio || '',
         calendar: [],
-        status: 'active'
+        status: 'active',
+        default_working_hours: {
+          start_time: '09:00',
+          end_time: '17:00'
+        },
+        default_break_time: {
+          start_time: '13:00',
+          end_time: '14:00'
+        },
+        default_slot_duration: 30
       };
     } else if (role === 'receptionist') {
       userData.receptionist_info = {
-        department: department || ''
+        department: department || null
       };
     }
 
@@ -449,6 +521,17 @@ router.post('/users', adminMiddleware, async (req, res) => {
     await user.save();
 
     console.log('User created successfully:', user._id);
+
+    // Create initial schedule for the next 30 days for doctors
+    if (role === 'doctor') {
+      try {
+        await createInitialDoctorSchedule(user._id);
+        console.log('Initial schedule created for doctor:', user._id);
+      } catch (scheduleError) {
+        console.error('Error creating initial schedule:', scheduleError);
+        // Don't fail the entire request if schedule creation fails
+      }
+    }
 
     // Send credentials email
     try {
@@ -464,7 +547,10 @@ router.post('/users', adminMiddleware, async (req, res) => {
       // Don't fail the entire request if email fails
     }
 
-    const userResponse = await User.findById(user._id).select('-password');
+    const userResponse = await User.findById(user._id)
+      .select('-password')
+      .populate('doctor_info.department', 'name description');
+    
     res.status(201).json({
       user: userResponse,
       tempPassword: tempPassword,
@@ -476,6 +562,54 @@ router.post('/users', adminMiddleware, async (req, res) => {
     res.status(500).json({ message: 'Server error: ' + error.message });
   }
 });
+
+// Helper function to create initial schedule for new doctors
+const createInitialDoctorSchedule = async (doctorId) => {
+  try {
+    const schedules = [];
+    const today = new Date();
+    
+    // Create schedules for the next 30 days (excluding weekends)
+    for (let i = 1; i <= 30; i++) {
+      const date = new Date(today);
+      date.setDate(today.getDate() + i);
+      date.setHours(0, 0, 0, 0);
+      
+      // Skip weekends (Saturday = 6, Sunday = 0)
+      if (date.getDay() === 0 || date.getDay() === 6) {
+        continue;
+      }
+      
+      const schedule = new DoctorSchedule({
+        doctor_id: doctorId,
+        date: date,
+        is_available: true,
+        working_hours: {
+          start_time: '09:00',
+          end_time: '17:00'
+        },
+        break_time: {
+          start_time: '13:00',
+          end_time: '14:00'
+        },
+        slot_duration: 30,
+        max_patients_per_slot: 1,
+        leave_reason: '',
+        notes: 'Default schedule created by admin'
+      });
+      
+      schedules.push(schedule);
+    }
+    
+    // Bulk insert schedules
+    if (schedules.length > 0) {
+      await DoctorSchedule.insertMany(schedules);
+    }
+  } catch (error) {
+    console.error('Error creating initial doctor schedule:', error);
+    throw error;
+  }
+};
 
 // Create user without email (Admin only) - Direct credential sharing
 router.post('/users-direct', adminMiddleware, async (req, res) => {
@@ -538,6 +672,341 @@ router.post('/users-direct', adminMiddleware, async (req, res) => {
 
   } catch (error) {
     console.error('Create user direct error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ==================== DEPARTMENT MANAGEMENT ====================
+
+// Get all departments
+router.get('/departments', adminMiddleware, async (req, res) => {
+  try {
+    const departments = await Department.find()
+      .populate('head_of_department', 'name email')
+      .populate('created_by', 'name email')
+      .sort({ name: 1 });
+
+    res.json({ departments });
+  } catch (error) {
+    console.error('Get departments error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Create new department
+router.post('/departments', adminMiddleware, async (req, res) => {
+  try {
+    console.log('Department creation request received:', req.body);
+    console.log('Admin user:', req.user);
+
+    const { name, description, icon, services } = req.body;
+
+    if (!name || !description) {
+      return res.status(400).json({ message: 'Name and description are required' });
+    }
+
+    // Check if department already exists
+    const existingDepartment = await Department.findOne({
+      name: { $regex: new RegExp(`^${name}$`, 'i') }
+    });
+
+    if (existingDepartment) {
+      return res.status(400).json({ message: 'Department already exists' });
+    }
+
+    const department = new Department({
+      name: name.trim(),
+      description: description.trim(),
+      icon: icon || 'hospital',
+      services: services || [],
+      created_by: req.user._id
+    });
+
+    console.log('Attempting to save department:', department);
+    await department.save();
+    console.log('Department saved successfully');
+
+    const populatedDepartment = await Department.findById(department._id)
+      .populate('created_by', 'name email');
+
+    res.status(201).json({
+      message: 'Department created successfully',
+      department: populatedDepartment
+    });
+  } catch (error) {
+    console.error('Create department error:', error);
+    res.status(500).json({ message: 'Server error: ' + error.message });
+  }
+});
+
+// Update department
+router.put('/departments/:id', adminMiddleware, async (req, res) => {
+  try {
+    const { name, description, icon, services, isActive, head_of_department } = req.body;
+
+    const department = await Department.findByIdAndUpdate(
+      req.params.id,
+      {
+        name: name?.trim(),
+        description: description?.trim(),
+        icon,
+        services,
+        isActive,
+        head_of_department: head_of_department || null
+      },
+      { new: true }
+    ).populate('head_of_department', 'name email')
+     .populate('created_by', 'name email');
+
+    if (!department) {
+      return res.status(404).json({ message: 'Department not found' });
+    }
+
+    res.json({ message: 'Department updated successfully', department });
+  } catch (error) {
+    console.error('Update department error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Delete department
+router.delete('/departments/:id', adminMiddleware, async (req, res) => {
+  try {
+    // Check if any doctors are assigned to this department
+    const doctorsInDepartment = await User.countDocuments({
+      role: 'doctor',
+      'doctor_info.department': req.params.id
+    });
+
+    if (doctorsInDepartment > 0) {
+      return res.status(400).json({
+        message: 'Cannot delete department. Doctors are still assigned to this department.'
+      });
+    }
+
+    const department = await Department.findByIdAndDelete(req.params.id);
+
+    if (!department) {
+      return res.status(404).json({ message: 'Department not found' });
+    }
+
+    res.json({ message: 'Department deleted successfully' });
+  } catch (error) {
+    console.error('Delete department error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ===== DOCTOR SCHEDULE MANAGEMENT =====
+
+// Get doctor schedules
+router.get('/doctor-schedules/:doctorId', adminMiddleware, async (req, res) => {
+  try {
+    const { doctorId } = req.params;
+    const { startDate, endDate } = req.query;
+
+    // Verify doctor exists
+    const doctor = await User.findById(doctorId).select('name role');
+    if (!doctor || doctor.role !== 'doctor') {
+      return res.status(404).json({ message: 'Doctor not found' });
+    }
+
+    const query = { doctor_id: doctorId };
+    
+    if (startDate && endDate) {
+      query.date = {
+        $gte: new Date(startDate),
+        $lte: new Date(endDate)
+      };
+    }
+
+    const schedules = await DoctorSchedule.find(query).sort({ date: 1 });
+
+    res.json({
+      doctor: doctor.name,
+      schedules: schedules.map(schedule => ({
+        id: schedule._id,
+        date: schedule.date,
+        isAvailable: schedule.is_available,
+        workingHours: schedule.working_hours,
+        breakTime: schedule.break_time,
+        slotDuration: schedule.slot_duration,
+        maxPatientsPerSlot: schedule.max_patients_per_slot,
+        bookedSlots: schedule.booked_slots,
+        leaveReason: schedule.leave_reason,
+        notes: schedule.notes
+      }))
+    });
+  } catch (error) {
+    console.error('Get doctor schedules error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Create/Update doctor schedule
+router.post('/doctor-schedules/:doctorId', adminMiddleware, async (req, res) => {
+  try {
+    const { doctorId } = req.params;
+    const {
+      date,
+      isAvailable,
+      workingHours,
+      breakTime,
+      slotDuration,
+      maxPatientsPerSlot,
+      leaveReason,
+      notes
+    } = req.body;
+
+    // Verify doctor exists
+    const doctor = await User.findById(doctorId).select('name role');
+    if (!doctor || doctor.role !== 'doctor') {
+      return res.status(404).json({ message: 'Doctor not found' });
+    }
+
+    const scheduleDate = new Date(date);
+    scheduleDate.setHours(0, 0, 0, 0);
+
+    // Check if schedule already exists for this date
+    let schedule = await DoctorSchedule.findOne({
+      doctor_id: doctorId,
+      date: scheduleDate
+    });
+
+    if (schedule) {
+      // Update existing schedule
+      schedule.is_available = isAvailable !== undefined ? isAvailable : schedule.is_available;
+      schedule.working_hours = workingHours || schedule.working_hours;
+      schedule.break_time = breakTime || schedule.break_time;
+      schedule.slot_duration = slotDuration || schedule.slot_duration;
+      schedule.max_patients_per_slot = maxPatientsPerSlot || schedule.max_patients_per_slot;
+      schedule.leave_reason = leaveReason || schedule.leave_reason;
+      schedule.notes = notes || schedule.notes;
+      
+      await schedule.save();
+    } else {
+      // Create new schedule
+      schedule = new DoctorSchedule({
+        doctor_id: doctorId,
+        date: scheduleDate,
+        is_available: isAvailable !== undefined ? isAvailable : true,
+        working_hours: workingHours || {
+          start_time: '09:00',
+          end_time: '17:00'
+        },
+        break_time: breakTime || {
+          start_time: '13:00',
+          end_time: '14:00'
+        },
+        slot_duration: slotDuration || 30,
+        max_patients_per_slot: maxPatientsPerSlot || 1,
+        leave_reason: leaveReason || '',
+        notes: notes || ''
+      });
+      
+      await schedule.save();
+    }
+
+    res.json({
+      message: 'Doctor schedule updated successfully',
+      schedule: {
+        id: schedule._id,
+        date: schedule.date,
+        isAvailable: schedule.is_available,
+        workingHours: schedule.working_hours,
+        breakTime: schedule.break_time,
+        slotDuration: schedule.slot_duration,
+        maxPatientsPerSlot: schedule.max_patients_per_slot,
+        leaveReason: schedule.leave_reason,
+        notes: schedule.notes
+      }
+    });
+  } catch (error) {
+    console.error('Create/Update doctor schedule error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Delete doctor schedule
+router.delete('/doctor-schedules/:scheduleId', adminMiddleware, async (req, res) => {
+  try {
+    const { scheduleId } = req.params;
+
+    const schedule = await DoctorSchedule.findByIdAndDelete(scheduleId);
+
+    if (!schedule) {
+      return res.status(404).json({ message: 'Schedule not found' });
+    }
+
+    res.json({ message: 'Doctor schedule deleted successfully' });
+  } catch (error) {
+    console.error('Delete doctor schedule error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Bulk create schedules for a doctor (for setting up weekly/monthly schedules)
+router.post('/doctor-schedules/:doctorId/bulk', adminMiddleware, async (req, res) => {
+  try {
+    const { doctorId } = req.params;
+    const { startDate, endDate, scheduleTemplate, skipWeekends = true } = req.body;
+
+    // Verify doctor exists
+    const doctor = await User.findById(doctorId).select('name role');
+    if (!doctor || doctor.role !== 'doctor') {
+      return res.status(404).json({ message: 'Doctor not found' });
+    }
+
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+    const schedules = [];
+
+    for (let date = new Date(start); date <= end; date.setDate(date.getDate() + 1)) {
+      // Skip weekends if requested
+      if (skipWeekends && (date.getDay() === 0 || date.getDay() === 6)) {
+        continue;
+      }
+
+      const scheduleDate = new Date(date);
+      scheduleDate.setHours(0, 0, 0, 0);
+
+      // Check if schedule already exists
+      const existingSchedule = await DoctorSchedule.findOne({
+        doctor_id: doctorId,
+        date: scheduleDate
+      });
+
+      if (!existingSchedule) {
+        const schedule = new DoctorSchedule({
+          doctor_id: doctorId,
+          date: scheduleDate,
+          is_available: scheduleTemplate.isAvailable !== undefined ? scheduleTemplate.isAvailable : true,
+          working_hours: scheduleTemplate.workingHours || {
+            start_time: '09:00',
+            end_time: '17:00'
+          },
+          break_time: scheduleTemplate.breakTime || {
+            start_time: '13:00',
+            end_time: '14:00'
+          },
+          slot_duration: scheduleTemplate.slotDuration || 30,
+          max_patients_per_slot: scheduleTemplate.maxPatientsPerSlot || 1
+        });
+
+        schedules.push(schedule);
+      }
+    }
+
+    if (schedules.length > 0) {
+      await DoctorSchedule.insertMany(schedules);
+    }
+
+    res.json({
+      message: `Successfully created ${schedules.length} schedules for Dr. ${doctor.name}`,
+      createdCount: schedules.length
+    });
+  } catch (error) {
+    console.error('Bulk create doctor schedules error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 });

@@ -39,6 +39,18 @@ console.log("Admin routes loaded, registering...");
 app.use("/api/admin", adminRoutes);
 console.log("Admin routes registered successfully");
 
+console.log("Loading doctor routes...");
+const doctorRoutes = require("./src/routes/doctor.js");
+console.log("Doctor routes loaded, registering...");
+app.use("/api/doctor", doctorRoutes);
+console.log("Doctor routes registered successfully");
+
+console.log("Loading patient routes...");
+const patientRoutes = require("./src/routes/patient.js");
+console.log("Patient routes loaded, registering...");
+app.use("/api/patient", patientRoutes);
+console.log("Patient routes registered successfully");
+
 
 // Start server
 app.listen(PORT, async () => {
