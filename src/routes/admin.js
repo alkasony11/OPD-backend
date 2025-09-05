@@ -2,6 +2,7 @@ const express = require('express');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
+const mongoose = require('mongoose');
 const { User, PasswordResetToken, OTP } = require('../models/User');
 const Department = require('../models/Department');
 const DoctorSchedule = require('../models/DoctorSchedule');
@@ -945,6 +946,80 @@ router.delete('/doctor-schedules/:scheduleId', adminMiddleware, async (req, res)
   }
 });
 
+// Bulk delete schedules for a doctor
+router.post('/doctor-schedules/:doctorId/bulk-delete', adminMiddleware, async (req, res) => {
+  try {
+    console.log('Bulk delete endpoint hit:', {
+      doctorId: req.params.doctorId,
+      body: req.body,
+      method: req.method,
+      url: req.url
+    });
+    
+    const { doctorId } = req.params;
+    const { deleteType, startDate, endDate, scheduleIds } = req.body;
+
+    // Verify doctor exists
+    const doctor = await User.findById(doctorId).select('name role');
+    if (!doctor || doctor.role !== 'doctor') {
+      return res.status(404).json({ message: 'Doctor not found' });
+    }
+
+    let deletedCount = 0;
+
+    if (deleteType === 'range') {
+      // Delete schedules by date range
+      const start = new Date(startDate);
+      const end = new Date(endDate);
+      start.setHours(0, 0, 0, 0);
+      end.setHours(23, 59, 59, 999);
+
+      const result = await DoctorSchedule.deleteMany({
+        doctor_id: doctorId,
+        date: { $gte: start, $lte: end }
+      });
+
+      deletedCount = result.deletedCount;
+    } else if (deleteType === 'selected') {
+      // Delete selected schedules by IDs
+      if (!scheduleIds || scheduleIds.length === 0) {
+        return res.status(400).json({ message: 'No schedules selected for deletion' });
+      }
+
+      // Convert string IDs to ObjectIds
+      const objectIds = scheduleIds.map(id => {
+        try {
+          return new mongoose.Types.ObjectId(id);
+        } catch (error) {
+          console.error('Invalid ObjectId:', id);
+          return null;
+        }
+      }).filter(id => id !== null);
+
+      if (objectIds.length === 0) {
+        return res.status(400).json({ message: 'No valid schedule IDs provided' });
+      }
+
+      const result = await DoctorSchedule.deleteMany({
+        doctor_id: doctorId,
+        _id: { $in: objectIds }
+      });
+
+      deletedCount = result.deletedCount;
+    } else {
+      return res.status(400).json({ message: 'Invalid delete type' });
+    }
+
+    res.json({
+      message: `Successfully deleted ${deletedCount} schedules for Dr. ${doctor.name}`,
+      deletedCount
+    });
+  } catch (error) {
+    console.error('Bulk delete doctor schedules error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 // Bulk create schedules for a doctor (for setting up weekly/monthly schedules)
 router.post('/doctor-schedules/:doctorId/bulk', adminMiddleware, async (req, res) => {
   try {
@@ -998,7 +1073,16 @@ router.post('/doctor-schedules/:doctorId/bulk', adminMiddleware, async (req, res
     }
 
     if (schedules.length > 0) {
-      await DoctorSchedule.insertMany(schedules);
+      try {
+        await DoctorSchedule.insertMany(schedules, { ordered: false });
+      } catch (error) {
+        // Handle duplicate key errors gracefully
+        if (error.code === 11000) {
+          console.log('Some schedules already exist, continuing...');
+        } else {
+          throw error;
+        }
+      }
     }
 
     res.json({
