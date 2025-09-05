@@ -454,10 +454,18 @@ router.post('/forgot-password', async (req, res) => {
     });
     await tokenDoc.save();
 
+    // Log token for development convenience
+    console.log('[Password Reset] Generated token for', email, '=>', resetToken);
+
     // Send password reset email with link
     await sendPasswordResetEmail(email, resetToken);
 
-    res.json({ message: 'Password reset link sent to your email' });
+    // In non-production, also include the token in the response to ease local testing
+    const isProd = process.env.NODE_ENV === 'production';
+    res.json({
+      message: 'Password reset link sent to your email',
+      ...(isProd ? {} : { devToken: resetToken })
+    });
   } catch (error) {
     console.error('Forgot password error:', error);
     res.status(500).json({ message: 'Failed to send password reset link. Please try again.' });

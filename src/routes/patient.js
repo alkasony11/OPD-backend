@@ -584,6 +584,7 @@ router.get('/appointments', authMiddleware, patientMiddleware, async (req, res) 
 
     const appointmentList = appointments.map(apt => ({
       id: apt._id,
+      doctorId: apt.doctor_id?._id,
       tokenNumber: apt.token_number,
       doctorName: apt.doctor_id?.name || 'Unknown Doctor',
       departmentName: apt.department,
@@ -748,6 +749,115 @@ router.delete('/family-members/:memberId', authMiddleware, patientMiddleware, as
     res.json({ message: 'Family member removed successfully' });
   } catch (error) {
     console.error('Delete family member error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ===== PATIENT APPOINTMENT ACTIONS =====
+
+// Cancel appointment (allowed until 2 hours before)
+router.post('/appointments/:id/cancel', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { reason } = req.body || {};
+
+    const appointment = await Token.findOne({ _id: id, patient_id: req.patient._id });
+    if (!appointment) {
+      return res.status(404).json({ message: 'Appointment not found' });
+    }
+
+    if (['cancelled', 'missed', 'consulted'].includes(appointment.status)) {
+      return res.status(400).json({ message: `Cannot cancel a ${appointment.status} appointment` });
+    }
+
+    const now = new Date();
+    const aptDate = new Date(appointment.booking_date);
+    const [h, m] = (appointment.time_slot || '00:00').split(':').map(Number);
+    aptDate.setHours(h || 0, m || 0, 0, 0);
+
+    const msUntil = aptDate.getTime() - now.getTime();
+    const twoHoursMs = 2 * 60 * 60 * 1000;
+    if (msUntil <= twoHoursMs) {
+      return res.status(400).json({ message: 'Cancellations are only allowed up to 2 hours before the appointment' });
+    }
+
+    appointment.status = 'cancelled';
+    if (reason) appointment.cancellation_reason = reason;
+    await appointment.save();
+
+    return res.json({ message: 'Appointment cancelled successfully' });
+  } catch (error) {
+    console.error('Cancel appointment error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Reschedule appointment (change date/time if available)
+router.post('/appointments/:id/reschedule', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { doctorId, newDate, newTime } = req.body;
+
+    if (!doctorId || !newDate || !newTime) {
+      return res.status(400).json({ message: 'doctorId, newDate and newTime are required' });
+    }
+
+    const appointment = await Token.findOne({ _id: id, patient_id: req.patient._id });
+    if (!appointment) {
+      return res.status(404).json({ message: 'Appointment not found' });
+    }
+
+    if (['cancelled', 'missed', 'consulted'].includes(appointment.status)) {
+      return res.status(400).json({ message: `Cannot reschedule a ${appointment.status} appointment` });
+    }
+
+    const doctor = await User.findById(doctorId).select('doctor_info role');
+    if (!doctor || doctor.role !== 'doctor') {
+      return res.status(404).json({ message: 'Doctor not found' });
+    }
+
+    const selectedDate = new Date(newDate);
+    selectedDate.setHours(0, 0, 0, 0);
+    const schedule = await DoctorSchedule.findOne({ doctor_id: doctorId, date: selectedDate });
+
+    if (schedule && !schedule.is_available) {
+      return res.status(400).json({ message: `Doctor is not available on ${newDate}` });
+    }
+
+    const workingHours = schedule ? schedule.working_hours : (doctor.doctor_info?.default_working_hours || { start_time: '09:00', end_time: '17:00' });
+    const breakTime = schedule ? schedule.break_time : (doctor.doctor_info?.default_break_time || { start_time: '13:00', end_time: '14:00' });
+
+    const timeMinutes = parseTime(newTime);
+    const startMinutes = parseTime(workingHours.start_time);
+    const endMinutes = parseTime(workingHours.end_time);
+    const breakStart = parseTime(breakTime.start_time);
+    const breakEnd = parseTime(breakTime.end_time);
+    if (timeMinutes < startMinutes || timeMinutes >= endMinutes || (timeMinutes >= breakStart && timeMinutes < breakEnd)) {
+      return res.status(400).json({ message: 'Selected time is outside working hours' });
+    }
+
+    const nextDay = new Date(selectedDate);
+    nextDay.setDate(nextDay.getDate() + 1);
+    const conflict = await Token.findOne({
+      doctor_id: doctorId,
+      booking_date: { $gte: selectedDate, $lt: nextDay },
+      time_slot: newTime,
+      status: { $nin: ['cancelled', 'missed'] },
+      _id: { $ne: appointment._id }
+    });
+    if (conflict) {
+      return res.status(400).json({ message: 'Selected time slot is no longer available' });
+    }
+
+    appointment.doctor_id = doctorId;
+    appointment.booking_date = selectedDate;
+    appointment.time_slot = newTime;
+    appointment.status = 'booked';
+    await appointment.save();
+
+    res.json({ message: 'Appointment rescheduled successfully' });
+  } catch (error) {
+    console.error('Reschedule appointment error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 });
