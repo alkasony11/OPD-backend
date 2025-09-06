@@ -51,6 +51,12 @@ console.log("Patient routes loaded, registering...");
 app.use("/api/patient", patientRoutes);
 console.log("Patient routes registered successfully");
 
+console.log("Loading receptionist routes...");
+const receptionistRoutes = require("./src/routes/receptionist.js");
+console.log("Receptionist routes loaded, registering...");
+app.use("/api/receptionist", receptionistRoutes);
+console.log("Receptionist routes registered successfully");
+
 
 // Start server
 app.listen(PORT, async () => {
