@@ -57,11 +57,11 @@ router.get('/doctors/:departmentId', async (req, res) => {
     // Add availability info for each doctor
     const doctorsWithAvailability = await Promise.all(
       doctors.map(async (doctor) => {
-        // Check if doctor has any available schedules in the next 30 days
+        // Check if doctor has any available schedules in the next 1 month
         const today = new Date();
         today.setHours(0, 0, 0, 0);
         const futureDate = new Date();
-        futureDate.setDate(today.getDate() + 30);
+        futureDate.setMonth(today.getMonth() + 1);
 
         const availableSchedules = await DoctorSchedule.countDocuments({
           doctor_id: doctor._id,
@@ -111,7 +111,7 @@ router.get('/doctors/:departmentId', async (req, res) => {
   }
 });
 
-// Get available dates for a doctor (next 30 days)
+// Get available dates for a doctor (only scheduled dates, next 1 month)
 router.get('/doctors/:doctorId/available-dates', async (req, res) => {
   try {
     const { doctorId } = req.params;
@@ -125,85 +125,56 @@ router.get('/doctors/:doctorId/available-dates', async (req, res) => {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     const futureDate = new Date();
-    futureDate.setDate(today.getDate() + 30);
+    futureDate.setMonth(today.getMonth() + 1); // 1 month ahead
 
-    // Get all schedules for this doctor in the next 30 days
+    // Get all the doctor's actual schedules for the next month
     const schedules = await DoctorSchedule.find({
       doctor_id: doctorId,
       date: { $gte: today, $lte: futureDate }
     }).sort({ date: 1 });
 
-    // Get doctor's default working hours
-    const defaultHours = doctor.doctor_info?.default_working_hours || {
-      start_time: '09:00',
-      end_time: '17:00'
-    };
-    const defaultBreak = doctor.doctor_info?.default_break_time || {
-      start_time: '13:00',
-      end_time: '14:00'
-    };
-
     const availableDates = [];
 
-    // Check each day for the next 30 days
-    for (let i = 0; i < 30; i++) {
-      const checkDate = new Date(today);
-      checkDate.setDate(today.getDate() + i);
-      const dateStr = checkDate.toISOString().split('T')[0];
-
-      // Skip Sundays (assuming doctors don't work on Sundays by default)
-      if (checkDate.getDay() === 0) continue;
-
-      // Check if doctor has a specific schedule for this date
-      const daySchedule = schedules.find(s => 
-        s.date.toISOString().split('T')[0] === dateStr
-      );
-
-      let isAvailable = true;
-      let workingHours = defaultHours;
-      let breakTime = defaultBreak;
-      let leaveReason = '';
-
-      if (daySchedule) {
-        isAvailable = daySchedule.is_available;
-        workingHours = daySchedule.working_hours;
-        breakTime = daySchedule.break_time;
-        leaveReason = daySchedule.leave_reason || '';
+    // Process each scheduled date
+    for (const schedule of schedules) {
+      // Only process available schedules
+      if (!schedule.is_available) {
+        continue;
       }
 
-      // Only include available dates
-      if (isAvailable) {
-        // Check if there are any available slots for this date
-        const nextDay = new Date(checkDate);
-        nextDay.setDate(checkDate.getDate() + 1);
+      const checkDate = schedule.date;
+      const dateStr = checkDate.toISOString().split('T')[0];
 
-        const existingAppointments = await Token.countDocuments({
-          doctor_id: doctorId,
-          booking_date: { $gte: checkDate, $lt: nextDay },
-          status: { $nin: ['cancelled', 'missed'] }
+      // Check if there are any available slots for this date
+      const nextDay = new Date(checkDate);
+      nextDay.setDate(checkDate.getDate() + 1);
+
+      const existingAppointments = await Token.countDocuments({
+        doctor_id: doctorId,
+        booking_date: { $gte: checkDate, $lt: nextDay },
+        status: { $nin: ['cancelled', 'missed'] }
+      });
+
+      // Calculate total possible slots
+      const totalSlots = calculateTotalSlots(schedule.working_hours, schedule.break_time, schedule.slot_duration || 30);
+      const availableSlots = totalSlots - existingAppointments;
+
+      if (availableSlots > 0) {
+        availableDates.push({
+          date: dateStr,
+          dayName: checkDate.toLocaleDateString('en-US', { weekday: 'long' }),
+          isToday: dateStr === today.toISOString().split('T')[0],
+          workingHours: {
+            start: schedule.working_hours.start_time,
+            end: schedule.working_hours.end_time
+          },
+          breakTime: {
+            start: schedule.break_time.start_time,
+            end: schedule.break_time.end_time
+          },
+          availableSlots,
+          totalSlots
         });
-
-        // Calculate total possible slots
-        const totalSlots = calculateTotalSlots(workingHours, breakTime, 30);
-        const availableSlots = totalSlots - existingAppointments;
-
-        if (availableSlots > 0) {
-          availableDates.push({
-            date: dateStr,
-            dayName: checkDate.toLocaleDateString('en-US', { weekday: 'long' }),
-            isToday: i === 0,
-            workingHours: {
-              start: workingHours.start_time,
-              end: workingHours.end_time
-            },
-            breakTime: {
-              start: breakTime.start_time,
-              end: breakTime.end_time
-            },
-            availableSlots,
-            totalSlots
-          });
-        }
       }
     }
 
@@ -251,33 +222,28 @@ router.get('/doctors/:doctorId/availability/:date', async (req, res) => {
       date: selectedDate
     });
 
-    // Use schedule if exists, otherwise use default hours
-    let workingHours, breakTime, slotDuration;
-    
-    if (schedule) {
-      if (!schedule.is_available) {
-        return res.json({ 
-          slots: [], 
-          message: `Doctor is not available on ${date}. Reason: ${schedule.leave_reason || 'Not specified'}`,
-          isAvailable: false,
-          leaveReason: schedule.leave_reason
-        });
-      }
-      workingHours = schedule.working_hours;
-      breakTime = schedule.break_time;
-      slotDuration = schedule.slot_duration || 30;
-    } else {
-      // Use doctor's default hours
-      workingHours = doctor.doctor_info?.default_working_hours || {
-        start_time: '09:00',
-        end_time: '17:00'
-      };
-      breakTime = doctor.doctor_info?.default_break_time || {
-        start_time: '13:00',
-        end_time: '14:00'
-      };
-      slotDuration = doctor.doctor_info?.default_slot_duration || 30;
+    // Only use schedule if exists, otherwise doctor is not available
+    if (!schedule) {
+      return res.json({ 
+        slots: [], 
+        message: `Doctor has no schedule for ${date}. Please select a scheduled date.`,
+        isAvailable: false,
+        leaveReason: 'No schedule'
+      });
     }
+    
+    if (!schedule.is_available) {
+      return res.json({ 
+        slots: [], 
+        message: `Doctor is not available on ${date}. Reason: ${schedule.leave_reason || 'Not specified'}`,
+        isAvailable: false,
+        leaveReason: schedule.leave_reason
+      });
+    }
+    
+    const workingHours = schedule.working_hours;
+    const breakTime = schedule.break_time;
+    const slotDuration = schedule.slot_duration || 30;
 
     // Generate time slots
     const slots = generateTimeSlots(workingHours, breakTime, slotDuration);
@@ -416,27 +382,21 @@ router.post('/book-appointment', authMiddleware, patientMiddleware, async (req, 
       date: selectedDate
     });
 
-    if (schedule && !schedule.is_available) {
+    if (!schedule) {
+      return res.status(400).json({ 
+        message: `Doctor has no schedule for ${appointmentDate}. Please select a scheduled date.` 
+      });
+    }
+
+    if (!schedule.is_available) {
       return res.status(400).json({ 
         message: `Doctor is not available on ${appointmentDate}. Reason: ${schedule.leave_reason || 'Not specified'}` 
       });
     }
 
-    // Check if the time slot is within doctor's working hours
-    let workingHours, breakTime;
-    if (schedule) {
-      workingHours = schedule.working_hours;
-      breakTime = schedule.break_time;
-    } else {
-      workingHours = doctor.doctor_info?.default_working_hours || {
-        start_time: '09:00',
-        end_time: '17:00'
-      };
-      breakTime = doctor.doctor_info?.default_break_time || {
-        start_time: '13:00',
-        end_time: '14:00'
-      };
-    }
+    // Use schedule working hours
+    const workingHours = schedule.working_hours;
+    const breakTime = schedule.break_time;
 
     // Validate if appointment time is within working hours
     const appointmentMinutes = parseTime(appointmentTime);
@@ -820,12 +780,16 @@ router.post('/appointments/:id/reschedule', authMiddleware, patientMiddleware, a
     selectedDate.setHours(0, 0, 0, 0);
     const schedule = await DoctorSchedule.findOne({ doctor_id: doctorId, date: selectedDate });
 
-    if (schedule && !schedule.is_available) {
-      return res.status(400).json({ message: `Doctor is not available on ${newDate}` });
+    if (!schedule) {
+      return res.status(400).json({ message: `Doctor has no schedule for ${newDate}. Please select a scheduled date.` });
     }
 
-    const workingHours = schedule ? schedule.working_hours : (doctor.doctor_info?.default_working_hours || { start_time: '09:00', end_time: '17:00' });
-    const breakTime = schedule ? schedule.break_time : (doctor.doctor_info?.default_break_time || { start_time: '13:00', end_time: '14:00' });
+    if (!schedule.is_available) {
+      return res.status(400).json({ message: `Doctor is not available on ${newDate}. Reason: ${schedule.leave_reason || 'Not specified'}` });
+    }
+
+    const workingHours = schedule.working_hours;
+    const breakTime = schedule.break_time;
 
     const timeMinutes = parseTime(newTime);
     const startMinutes = parseTime(workingHours.start_time);

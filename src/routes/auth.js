@@ -239,7 +239,7 @@ router.post('/login', async (req, res) => {
         redirectTo = '/doctor/dashboard';
         break;
       case 'receptionist':
-        redirectTo = '/'; // No specific receptionist dashboard yet
+        redirectTo = '/receptionist/dashboard';
         break;
       case 'admin':
         redirectTo = '/admin/dashboard';

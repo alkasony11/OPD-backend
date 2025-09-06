@@ -807,18 +807,13 @@ router.get('/availability/:date', authMiddleware, async (req, res) => {
     });
 
     if (!schedule) {
-      // No schedule set, assume available with default hours
+      // No schedule set, doctor is not available
       res.json({
-        isAvailable: true,
-        workingHours: {
-          start_time: '09:00',
-          end_time: '17:00'
-        },
-        breakTime: {
-          start_time: '13:00',
-          end_time: '14:00'
-        },
-        slotDuration: 30
+        isAvailable: false,
+        workingHours: null,
+        breakTime: null,
+        slotDuration: null,
+        leaveReason: 'No schedule'
       });
     } else {
       res.json({
