@@ -40,6 +40,42 @@ const sendOTPEmail = async (email, otp, type = 'registration') => {
   await transporter.sendMail(mailOptions);
 };
 
+// Availability check for email/phone during registration
+router.get('/availability', async (req, res) => {
+  try {
+    const { email } = req.query;
+    let { phone } = req.query;
+
+    if (!email && !phone) {
+      return res.status(400).json({ message: 'Provide email or phone to check availability' });
+    }
+
+    const result = {};
+
+    if (email) {
+      const existingByEmail = await User.findOne({ email });
+      result.email = { available: !existingByEmail };
+    }
+
+    if (phone) {
+      // Normalize Indian numbers to 10-digit for consistent storage comparison
+      let digits = String(phone).replace(/\D/g, '');
+      if (digits.startsWith('0')) digits = digits.replace(/^0+/, '');
+      if (digits.startsWith('91') && digits.length === 12) digits = digits.slice(2);
+      if (digits.length !== 10) {
+        return res.status(400).json({ message: 'Invalid phone format' });
+      }
+      const existingByPhone = await User.findOne({ phone: digits });
+      result.phone = { available: !existingByPhone };
+    }
+
+    return res.json(result);
+  } catch (error) {
+    console.error('Availability check error:', error);
+    return res.status(500).json({ message: 'Server error' });
+  }
+});
+
 // Helper function to send password reset email with link
 const sendPasswordResetEmail = async (email, resetToken) => {
   const resetUrl = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/reset-password?token=${resetToken}`;
