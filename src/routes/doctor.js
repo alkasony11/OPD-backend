@@ -2,11 +2,12 @@ const express = require('express');
 const router = express.Router();
 const { User, Appointment, Token } = require('../models/User');
 const DoctorSchedule = require('../models/DoctorSchedule');
+const LeaveRequest = require('../models/LeaveRequest');
 const DoctorStats = require('../models/DoctorStats');
 const DoctorStatsService = require('../services/doctorStatsService');
 const { authMiddleware } = require('../middleware/authMiddleware');
 
-// Middleware to check if user is a doctor
+// Doctor role guard
 const doctorMiddleware = async (req, res, next) => {
   try {
     const user = await User.findById(req.user.userId);
@@ -20,6 +21,41 @@ const doctorMiddleware = async (req, res, next) => {
     res.status(500).json({ message: 'Server error' });
   }
 };
+
+// Leave Requests
+// Doctor submits a leave request
+router.post('/leave-requests', authMiddleware, doctorMiddleware, async (req, res) => {
+  try {
+    const { date, reason } = req.body;
+    if (!date) return res.status(400).json({ message: 'Date is required' });
+    const leaveDate = new Date(date);
+    leaveDate.setHours(0, 0, 0, 0);
+
+    const leave = await LeaveRequest.findOneAndUpdate(
+      { doctor_id: req.doctor._id, date: leaveDate },
+      { reason: reason || '', status: 'pending' },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    res.json({ message: 'Leave request submitted', leave });
+  } catch (error) {
+    console.error('Submit leave request error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Doctor lists their leave requests
+router.get('/leave-requests', authMiddleware, doctorMiddleware, async (req, res) => {
+  try {
+    const leaves = await LeaveRequest.find({ doctor_id: req.doctor._id }).sort({ date: -1 });
+    res.json({ leaves });
+  } catch (error) {
+    console.error('List leave requests error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// (middleware defined above)
 
 // Get doctor's appointments from tokens collection
 router.get('/appointments', authMiddleware, doctorMiddleware, async (req, res) => {
@@ -662,6 +698,66 @@ router.get('/patients', authMiddleware, doctorMiddleware, async (req, res) => {
     res.json({ patients });
   } catch (error) {
     console.error('Get patients error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get booked patients (patients with active appointments)
+router.get('/booked-patients', authMiddleware, doctorMiddleware, async (req, res) => {
+  try {
+    const doctorId = req.doctor._id;
+
+    // Get patients who have active appointments (booked or in_queue status)
+    const appointments = await Token.find({ 
+      doctor_id: doctorId,
+      status: { $in: ['booked', 'in_queue'] }
+    })
+      .populate('patient_id', 'name email phone patient_info')
+      .sort({ booking_date: 1 });
+
+    // Create unique patients list with their next appointment info
+    const patientsMap = new Map();
+
+    appointments.forEach(appointment => {
+      const patientId = appointment.patient_id?._id?.toString();
+      if (patientId) {
+        const patient = appointment.patient_id;
+        
+        // If patient already exists, update with earliest appointment
+        if (patientsMap.has(patientId)) {
+          const existingPatient = patientsMap.get(patientId);
+          if (new Date(appointment.booking_date) < new Date(existingPatient.nextAppointment.booking_date)) {
+            existingPatient.nextAppointment = {
+              booking_date: appointment.booking_date,
+              time_slot: appointment.time_slot,
+              status: appointment.status,
+              token_number: appointment.token_number
+            };
+          }
+        } else {
+          // Add new patient
+          patientsMap.set(patientId, {
+            _id: patientId,
+            name: patient.name,
+            email: patient.email,
+            phone: patient.phone,
+            age: patient.patient_info?.age || 'N/A',
+            gender: patient.patient_info?.gender || 'N/A',
+            nextAppointment: {
+              booking_date: appointment.booking_date,
+              time_slot: appointment.time_slot,
+              status: appointment.status,
+              token_number: appointment.token_number
+            }
+          });
+        }
+      }
+    });
+
+    const patients = Array.from(patientsMap.values());
+    res.json({ patients });
+  } catch (error) {
+    console.error('Get booked patients error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 });

@@ -3,7 +3,8 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const mongoose = require('mongoose');
-const { User, PasswordResetToken, OTP } = require('../models/User');
+const { User, PasswordResetToken, OTP, Token } = require('../models/User');
+const LeaveRequest = require('../models/LeaveRequest');
 const Department = require('../models/Department');
 const DoctorSchedule = require('../models/DoctorSchedule');
 const { transporter } = require('../config/email');
@@ -1017,6 +1018,146 @@ router.post('/doctor-schedules/:doctorId/bulk-delete', adminMiddleware, async (r
   } catch (error) {
     console.error('Bulk delete doctor schedules error:', error);
     res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ===== DOCTOR LEAVE REQUESTS =====
+
+// List leave requests (optional filtering by status)
+router.get('/leave-requests', adminMiddleware, async (req, res) => {
+  try {
+    const { status } = req.query;
+    const query = {};
+    if (status) query.status = status;
+    const leaves = await LeaveRequest.find(query).populate('doctor_id', 'name email');
+    res.json({ leaves });
+  } catch (error) {
+    console.error('List leave requests error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Approve a leave request and disable bookings for that date
+router.post('/leave-requests/:id/approve', adminMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { admin_comment } = req.body;
+    
+    console.log('Approving leave request:', id, 'with comment:', admin_comment);
+    
+    const leave = await LeaveRequest.findById(id);
+    if (!leave) {
+      console.log('Leave request not found:', id);
+      return res.status(404).json({ message: 'Leave request not found' });
+    }
+
+    console.log('Found leave request:', leave);
+
+    // Update leave request status
+    leave.status = 'approved';
+    if (admin_comment) leave.admin_comment = admin_comment;
+    await leave.save();
+    console.log('Leave request updated successfully');
+
+    // Ensure schedule is marked unavailable for that date
+    const scheduleDate = new Date(leave.date);
+    scheduleDate.setHours(0, 0, 0, 0);
+    console.log('Schedule date:', scheduleDate);
+
+    let schedule = await DoctorSchedule.findOne({ doctor_id: leave.doctor_id, date: scheduleDate });
+    console.log('Existing schedule found:', !!schedule);
+    
+    if (!schedule) {
+      console.log('Creating new schedule for leave date');
+      schedule = new DoctorSchedule({
+        doctor_id: leave.doctor_id,
+        date: scheduleDate,
+        is_available: false,
+        working_hours: { start_time: '09:00', end_time: '17:00' },
+        break_time: { start_time: '13:00', end_time: '14:00' },
+        slot_duration: 30,
+        max_patients_per_slot: 1,
+        leave_reason: leave.reason || 'Approved leave',
+        notes: 'Auto-set by admin leave approval'
+      });
+    } else {
+      console.log('Updating existing schedule');
+      schedule.is_available = false;
+      schedule.leave_reason = leave.reason || 'Approved leave';
+    }
+    
+    await schedule.save();
+    console.log('Schedule saved successfully');
+
+    // Cancel or disable tokens for that date
+    const nextDay = new Date(scheduleDate);
+    nextDay.setDate(nextDay.getDate() + 1);
+    
+    const tokenUpdateResult = await Token.updateMany(
+      {
+        doctor_id: leave.doctor_id,
+        booking_date: { $gte: scheduleDate, $lt: nextDay },
+        status: { $in: ['booked', 'in_queue'] }
+      },
+      { $set: { status: 'cancelled' } }
+    );
+    
+    console.log('Tokens updated:', tokenUpdateResult);
+
+    res.json({ 
+      message: 'Leave approved and day blocked', 
+      leave: {
+        _id: leave._id,
+        status: leave.status,
+        admin_comment: leave.admin_comment
+      }
+    });
+  } catch (error) {
+    console.error('Approve leave request error:', error);
+    console.error('Error stack:', error.stack);
+    res.status(500).json({ 
+      message: 'Server error', 
+      error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+    });
+  }
+});
+
+// Reject a leave request
+router.post('/leave-requests/:id/reject', adminMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { admin_comment } = req.body;
+    
+    console.log('Rejecting leave request:', id, 'with comment:', admin_comment);
+    
+    const leave = await LeaveRequest.findById(id);
+    if (!leave) {
+      console.log('Leave request not found:', id);
+      return res.status(404).json({ message: 'Leave request not found' });
+    }
+
+    console.log('Found leave request:', leave);
+
+    leave.status = 'rejected';
+    if (admin_comment) leave.admin_comment = admin_comment;
+    await leave.save();
+    console.log('Leave request rejected successfully');
+
+    res.json({ 
+      message: 'Leave rejected', 
+      leave: {
+        _id: leave._id,
+        status: leave.status,
+        admin_comment: leave.admin_comment
+      }
+    });
+  } catch (error) {
+    console.error('Reject leave request error:', error);
+    console.error('Error stack:', error.stack);
+    res.status(500).json({ 
+      message: 'Server error', 
+      error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+    });
   }
 });
 
