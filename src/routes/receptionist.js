@@ -503,8 +503,8 @@ router.post('/appointments', authMiddleware, receptionistMiddleware, async (req,
     } = req.body;
 
     // Validate required fields
-    if (!patientId || !doctorId || !departmentId || !appointmentDate || !appointmentTime || !symptoms) {
-      return res.status(400).json({ message: 'All required fields must be provided' });
+    if (!patientId || !doctorId || !departmentId || !appointmentDate || !appointmentTime) {
+      return res.status(400).json({ message: 'patientId, doctorId, departmentId, appointmentDate and appointmentTime are required' });
     }
 
     // Get patient and doctor details
@@ -529,10 +529,12 @@ router.post('/appointments', authMiddleware, receptionistMiddleware, async (req,
     const selectedDate = new Date(appointmentDate);
     selectedDate.setHours(0, 0, 0, 0);
 
-    // Check if doctor is available on that date
+    // Check if doctor is available on that date (timezone-safe day range)
+    const endOfDay = new Date(selectedDate);
+    endOfDay.setDate(endOfDay.getDate() + 1);
     const schedule = await DoctorSchedule.findOne({
       doctor_id: doctorId,
-      date: selectedDate
+      date: { $gte: selectedDate, $lt: endOfDay }
     });
 
     if (!schedule || !schedule.is_available) {
@@ -558,16 +560,44 @@ router.post('/appointments', authMiddleware, receptionistMiddleware, async (req,
       });
     }
 
+    // Block multiple active appointments in the same department (for self or same family member)
+    const activeSameDepartmentQuery = {
+      patient_id: patientId,
+      department: department.name,
+      status: { $in: ['booked', 'in_queue'] }
+    };
+    if (familyMemberId && familyMemberId !== 'self') {
+      activeSameDepartmentQuery.family_member_id = familyMemberId;
+    } else {
+      activeSameDepartmentQuery.family_member_id = null;
+    }
+    const existingActiveSameDept = await Token.findOne(activeSameDepartmentQuery);
+    if (existingActiveSameDept) {
+      return res.status(400).json({
+        message: 'Cannot book another appointment in the same department until the current one is completed or cancelled'
+      });
+    }
+
+    // Validate family member if provided and normalize 'self'
+    let familyMemberObjectId = null;
+    if (familyMemberId && familyMemberId !== 'self') {
+      const fm = await FamilyMember.findOne({ _id: familyMemberId, patient_id: patientId, isActive: true });
+      if (!fm) {
+        return res.status(404).json({ message: 'Family member not found' });
+      }
+      familyMemberObjectId = fm._id;
+    }
+
     // Generate token number
-    const tokenNumber = `TKN${Date.now().toString().slice(-6)}`;
+    const tokenNumber = `T${Date.now().toString().slice(-4)}`;
 
     // Create appointment
     const appointment = new Token({
       patient_id: patientId,
-      family_member_id: familyMemberId || null,
+      family_member_id: familyMemberObjectId,
       doctor_id: doctorId,
       department: department.name,
-      symptoms,
+      symptoms: symptoms && String(symptoms).trim().length > 0 ? symptoms : 'Not provided',
       booking_date: selectedDate,
       time_slot: appointmentTime,
       status: 'booked',
@@ -591,7 +621,7 @@ router.post('/appointments', authMiddleware, receptionistMiddleware, async (req,
       appointment: {
         _id: appointment._id,
         tokenNumber: appointment.token_number,
-        patientName: patient.name,
+        patientName: familyMemberObjectId ? (await FamilyMember.findById(familyMemberObjectId)).name : patient.name,
         doctorName: doctor.name,
         department: department.name,
         appointmentDate: appointment.booking_date,

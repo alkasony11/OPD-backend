@@ -5,6 +5,9 @@ const Department = require('../models/Department');
 const FamilyMember = require('../models/FamilyMember');
 const DoctorSchedule = require('../models/DoctorSchedule');
 const { authMiddleware } = require('../middleware/authMiddleware');
+const SymptomAnalysisService = require('../services/symptomAnalysisService');
+const crypto = require('crypto');
+let Razorpay; try { Razorpay = require('razorpay'); } catch { Razorpay = null; }
 
 // Middleware to check if user is a patient
 const patientMiddleware = async (req, res, next) => {
@@ -20,6 +23,56 @@ const patientMiddleware = async (req, res, next) => {
     res.status(500).json({ message: 'Server error' });
   }
 };
+
+// Analyze symptoms and suggest departments
+router.post('/analyze-symptoms', async (req, res) => {
+  try {
+    const { symptoms } = req.body;
+
+    if (!symptoms || typeof symptoms !== 'string') {
+      return res.status(400).json({ message: 'Symptoms text is required' });
+    }
+
+    const analysis = await SymptomAnalysisService.analyzeSymptoms(symptoms);
+    
+    // Get department IDs from database for the suggested departments
+    const suggestedDepartments = [analysis.primaryDepartment, ...analysis.relatedDepartments];
+    const departments = await Department.find({ 
+      name: { $in: suggestedDepartments },
+      isActive: true 
+    }).select('_id name description icon');
+
+    // Create department mapping
+    const departmentMap = {};
+    departments.forEach(dept => {
+      departmentMap[dept.name] = {
+        id: dept._id,
+        name: dept.name,
+        description: dept.description,
+        icon: dept.icon
+      };
+    });
+
+    // Build response with department details
+    const primaryDept = departmentMap[analysis.primaryDepartment];
+    const relatedDepts = analysis.relatedDepartments
+      .map(name => departmentMap[name])
+      .filter(dept => dept); // Filter out departments not found in database
+
+    res.json({
+      analysis: {
+        primaryDepartment: primaryDept,
+        relatedDepartments: relatedDepts,
+        confidence: analysis.confidence,
+        reasoning: analysis.reasoning,
+        matchedSymptoms: analysis.matchedSymptoms
+      }
+    });
+  } catch (error) {
+    console.error('Symptom analysis error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
 
 // Get all active departments
 router.get('/departments', async (req, res) => {
@@ -108,6 +161,614 @@ router.get('/doctors/:departmentId', async (req, res) => {
   } catch (error) {
     console.error('Get doctors error:', error);
     res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get department-level available dates (union across doctors) for next 1 month
+router.get('/departments/:departmentId/available-dates', async (req, res) => {
+  try {
+    const { departmentId } = req.params;
+
+    // Find all doctors in the department
+    const doctors = await User.find({
+      role: 'doctor',
+      'doctor_info.department': departmentId
+    }).select('_id');
+
+
+    if (!doctors.length) {
+      return res.json({ availableDates: [] });
+    }
+
+    const doctorIds = doctors.map(d => d._id);
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const futureDate = new Date();
+    futureDate.setMonth(today.getMonth() + 1);
+
+    // Fetch all schedules for these doctors in next month
+    const schedules = await DoctorSchedule.find({
+      doctor_id: { $in: doctorIds },
+      date: { $gte: today, $lte: futureDate },
+      is_available: true
+    }).sort({ date: 1 });
+
+
+    // Map dateStr -> aggregate available sessions (sum across doctors)
+    const dateAvailabilityMap = new Map();
+
+    for (const schedule of schedules) {
+      const date = new Date(schedule.date);
+      date.setHours(0, 0, 0, 0);
+      const dateStr = date.toISOString().split('T')[0];
+
+      const nextDay = new Date(date);
+      nextDay.setDate(date.getDate() + 1);
+
+      // Count existing appointments for this doctor/date
+      const existingAppointments = await Token.countDocuments({
+        doctor_id: schedule.doctor_id,
+        booking_date: { $gte: date, $lt: nextDay },
+        status: { $nin: ['cancelled', 'missed'] }
+      });
+
+      // Calculate session-based availability
+      let availableSessions = 0;
+      let totalSessions = 0;
+
+
+      // Check morning session availability
+      if (schedule.morning_session?.available !== false) {
+        totalSessions++;
+        const morningCapacity = schedule.morning_session?.max_patients || 10;
+        const morningAppointments = await Token.countDocuments({
+          doctor_id: schedule.doctor_id,
+          booking_date: { $gte: date, $lt: nextDay },
+          time_slot: { $gte: '09:00', $lt: '13:00' },
+          status: { $nin: ['cancelled', 'missed'] }
+        });
+        if (morningAppointments < morningCapacity) {
+          availableSessions++;
+        }
+      }
+
+      // Check afternoon session availability
+      if (schedule.afternoon_session?.available !== false) {
+        totalSessions++;
+        const afternoonCapacity = schedule.afternoon_session?.max_patients || 10;
+        const afternoonAppointments = await Token.countDocuments({
+          doctor_id: schedule.doctor_id,
+          booking_date: { $gte: date, $lt: nextDay },
+          time_slot: { $gte: '14:00', $lt: '18:00' },
+          status: { $nin: ['cancelled', 'missed'] }
+        });
+        if (afternoonAppointments < afternoonCapacity) {
+          availableSessions++;
+        }
+      }
+
+
+      if (availableSessions > 0) {
+        const prev = dateAvailabilityMap.get(dateStr) || { date, availableSessions: 0, totalSessions: 0 };
+        prev.availableSessions += availableSessions;
+        prev.totalSessions += totalSessions;
+        dateAvailabilityMap.set(dateStr, prev);
+      }
+    }
+
+    // If no schedules contributed availability, fall back to defaults for next 7 days
+    if (dateAvailabilityMap.size === 0) {
+      const next7 = [];
+      for (let i = 0; i < 7; i++) {
+        const d = new Date(today);
+        d.setDate(today.getDate() + i);
+        d.setHours(0, 0, 0, 0);
+        next7.push(d);
+      }
+
+      for (const d of next7) {
+        const dateStr = d.toISOString().split('T')[0];
+
+        // Default session-based availability (2 sessions per doctor)
+        let dayAvailableSessions = 0;
+        let dayTotalSessions = 0;
+
+        for (const docId of doctorIds) {
+          // Each doctor has 2 default sessions (morning + afternoon)
+          dayTotalSessions += 2;
+          
+          // Check if doctor has any appointments for this date
+          const nextDay = new Date(d);
+          nextDay.setDate(d.getDate() + 1);
+          const hasAppointments = await Token.countDocuments({
+            doctor_id: docId,
+            booking_date: { $gte: d, $lt: nextDay },
+            status: { $nin: ['cancelled', 'missed'] }
+          });
+          
+          // If no appointments, both sessions are available
+          if (hasAppointments === 0) {
+            dayAvailableSessions += 2;
+          } else {
+            // Check individual session capacity (default 10 patients per session)
+            const morningAppointments = await Token.countDocuments({
+              doctor_id: docId,
+              booking_date: { $gte: d, $lt: nextDay },
+              time_slot: { $gte: '09:00', $lt: '13:00' },
+              status: { $nin: ['cancelled', 'missed'] }
+            });
+            const afternoonAppointments = await Token.countDocuments({
+              doctor_id: docId,
+              booking_date: { $gte: d, $lt: nextDay },
+              time_slot: { $gte: '14:00', $lt: '18:00' },
+              status: { $nin: ['cancelled', 'missed'] }
+            });
+            
+            if (morningAppointments < 10) dayAvailableSessions++;
+            if (afternoonAppointments < 10) dayAvailableSessions++;
+          }
+        }
+
+        if (dayAvailableSessions > 0) {
+          dateAvailabilityMap.set(dateStr, {
+            date: d,
+            availableSessions: dayAvailableSessions,
+            totalSessions: dayTotalSessions
+          });
+        }
+      }
+    }
+
+    const availableDates = Array.from(dateAvailabilityMap.entries()).map(([dateStr, info]) => ({
+      date: dateStr,
+      dayName: info.date.toLocaleDateString('en-US', { weekday: 'long' }),
+      isToday: dateStr === today.toISOString().split('T')[0],
+      availableSessions: info.availableSessions || 0,
+      totalSessions: info.totalSessions || 0,
+      // Keep backward compatibility
+      availableSlots: info.availableSessions || 0,
+      totalSlots: info.totalSessions || 0
+    })).sort((a, b) => (a.date < b.date ? -1 : 1));
+
+    res.json({ availableDates });
+  } catch (error) {
+    console.error('Department available dates error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get department-level available sessions for a specific date (Morning/Afternoon)
+router.get('/departments/:departmentId/availability/:date', async (req, res) => {
+  try {
+    const { departmentId, date } = req.params;
+
+    const selectedDate = new Date(date);
+    selectedDate.setHours(0, 0, 0, 0);
+    const nextDay = new Date(selectedDate);
+    nextDay.setDate(nextDay.getDate() + 1);
+
+    // Doctors in department
+    const doctors = await User.find({
+      role: 'doctor',
+      'doctor_info.department': departmentId
+    }).select('_id name doctor_info');
+
+    if (!doctors.length) return res.json({ sessions: [] });
+
+    // Define session times
+    const sessions = [
+      {
+        id: 'morning',
+        name: 'Morning Session',
+        startTime: '09:00',
+        endTime: '13:00',
+        displayTime: '9:00 AM - 1:00 PM'
+      },
+      {
+        id: 'afternoon',
+        name: 'Afternoon Session',
+        startTime: '14:00',
+        endTime: '18:00',
+        displayTime: '2:00 PM - 6:00 PM'
+      }
+    ];
+
+    const availableSessions = [];
+
+    for (const session of sessions) {
+      const availableDoctors = [];
+
+
+      for (const doctor of doctors) {
+        // Check if doctor is available during this session
+        const isAvailable = await checkDoctorSessionAvailability(
+          doctor._id,
+          selectedDate,
+          session.startTime,
+          session.endTime
+        );
+
+
+        if (isAvailable) {
+          // Get real-time availability data for this doctor
+          const doctorAvailability = await getDoctorSessionAvailability(
+            doctor._id,
+            selectedDate,
+            session.startTime,
+            session.endTime
+          );
+
+          availableDoctors.push({
+            id: doctor._id,
+            name: doctor.name,
+            specialization: doctor.doctor_info?.specialization || 'General',
+            experience: doctor.doctor_info?.experience || 0,
+            fee: doctor.doctor_info?.consultation_fee || 500,
+            ...doctorAvailability
+          });
+        }
+      }
+
+
+      if (availableDoctors.length > 0) {
+        availableSessions.push({
+          ...session,
+          availableDoctors,
+          doctorCount: availableDoctors.length
+        });
+      }
+    }
+
+    res.json({ sessions: availableSessions });
+  } catch (error) {
+    console.error('Department availability error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Helper function to check if doctor is available during a session
+async function checkDoctorSessionAvailability(doctorId, date, startTime, endTime) {
+  try {
+    const nextDay = new Date(date);
+    nextDay.setDate(nextDay.getDate() + 1);
+
+    // Check doctor's schedule for this date
+    const schedule = await DoctorSchedule.findOne({
+      doctor_id: doctorId,
+      date: { $gte: date, $lt: nextDay },
+      is_available: true
+    });
+
+
+    if (schedule) {
+      // Check session-based availability first
+      if (startTime >= '09:00' && endTime <= '13:00') {
+        // Morning session
+        const isAvailable = schedule.morning_session?.available !== false;
+        return isAvailable;
+      } else if (startTime >= '14:00' && endTime <= '18:00') {
+        // Afternoon session
+        const isAvailable = schedule.afternoon_session?.available !== false;
+        return isAvailable;
+      } else {
+        // Fallback to working hours for other times
+        const scheduleStart = schedule.working_hours?.start_time || '09:00';
+        const scheduleEnd = schedule.working_hours?.end_time || '17:00';
+        return startTime >= scheduleStart && endTime <= scheduleEnd;
+      }
+    } else {
+      // If no schedule, use default session availability
+      if (startTime >= '09:00' && endTime <= '13:00') {
+        // Morning session - default available
+        return true;
+      } else if (startTime >= '14:00' && endTime <= '18:00') {
+        // Afternoon session - default available
+        return true;
+      } else {
+        // Fallback to doctor's default working hours
+        const doctor = await User.findById(doctorId).select('doctor_info');
+        const defaultStart = doctor?.doctor_info?.default_working_hours?.start_time || '09:00';
+        const defaultEnd = doctor?.doctor_info?.default_working_hours?.end_time || '17:00';
+        return startTime >= defaultStart && endTime <= defaultEnd;
+      }
+    }
+  } catch (error) {
+    console.error('Error checking doctor session availability:', error);
+    return false;
+  }
+}
+
+// Get detailed doctor session availability with queue information
+async function getDoctorSessionAvailability(doctorId, date, startTime, endTime) {
+  try {
+    const selectedDate = new Date(date);
+    selectedDate.setHours(0, 0, 0, 0);
+    const nextDay = new Date(selectedDate);
+    nextDay.setDate(nextDay.getDate() + 1);
+
+    // Get doctor's schedule for this date
+    const schedule = await DoctorSchedule.findOne({
+      doctor_id: doctorId,
+      date: { $gte: selectedDate, $lt: nextDay },
+      is_available: true
+    });
+
+    // Count current appointments in this session
+    const currentAppointments = await Token.countDocuments({
+      doctor_id: doctorId,
+        booking_date: { $gte: selectedDate, $lt: nextDay },
+      time_slot: { $gte: startTime, $lt: endTime },
+      status: { $nin: ['cancelled', 'missed', 'completed'] }
+    });
+
+    // Get session capacity
+    let maxPatients = 10; // default
+    if (schedule) {
+      if (startTime >= '09:00' && endTime <= '13:00') {
+        maxPatients = schedule.morning_session?.max_patients || 10;
+      } else if (startTime >= '14:00' && endTime <= '18:00') {
+        maxPatients = schedule.afternoon_session?.max_patients || 10;
+      }
+    }
+
+    // Calculate next available slot
+    const nextSlot = calculateNextAvailableSlot(selectedDate, startTime, endTime, currentAppointments);
+
+    // Calculate average wait time (simplified - can be enhanced with ML)
+    const averageWaitTime = Math.max(15, currentAppointments * 20); // 20 mins per patient, minimum 15 mins
+
+    // Check if doctor has a schedule for this session
+    let hasSchedule = false;
+    if (schedule) {
+      if (startTime >= '09:00' && endTime <= '13:00') {
+        hasSchedule = schedule.morning_session?.available !== false;
+      } else if (startTime >= '14:00' && endTime <= '18:00') {
+        hasSchedule = schedule.afternoon_session?.available !== false;
+      } else {
+        hasSchedule = true; // For other times, use working hours
+      }
+    } else {
+      // If no schedule, default to available for session times
+      hasSchedule = (startTime >= '09:00' && endTime <= '13:00') || (startTime >= '14:00' && endTime <= '18:00');
+    }
+
+    return {
+      isAvailable: hasSchedule,
+      patientsAhead: currentAppointments,
+      maxPatients,
+      nextSlot,
+      averageWaitTime,
+      sessionTime: `${startTime} - ${endTime}`,
+      availableSlots: maxPatients - currentAppointments,
+      hasAvailableSlots: currentAppointments < maxPatients
+    };
+  } catch (error) {
+    console.error('Error getting doctor session availability:', error);
+    return {
+      isAvailable: false,
+      patientsAhead: 0,
+      maxPatients: 10,
+      nextSlot: startTime,
+      averageWaitTime: 15,
+      sessionTime: `${startTime} - ${endTime}`,
+      availableSlots: 0
+    };
+  }
+}
+
+// Calculate next available slot
+function calculateNextAvailableSlot(date, startTime, endTime, currentAppointments) {
+  const [startHour, startMin] = startTime.split(':').map(Number);
+  const [endHour, endMin] = endTime.split(':').map(Number);
+  
+  const startMinutes = startHour * 60 + startMin;
+  const endMinutes = endHour * 60 + endMin;
+  const slotDuration = 45; // 45 minutes per slot
+  
+  const nextSlotMinutes = startMinutes + (currentAppointments * slotDuration);
+  
+  if (nextSlotMinutes >= endMinutes) {
+    return 'Fully Booked';
+  }
+  
+  const nextHour = Math.floor(nextSlotMinutes / 60);
+  const nextMin = nextSlotMinutes % 60;
+  
+  const nextSlot = new Date(date);
+  nextSlot.setHours(nextHour, nextMin, 0, 0);
+  
+  return nextSlot.toLocaleTimeString('en-US', { 
+    hour: 'numeric', 
+    minute: '2-digit',
+    hour12: true 
+  });
+}
+
+// Auto-assign doctor based on load balancing
+router.post('/departments/:departmentId/auto-assign', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    const { departmentId } = req.params;
+    const { date, sessionId, familyMemberId } = req.body;
+
+    if (!date || !sessionId) {
+      return res.status(400).json({ message: 'date and sessionId are required' });
+    }
+
+    const selectedDate = new Date(date);
+    selectedDate.setHours(0, 0, 0, 0);
+    const nextDay = new Date(selectedDate);
+    nextDay.setDate(nextDay.getDate() + 1);
+
+    // Get session details
+    const sessions = [
+      { id: 'morning', startTime: '09:00', endTime: '13:00' },
+      { id: 'afternoon', startTime: '14:00', endTime: '18:00' }
+    ];
+    const session = sessions.find(s => s.id === sessionId);
+    if (!session) {
+      return res.status(400).json({ message: 'Invalid session' });
+    }
+
+    // Get available doctors for this session
+    const doctors = await User.find({
+      role: 'doctor',
+      'doctor_info.department': departmentId
+    }).select('_id name doctor_info');
+
+    const availableDoctors = [];
+    for (const doctor of doctors) {
+      const isAvailable = await checkDoctorSessionAvailability(
+        doctor._id,
+        selectedDate,
+        session.startTime,
+        session.endTime
+      );
+      if (isAvailable) {
+        // Calculate current load for this doctor on this date
+        const currentLoad = await Token.countDocuments({
+          doctor_id: doctor._id,
+          booking_date: { $gte: selectedDate, $lt: nextDay },
+          status: { $in: ['booked', 'in_queue'] }
+        });
+
+        availableDoctors.push({
+          id: doctor._id,
+          name: doctor.name,
+          specialization: doctor.doctor_info?.specialization || 'General',
+          experience: doctor.doctor_info?.experience || 0,
+          fee: doctor.doctor_info?.consultation_fee || 500,
+          currentLoad
+        });
+      }
+    }
+
+    if (availableDoctors.length === 0) {
+      return res.status(400).json({ message: 'No doctors available for this session' });
+    }
+
+    // Sort by load (ascending) and select the doctor with least load
+    const sortedDoctors = availableDoctors.sort((a, b) => a.currentLoad - b.currentLoad);
+    const assignedDoctor = sortedDoctors[0];
+
+    res.json({
+      assignedDoctor,
+      reason: `Auto-assigned to Dr. ${assignedDoctor.name} (${assignedDoctor.currentLoad} patients in queue)`,
+      alternativeDoctors: sortedDoctors.slice(1, 4) // Show next 3 options
+    });
+  } catch (error) {
+    console.error('Auto-assign doctor error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get doctors available for a department on a specific date/time
+router.get('/departments/:departmentId/available-doctors', async (req, res) => {
+  try {
+    const { departmentId } = req.params;
+    const { date, time } = req.query;
+
+    if (!date || !time) return res.status(400).json({ message: 'date and time are required' });
+
+    const selectedDate = new Date(date);
+    selectedDate.setHours(0, 0, 0, 0);
+    const nextDay = new Date(selectedDate);
+    nextDay.setDate(nextDay.getDate() + 1);
+
+    // Doctors in department
+    const doctors = await User.find({
+      role: 'doctor',
+      'doctor_info.department': departmentId
+    }).select('name doctor_info email profile_photo');
+
+    // Filter to those with schedule and free at time
+    const available = [];
+    for (const doctor of doctors) {
+      // Prefer explicit schedule; if none, fall back to doctor's default hours
+      console.log('[AVAIL-DOCTORS] doctorId=', doctor._id.toString(), 'date=', date, 'time=', time, 'range=', selectedDate.toISOString(), 'to', nextDay.toISOString());
+      const schedule = await DoctorSchedule.findOne({
+        doctor_id: doctor._id,
+        date: { $gte: selectedDate, $lt: nextDay },
+        is_available: true
+      });
+      if (!schedule) {
+        console.log('[AVAIL-DOCTORS] No schedule found in range for doctor');
+      }
+
+      const workingHours = schedule?.working_hours || doctor.doctor_info?.default_working_hours || { start_time: '09:00', end_time: '17:00' };
+      const breakTime = schedule?.break_time || doctor.doctor_info?.default_break_time || { start_time: '13:00', end_time: '14:00' };
+
+      // Check time in working hours and not during break
+      const t = parseTime(time);
+      const start = parseTime(workingHours.start_time);
+      const end = parseTime(workingHours.end_time);
+      const bs = parseTime(breakTime.start_time);
+      const be = parseTime(breakTime.end_time);
+      const within = t >= start && t < end && !(t >= bs && t < be);
+      if (!within) continue;
+
+      const conflict = await Token.findOne({
+        doctor_id: doctor._id,
+        booking_date: { $gte: selectedDate, $lt: nextDay },
+        time_slot: time,
+        status: { $nin: ['cancelled', 'missed'] }
+      });
+      if (conflict) continue;
+
+      available.push({
+        id: doctor._id,
+        name: doctor.name,
+        email: doctor.email,
+        specialization: doctor.doctor_info?.specialization || 'General Medicine',
+        departmentId,
+        experience: doctor.doctor_info?.experience_years || 0,
+        fee: doctor.doctor_info?.consultation_fee || 500,
+        profilePhoto: doctor.profile_photo,
+        rating: 4.5,
+        reviews: 50,
+        isAvailable: true,
+        availableDays: 1,
+        nextAvailableDate: date
+      });
+    }
+
+    res.json({ doctors: available });
+  } catch (error) {
+    console.error('Department available doctors error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ===== PAYMENTS (Razorpay - test) =====
+router.get('/payment/key', authMiddleware, async (req, res) => {
+  try {
+    const keyId = process.env.RAZORPAY_KEY_ID || '';
+    if (!keyId) return res.status(500).json({ message: 'Razorpay key not configured' });
+    res.json({ keyId });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.post('/payment/create-order', authMiddleware, async (req, res) => {
+  try {
+    const { amount, currency = 'INR', receipt } = req.body;
+    if (!amount) return res.status(400).json({ message: 'amount is required' });
+
+    const keyId = process.env.RAZORPAY_KEY_ID;
+    const keySecret = process.env.RAZORPAY_KEY_SECRET;
+    if (!keyId || !keySecret) return res.status(500).json({ message: 'Razorpay keys not configured' });
+
+    const instance = new Razorpay({ key_id: keyId, key_secret: keySecret });
+    const order = await instance.orders.create({
+      amount: Math.round(Number(amount) * 100),
+      currency,
+      receipt: receipt || `rcpt_${Date.now()}`
+    });
+    res.json({ order });
+  } catch (error) {
+    console.error('Razorpay create order error:', error);
+    res.status(500).json({ message: 'Failed to create payment order' });
   }
 });
 
@@ -216,11 +877,19 @@ router.get('/doctors/:doctorId/availability/:date', async (req, res) => {
     const selectedDate = new Date(date);
     selectedDate.setHours(0, 0, 0, 0);
     
-    // Get doctor's schedule for this date
+    // Get doctor's schedule for this date (match by day range)
+    const nextDay = new Date(selectedDate);
+    nextDay.setDate(nextDay.getDate() + 1);
+    console.log('[SLOTS] doctorId=', doctorId, 'dateParam=', date, 'selectedDateISO=', selectedDate.toISOString(), 'range=', selectedDate.toISOString(), 'to', nextDay.toISOString());
     const schedule = await DoctorSchedule.findOne({
       doctor_id: doctorId,
-      date: selectedDate
+      date: { $gte: selectedDate, $lt: nextDay }
     });
+    if (!schedule) {
+      console.log('[SLOTS] No schedule found for range.');
+    } else {
+      console.log('[SLOTS] Found schedule id=', schedule._id.toString(), 'dateISO=', new Date(schedule.date).toISOString(), 'is_available=', schedule.is_available);
+    }
 
     // Only use schedule if exists, otherwise doctor is not available
     if (!schedule) {
@@ -248,9 +917,7 @@ router.get('/doctors/:doctorId/availability/:date', async (req, res) => {
     // Generate time slots
     const slots = generateTimeSlots(workingHours, breakTime, slotDuration);
 
-    // Get existing appointments for this date
-    const nextDay = new Date(selectedDate);
-    nextDay.setDate(nextDay.getDate() + 1);
+    // Get existing appointments for this date (use same nextDay calculated above)
 
     const existingAppointments = await Token.find({
       doctor_id: doctorId,
@@ -289,6 +956,51 @@ router.get('/doctors/:doctorId/availability/:date', async (req, res) => {
     });
   } catch (error) {
     console.error('Get availability error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Check for patient appointment conflict on a date (optionally for a specific doctor)
+router.get('/appointments/conflict', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    const { date, doctorId, familyMemberId } = req.query;
+    if (!date) {
+      return res.status(400).json({ message: 'date is required' });
+    }
+
+    const selectedDate = new Date(date);
+    selectedDate.setHours(0, 0, 0, 0);
+    const nextDay = new Date(selectedDate);
+    nextDay.setDate(nextDay.getDate() + 1);
+
+    const query = {
+      patient_id: req.patient._id,
+      booking_date: { $gte: selectedDate, $lt: nextDay },
+      status: { $nin: ['cancelled', 'missed'] }
+    };
+    // Only consider the same person: either self (null) or the specific family member
+    if (familyMemberId && familyMemberId !== 'self' && familyMemberId !== 'undefined') {
+      query.family_member_id = familyMemberId;
+    } else {
+      query.family_member_id = null;
+    }
+    if (doctorId) {
+      query.doctor_id = doctorId;
+    }
+
+    const existing = await Token.findOne(query).populate('doctor_id', 'name');
+    if (existing) {
+      return res.json({
+        conflict: true,
+        message: `This person already has an appointment on this date${doctorId ? ' with this doctor' : ''}.`,
+        doctorName: existing.doctor_id?.name || null,
+        timeSlot: existing.time_slot
+      });
+    }
+
+    res.json({ conflict: false });
+  } catch (error) {
+    console.error('Conflict check error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -354,8 +1066,8 @@ router.post('/book-appointment', authMiddleware, patientMiddleware, async (req, 
     } = req.body;
 
     // Validate required fields
-    if (!doctorId || !departmentId || !appointmentDate || !appointmentTime || !symptoms) {
-      return res.status(400).json({ message: 'All fields are required' });
+    if (!doctorId || !departmentId || !appointmentDate || !appointmentTime) {
+      return res.status(400).json({ message: 'doctorId, departmentId, appointmentDate and appointmentTime are required' });
     }
 
     // Get doctor and department details
@@ -376,44 +1088,62 @@ router.post('/book-appointment', authMiddleware, patientMiddleware, async (req, 
     const selectedDate = new Date(appointmentDate);
     selectedDate.setHours(0, 0, 0, 0);
     
-    // Check if doctor is available on that date
+    // Check if doctor is available on that date (match by day range to avoid timezone issues)
+    const endOfDay = new Date(selectedDate);
+    endOfDay.setDate(endOfDay.getDate() + 1);
+    console.log('[BOOK] doctorId=', doctorId, 'appointmentDate=', appointmentDate, 'selectedDateISO=', selectedDate.toISOString(), 'range=', selectedDate.toISOString(), 'to', endOfDay.toISOString());
     const schedule = await DoctorSchedule.findOne({
       doctor_id: doctorId,
-      date: selectedDate
+      date: { $gte: selectedDate, $lt: endOfDay }
     });
-
     if (!schedule) {
-      return res.status(400).json({ 
-        message: `Doctor has no schedule for ${appointmentDate}. Please select a scheduled date.` 
-      });
+      console.log('[BOOK] No schedule found for range.');
+    } else {
+      console.log('[BOOK] Found schedule id=', schedule._id.toString(), 'dateISO=', new Date(schedule.date).toISOString(), 'is_available=', schedule.is_available);
     }
 
-    if (!schedule.is_available) {
+    // If explicit schedule exists and is unavailable, block booking. Otherwise, allow using defaults
+    if (schedule && !schedule.is_available) {
       return res.status(400).json({ 
         message: `Doctor is not available on ${appointmentDate}. Reason: ${schedule.leave_reason || 'Not specified'}` 
       });
     }
 
-    // Use schedule working hours
-    const workingHours = schedule.working_hours;
-    const breakTime = schedule.break_time;
-
-    // Validate if appointment time is within working hours
+    // Validate session-based availability
     const appointmentMinutes = parseTime(appointmentTime);
+    let isSessionValid = false;
+    let sessionName = '';
+
+    // Check morning session (9:00 AM - 1:00 PM)
+    if (appointmentMinutes >= parseTime('09:00') && appointmentMinutes < parseTime('13:00')) {
+      if (schedule) {
+        isSessionValid = schedule.morning_session?.available !== false;
+      } else {
+        isSessionValid = true; // Default available if no schedule
+      }
+      sessionName = 'Morning Session';
+    }
+    // Check afternoon session (2:00 PM - 6:00 PM)
+    else if (appointmentMinutes >= parseTime('14:00') && appointmentMinutes < parseTime('18:00')) {
+      if (schedule) {
+        isSessionValid = schedule.afternoon_session?.available !== false;
+      } else {
+        isSessionValid = true; // Default available if no schedule
+      }
+      sessionName = 'Afternoon Session';
+    }
+    // Fallback to working hours for other times
+    else {
+      const workingHours = schedule?.working_hours || doctor.doctor_info?.default_working_hours || { start_time: '09:00', end_time: '17:00' };
     const startMinutes = parseTime(workingHours.start_time);
     const endMinutes = parseTime(workingHours.end_time);
-    const breakStartMinutes = parseTime(breakTime.start_time);
-    const breakEndMinutes = parseTime(breakTime.end_time);
-
-    if (appointmentMinutes < startMinutes || appointmentMinutes >= endMinutes) {
-      return res.status(400).json({ 
-        message: `Appointment time must be between ${workingHours.start_time} and ${workingHours.end_time}` 
-      });
+      isSessionValid = appointmentMinutes >= startMinutes && appointmentMinutes < endMinutes;
+      sessionName = 'Working Hours';
     }
 
-    if (appointmentMinutes >= breakStartMinutes && appointmentMinutes < breakEndMinutes) {
+    if (!isSessionValid) {
       return res.status(400).json({ 
-        message: `Appointment time cannot be during break time (${breakTime.start_time} - ${breakTime.end_time})` 
+        message: `Doctor is not available during ${sessionName} on ${appointmentDate}` 
       });
     }
 
@@ -446,10 +1176,31 @@ router.post('/book-appointment', authMiddleware, patientMiddleware, async (req, 
       }
     }
 
-    // Check for patient/family member overlap (same patient or family member, same date)
+    // Block multiple active appointments in the same department (for self or same family member)
+    const activeSameDepartmentQuery = {
+      patient_id: req.patient._id,
+      department: department.name,
+      status: { $in: ['booked', 'in_queue'] }
+    };
+    if (familyMember) {
+      activeSameDepartmentQuery.family_member_id = familyMember._id;
+    } else {
+      activeSameDepartmentQuery.family_member_id = null;
+    }
+
+    const existingActiveSameDept = await Token.findOne(activeSameDepartmentQuery);
+    if (existingActiveSameDept) {
+      const forWhom = familyMember ? familyMember.name : 'you';
+      return res.status(400).json({
+        message: `Cannot book another appointment in the same department until the current one for ${forWhom} is completed or cancelled`
+      });
+    }
+
+    // Check for overlap for the SAME doctor only (allow different doctors on same date)
     const overlapQuery = {
       patient_id: req.patient._id,
       booking_date: { $gte: selectedDate, $lt: nextDay },
+      doctor_id: doctorId,
       status: { $nin: ['cancelled', 'missed'] }
     };
 
@@ -466,7 +1217,7 @@ router.post('/book-appointment', authMiddleware, patientMiddleware, async (req, 
     if (existingPatientAppointment) {
       const forWhom = familyMember ? familyMember.name : 'you';
       return res.status(400).json({ 
-        message: `${forWhom} already have an appointment on this date` 
+        message: `${forWhom} already have an appointment with this doctor on this date` 
       });
     }
 
@@ -487,7 +1238,22 @@ router.post('/book-appointment', authMiddleware, patientMiddleware, async (req, 
     }
 
     // Generate token number
-    const tokenNumber = `TKN${Date.now().toString().slice(-6)}`;
+    const tokenNumber = `T${Date.now().toString().slice(-4)}`;
+
+    // Determine session type and time range
+    let sessionType = 'morning';
+    let sessionTimeRange = '9:00 AM - 1:00 PM';
+    
+    if (appointmentMinutes >= parseTime('09:00') && appointmentMinutes < parseTime('13:00')) {
+      sessionType = 'morning';
+      sessionTimeRange = '9:00 AM - 1:00 PM';
+    } else if (appointmentMinutes >= parseTime('14:00') && appointmentMinutes < parseTime('18:00')) {
+      sessionType = 'afternoon';
+      sessionTimeRange = '2:00 PM - 6:00 PM';
+    } else {
+      sessionType = 'evening';
+      sessionTimeRange = '6:00 PM - 9:00 PM';
+    }
 
     // Create appointment token
     const appointmentToken = new Token({
@@ -495,9 +1261,11 @@ router.post('/book-appointment', authMiddleware, patientMiddleware, async (req, 
       family_member_id: familyMember ? familyMember._id : null,
       doctor_id: doctorId,
       department: department.name,
-      symptoms,
+      symptoms: symptoms && String(symptoms).trim().length > 0 ? symptoms : 'Not provided',
       booking_date: selectedDate,
       time_slot: appointmentTime,
+      session_type: sessionType,
+      session_time_range: sessionTimeRange,
       status: 'booked',
       token_number: tokenNumber,
       payment_status: 'pending',
@@ -535,14 +1303,35 @@ router.post('/book-appointment', authMiddleware, patientMiddleware, async (req, 
   }
 });
 
-// Get patient's appointments
+// Get patient's appointments with enhanced details
 router.get('/appointments', authMiddleware, patientMiddleware, async (req, res) => {
   try {
-    const appointments = await Token.find({ patient_id: req.patient._id })
+    const { familyMemberId, status } = req.query;
+    
+    // Build query
+    let query = { patient_id: req.patient._id };
+    if (familyMemberId) {
+      query.family_member_id = familyMemberId;
+    }
+    if (status) {
+      query.status = status;
+    }
+
+    const appointments = await Token.find(query)
       .populate('doctor_id', 'name doctor_info')
+      .populate('family_member_id', 'name relation patientId')
+      .populate('patient_id', 'name patientId')
       .sort({ booking_date: -1 });
 
-    const appointmentList = appointments.map(apt => ({
+    const appointmentList = appointments.map(apt => {
+      // Determine session type and time range
+      const timeSlot = apt.time_slot || apt.session_time_range || '09:00';
+      const sessionType = apt.session_type || (timeSlot >= '09:00' && timeSlot < '13:00' ? 'morning' : 
+                                               timeSlot >= '14:00' && timeSlot < '18:00' ? 'afternoon' : 'evening');
+      const sessionTimeRange = apt.session_time_range || (sessionType === 'morning' ? '9:00 AM - 1:00 PM' :
+                                                          sessionType === 'afternoon' ? '2:00 PM - 6:00 PM' : '6:00 PM - 9:00 PM');
+
+      return {
       id: apt._id,
       doctorId: apt.doctor_id?._id,
       tokenNumber: apt.token_number,
@@ -550,16 +1339,327 @@ router.get('/appointments', authMiddleware, patientMiddleware, async (req, res) 
       departmentName: apt.department,
       appointmentDate: apt.booking_date,
       appointmentTime: apt.time_slot,
+        sessionType: sessionType,
+        sessionTimeRange: sessionTimeRange,
       symptoms: apt.symptoms,
       status: apt.status,
       estimatedWaitTime: apt.estimated_wait_time,
       paymentStatus: apt.payment_status,
-      bookedAt: apt.createdAt
-    }));
+      bookedAt: apt.createdAt,
+        consultationCompletedAt: apt.consultation_completed_at,
+      isFamilyMember: !!apt.family_member_id,
+      patientName: apt.family_member_id ? apt.family_member_id.name : (apt.patient_id?.name || 'You'),
+      patientCode: apt.family_member_id ? apt.family_member_id.patientId : (apt.patient_id?.patientId || null),
+        familyMemberRelation: apt.family_member_id ? apt.family_member_id.relation : null,
+        consultationNotes: apt.consultation_notes,
+        diagnosis: apt.diagnosis,
+        prescriptions: apt.prescriptions || [],
+        cancellationReason: apt.cancellation_reason
+      };
+    });
 
     res.json({ appointments: appointmentList });
   } catch (error) {
     console.error('Get patient appointments error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get family members for filtering appointments
+router.get('/family-members', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    const familyMembers = await FamilyMember.find({ patientId: req.patient._id })
+      .select('_id name relation patientId')
+      .sort({ name: 1 });
+
+    const familyList = [
+      { _id: null, name: 'Myself', relation: 'self', patientId: req.patient.patientId },
+      ...familyMembers.map(member => ({
+        _id: member._id,
+        name: member.name,
+        relation: member.relation,
+        patientId: member.patientId
+      }))
+    ];
+
+    res.json({ familyMembers: familyList });
+  } catch (error) {
+    console.error('Get family members error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Cancel appointment with refund processing
+router.post('/appointments/:appointmentId/cancel', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    const { appointmentId } = req.params;
+    const { reason, refundMethod = 'wallet' } = req.body;
+
+    // Find the appointment
+    const appointment = await Token.findById(appointmentId)
+      .populate('patient_id', 'name email phone')
+      .populate('doctor_id', 'name email phone doctor_info')
+      .populate('family_member_id', 'name relation');
+
+    if (!appointment) {
+      return res.status(404).json({ message: 'Appointment not found' });
+    }
+
+    // Verify ownership
+    if (appointment.patient_id._id.toString() !== req.patient._id.toString()) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Check if already cancelled
+    if (appointment.status === 'cancelled') {
+      return res.status(400).json({ message: 'Appointment is already cancelled' });
+    }
+
+    // Check if consultation is completed
+    if (appointment.status === 'consulted') {
+      return res.status(400).json({ message: 'Cannot cancel completed consultation' });
+    }
+
+    // Determine cancellation policy
+    const now = new Date();
+    const appointmentDate = new Date(appointment.booking_date);
+    const isBeforeConsultation = !appointment.consultation_started_at;
+    const isSameDay = appointmentDate.toDateString() === now.toDateString();
+    
+    // Check if consultation has started (same day and current time is past appointment time)
+    const appointmentTime = appointment.time_slot;
+    const currentTime = now.toTimeString().slice(0, 5);
+    const hasConsultationStarted = isSameDay && currentTime >= appointmentTime;
+
+    let refundEligible = false;
+    let refundAmount = 0;
+    let refundStatus = 'none';
+
+    // Cancellation Policy Logic
+    if (isBeforeConsultation && !hasConsultationStarted) {
+      // Full refund allowed - consultation hasn't started
+      refundEligible = true;
+      refundAmount = appointment.doctor_id?.doctor_info?.consultation_fee || 500;
+      refundStatus = 'pending';
+    } else if (hasConsultationStarted || appointment.consultation_started_at) {
+      // No refund - consultation has started
+      refundEligible = false;
+      refundAmount = 0;
+      refundStatus = 'none';
+    }
+
+    // Update appointment status
+    const updateData = {
+      status: 'cancelled',
+      cancelled_at: now,
+      cancelled_by: 'patient',
+      cancellation_reason: reason || 'Cancelled by patient'
+    };
+
+    // Add refund information if eligible
+    if (refundEligible && appointment.payment_status === 'paid') {
+      updateData.refund_status = refundStatus;
+      updateData.refund_amount = refundAmount;
+      updateData.refund_method = refundMethod;
+      updateData.refund_reference = `REF${Date.now().toString().slice(-6)}`;
+    }
+
+    const updatedAppointment = await Token.findByIdAndUpdate(
+      appointmentId,
+      updateData,
+      { new: true }
+    );
+
+    // Process refund if eligible
+    let refundResult = null;
+    if (refundEligible && appointment.payment_status === 'paid') {
+      refundResult = await processRefund({
+        appointmentId,
+        amount: refundAmount,
+        method: refundMethod,
+        patientId: req.patient._id,
+        reference: updateData.refund_reference
+      });
+      
+      // Update refund status based on processing result
+      if (refundResult.success) {
+        await Token.findByIdAndUpdate(appointmentId, { 
+          refund_status: 'processed',
+          payment_status: 'refunded'
+        });
+      } else {
+        await Token.findByIdAndUpdate(appointmentId, { 
+          refund_status: 'failed'
+        });
+      }
+    }
+
+    // Send notifications
+    await sendCancellationNotifications({
+      appointment: updatedAppointment,
+      patient: req.patient,
+      doctor: appointment.doctor_id,
+      familyMember: appointment.family_member_id,
+      refundEligible,
+      refundAmount,
+      refundResult
+    });
+
+    // Prepare response
+    const response = {
+      message: 'Appointment cancelled successfully',
+      appointment: {
+        id: updatedAppointment._id,
+        status: updatedAppointment.status,
+        cancelledAt: updatedAppointment.cancelled_at,
+        cancellationReason: updatedAppointment.cancellation_reason
+      }
+    };
+
+    // Add refund information to response
+    if (refundEligible) {
+      response.refund = {
+        eligible: true,
+        amount: refundAmount,
+        method: refundMethod,
+        status: refundResult?.success ? 'processed' : 'failed',
+        reference: updateData.refund_reference,
+        message: refundResult?.success ? 
+          `Refund of ₹${refundAmount} will be processed to your ${refundMethod} account` :
+          'Refund processing failed. Please contact support.'
+      };
+    } else {
+      response.refund = {
+        eligible: false,
+        reason: hasConsultationStarted ? 
+          'No refund available - consultation has started' :
+          'No payment made for this appointment'
+      };
+    }
+
+    res.json(response);
+
+  } catch (error) {
+    console.error('Cancel appointment error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Process refund
+async function processRefund({ appointmentId, amount, method, patientId, reference }) {
+  try {
+    // Simulate refund processing based on method
+    switch (method) {
+      case 'wallet':
+        // Add to patient's wallet balance
+        await User.findByIdAndUpdate(patientId, {
+          $inc: { 'patient_info.wallet_balance': amount }
+        });
+        return { success: true, message: 'Refund added to wallet' };
+        
+      case 'upi':
+        // Simulate UPI refund (in real implementation, integrate with payment gateway)
+        return { success: true, message: 'UPI refund initiated' };
+        
+      case 'card':
+        // Simulate card refund (in real implementation, integrate with payment gateway)
+        return { success: true, message: 'Card refund initiated' };
+        
+      case 'cash':
+        // For cash payments, no automatic refund
+        return { success: false, message: 'Cash refund to be processed manually' };
+        
+      default:
+        return { success: false, message: 'Invalid refund method' };
+    }
+  } catch (error) {
+    console.error('Refund processing error:', error);
+    return { success: false, message: 'Refund processing failed' };
+  }
+}
+
+// Send cancellation notifications
+async function sendCancellationNotifications({ appointment, patient, doctor, familyMember, refundEligible, refundAmount, refundResult }) {
+  try {
+    const patientName = familyMember ? familyMember.name : patient.name;
+    const relation = familyMember ? familyMember.relation : 'self';
+
+    // Patient notification
+    const patientMessage = `Your appointment with Dr. ${doctor.name} on ${new Date(appointment.booking_date).toLocaleDateString()} has been cancelled.${refundEligible ? ` Refund of ₹${refundAmount} will be processed.` : ''}`;
+    
+    // Doctor notification
+    const doctorMessage = `Appointment cancelled: ${patientName} (${relation}) - ${new Date(appointment.booking_date).toLocaleDateString()} at ${appointment.time_slot}`;
+
+    // In a real implementation, you would send these via email/SMS/push notifications
+    console.log('Patient Notification:', patientMessage);
+    console.log('Doctor Notification:', doctorMessage);
+    
+    // You can integrate with email service, SMS service, or push notification service here
+    // await emailService.send(patient.email, 'Appointment Cancelled', patientMessage);
+    // await smsService.send(patient.phone, patientMessage);
+    // await notificationService.send(doctor._id, 'Appointment Cancelled', doctorMessage);
+
+  } catch (error) {
+    console.error('Notification sending error:', error);
+  }
+}
+
+// Check if there is an active appointment in the same department for self or a family member
+router.get('/appointments/active-department-check', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    const { departmentId, familyMemberId } = req.query;
+
+    if (!departmentId) {
+      return res.status(400).json({ message: 'departmentId is required' });
+    }
+
+    const department = await Department.findById(departmentId);
+    if (!department) {
+      return res.status(404).json({ message: 'Department not found' });
+    }
+
+    let familyMember = null;
+    if (familyMemberId && familyMemberId !== 'self' && familyMemberId !== 'undefined') {
+      try {
+        familyMember = await FamilyMember.findOne({
+          _id: familyMemberId,
+          patientId: req.patient._id,
+          isActive: true
+        });
+        if (!familyMember) {
+          return res.status(404).json({ message: 'Family member not found' });
+        }
+      } catch (error) {
+        console.error('Family member lookup error:', error);
+        return res.status(400).json({ message: 'Invalid family member ID' });
+      }
+    }
+
+    const query = {
+      patient_id: req.patient._id,
+      department: department.name,
+      status: { $in: ['booked', 'in_queue'] }
+    };
+
+    if (familyMember) {
+      query.family_member_id = familyMember._id;
+    } else {
+      query.family_member_id = null;
+    }
+
+    const existing = await Token.findOne(query).populate('doctor_id', 'name');
+
+    if (existing) {
+      const who = familyMember ? familyMember.name : 'you';
+      return res.json({
+        conflict: true,
+        message: `Cannot book another appointment in the same department until the current one for ${who} is completed or cancelled`
+      });
+    }
+
+    return res.json({ conflict: false });
+  } catch (error) {
+    console.error('Active department check error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -576,6 +1676,7 @@ router.get('/family-members', authMiddleware, patientMiddleware, async (req, res
 
     const memberList = familyMembers.map(member => ({
       id: member._id,
+      patientId: member.patientId,
       name: member.name,
       age: member.age,
       gender: member.gender,
@@ -595,6 +1696,9 @@ router.get('/family-members', authMiddleware, patientMiddleware, async (req, res
 // Add a family member
 router.post('/family-members', authMiddleware, patientMiddleware, async (req, res) => {
   try {
+    console.log('Add family member request:', req.body);
+    console.log('Patient ID:', req.patient._id);
+    
     const { name, age, gender, relation, phone, allergies, medicalHistory } = req.body;
 
     // Validate required fields
@@ -630,6 +1734,7 @@ router.post('/family-members', authMiddleware, patientMiddleware, async (req, re
       message: 'Family member added successfully',
       familyMember: {
         id: familyMember._id,
+        patientId: familyMember.patientId,
         name: familyMember.name,
         age: familyMember.age,
         gender: familyMember.gender,
@@ -639,7 +1744,10 @@ router.post('/family-members', authMiddleware, patientMiddleware, async (req, re
     });
   } catch (error) {
     console.error('Add family member error:', error);
-    res.status(500).json({ message: 'Server error' });
+    res.status(500).json({ 
+      message: 'Server error',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
   }
 });
 
@@ -674,6 +1782,7 @@ router.put('/family-members/:memberId', authMiddleware, patientMiddleware, async
       message: 'Family member updated successfully',
       familyMember: {
         id: familyMember._id,
+        patientId: familyMember.patientId,
         name: familyMember.name,
         age: familyMember.age,
         gender: familyMember.gender,

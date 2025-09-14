@@ -173,7 +173,7 @@ router.post('/send-otp', async (req, res) => {
 // Register with OTP verification
 router.post('/register', async (req, res) => {
   try {
-    const { name, email, password, phone, dob, gender, otp } = req.body;
+    const { name, email, password, phone, dob, gender, age, otp } = req.body;
 
     // Validate required fields
     if (!name || !email || !password || !otp) {
@@ -207,6 +207,7 @@ router.post('/register', async (req, res) => {
       email,
       password: hashedPassword,
       phone: phone || '',
+      age: age || undefined,
       dob: dob ? new Date(dob) : undefined,
       gender: gender || '',
       role: 'patient', // Force patient role for public registration
@@ -231,7 +232,9 @@ router.post('/register', async (req, res) => {
         id: user._id,
         name: user.name,
         email: user.email,
+        patientId: user.patientId,
         phone: user.phone,
+        age: user.age,
         dob: user.dob,
         gender: user.gender,
         role: user.role
@@ -297,7 +300,8 @@ router.post('/login', async (req, res) => {
         id: user._id,
         name: user.name,
         email: user.email,
-        role: user.role
+        role: user.role,
+        patientId: user.role === 'patient' ? user.patientId : undefined
       },
       redirectTo,
       message: 'Login successful'

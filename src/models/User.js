@@ -54,6 +54,12 @@ const passwordResetTokenSchema = new mongoose.Schema({
 // Auto-delete expired tokens
 passwordResetTokenSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 
+// Counter schema for generating sequential IDs (e.g., Patient IDs)
+const counterSchema = new mongoose.Schema({
+  key: { type: String, required: true, unique: true },
+  seq: { type: Number, default: 0 }
+});
+
 const userSchema = new mongoose.Schema({
   name: { type: String, required: true },
   email: { type: String, required: true, unique: true },
@@ -62,6 +68,7 @@ const userSchema = new mongoose.Schema({
     required: function() { return !this.clerkId; }
   },
   phone: { type: String, default: '' },
+  age: { type: Number },
   dob: { type: Date },
   gender: { type: String },
   clerkId: { type: String },
@@ -71,6 +78,7 @@ const userSchema = new mongoose.Schema({
     enum: ['patient', 'doctor', 'receptionist', 'admin'],
     default: 'patient'
   },
+  patientId: { type: String, unique: true, sparse: true },
   profile_photo: { type: String, default: '' },
   isVerified: { type: Boolean, default: false },
   authProvider: {
@@ -89,7 +97,11 @@ const userSchema = new mongoose.Schema({
       gender: String,
       medical_history: [String]
     }],
-    booking_history: [mongoose.Schema.Types.ObjectId]
+    booking_history: [mongoose.Schema.Types.ObjectId],
+    wallet_balance: {
+      type: Number,
+      default: 0
+    }
   },
   
   doctor_info: {
@@ -155,6 +167,35 @@ const userSchema = new mongoose.Schema({
   }
 }, {
   timestamps: true
+});
+
+// Helper to left-pad numbers with zeros
+function padNumberWithZeros(number, width) {
+  const numberString = String(number);
+  if (numberString.length >= width) return numberString;
+  return '0'.repeat(width - numberString.length) + numberString;
+}
+
+// Assign sequential Patient ID for new patient users
+userSchema.pre('save', async function(next) {
+  try {
+    if (!this.isNew) return next();
+    if (this.role !== 'patient') return next();
+    if (this.patientId) return next();
+
+    const Counter = mongoose.model('Counter', counterSchema);
+    const updated = await Counter.findOneAndUpdate(
+      { key: 'patient' },
+      { $inc: { seq: 1 } },
+      { new: true, upsert: true, setDefaultsOnInsert: true }
+    );
+
+    const nextSeq = updated.seq;
+    this.patientId = `P${padNumberWithZeros(nextSeq, 3)}`;
+    return next();
+  } catch (error) {
+    return next(error);
+  }
 });
 
 // Appointment Schema
@@ -317,7 +358,7 @@ const tokenSchema = new mongoose.Schema({
   },
   family_member_id: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: 'User'
+    ref: 'FamilyMember'
   },
   doctor_id: {
     type: mongoose.Schema.Types.ObjectId,
@@ -378,6 +419,81 @@ const tokenSchema = new mongoose.Schema({
   cancellation_reason: {
     type: String,
     default: ''
+  },
+  session_type: {
+    type: String,
+    enum: ['morning', 'afternoon', 'evening'],
+    required: true
+  },
+  session_time_range: {
+    type: String,
+    required: true
+  },
+  consultation_notes: {
+    type: String,
+    default: ''
+  },
+  diagnosis: {
+    type: String,
+    default: ''
+  },
+  prescriptions: [{
+    medication_name: {
+      type: String,
+      required: true
+    },
+    dosage: {
+      type: String,
+      required: true
+    },
+    frequency: {
+      type: String,
+      required: true
+    },
+    duration: {
+      type: String,
+      required: true
+    },
+    instructions: {
+      type: String,
+      default: ''
+    },
+    prescribed_at: {
+      type: Date,
+      default: Date.now
+    }
+  }],
+  consultation_started_at: {
+    type: Date
+  },
+  consultation_completed_at: {
+    type: Date
+  },
+  cancelled_at: {
+    type: Date
+  },
+  cancelled_by: {
+    type: String,
+    enum: ['patient', 'doctor', 'receptionist', 'admin'],
+    default: 'patient'
+  },
+  refund_status: {
+    type: String,
+    enum: ['none', 'pending', 'processed', 'failed'],
+    default: 'none'
+  },
+  refund_amount: {
+    type: Number,
+    default: 0
+  },
+  refund_method: {
+    type: String,
+    enum: ['wallet', 'upi', 'card', 'cash'],
+    default: 'wallet'
+  },
+  refund_reference: {
+    type: String,
+    default: ''
   }
 }, {
   timestamps: true
@@ -390,11 +506,12 @@ tokenSchema.index({ status: 1 });
 tokenSchema.index({ token_number: 1 });
 
 const User = mongoose.model('User', userSchema);
+const Counter = mongoose.model('Counter', counterSchema);
 const OTP = mongoose.model('OTP', otpSchema);
 const PasswordResetToken = mongoose.model('PasswordResetToken', passwordResetTokenSchema);
 const Appointment = mongoose.model('Appointment', appointmentSchema);
 const Token = mongoose.model('Token', tokenSchema);
 
-module.exports = { User, OTP, PasswordResetToken, Appointment, Token };
+module.exports = { User, OTP, PasswordResetToken, Appointment, Token, Counter };
 
 

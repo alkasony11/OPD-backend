@@ -215,6 +215,70 @@ router.get('/stats', adminMiddleware, async (req, res) => {
   }
 });
 
+// Get doctor load analytics (Admin only)
+router.get('/doctor-load-analytics', adminMiddleware, async (req, res) => {
+  try {
+    const { date } = req.query;
+    
+    if (!date) {
+      return res.status(400).json({ message: 'Date parameter is required' });
+    }
+
+    const selectedDate = new Date(date);
+    selectedDate.setHours(0, 0, 0, 0);
+    const nextDay = new Date(selectedDate);
+    nextDay.setDate(nextDay.getDate() + 1);
+
+    // Get all doctors
+    const doctors = await User.find({ role: 'doctor' })
+      .select('_id name doctor_info')
+      .populate('doctor_info.department', 'name');
+
+    const analytics = [];
+
+    for (const doctor of doctors) {
+      // Get appointments for this doctor on the selected date
+      const appointments = await Token.find({
+        doctor_id: doctor._id,
+        booking_date: { $gte: selectedDate, $lt: nextDay },
+        status: { $in: ['booked', 'in_queue', 'consulted'] }
+      });
+
+      // Calculate session breakdown
+      const morningAppointments = appointments.filter(apt => apt.time_slot === '09:00').length;
+      const afternoonAppointments = appointments.filter(apt => apt.time_slot === '14:00').length;
+      const totalAppointments = appointments.length;
+
+      // Calculate auto-assigned vs manual
+      const autoAssignedCount = appointments.filter(apt => apt.created_by === 'patient' && apt.auto_assigned).length;
+      const manualAssignedCount = totalAppointments - autoAssignedCount;
+
+      // Calculate average wait time (mock calculation)
+      const avgWaitTime = totalAppointments > 0 ? Math.round(15 + (totalAppointments * 2)) : 0;
+
+      analytics.push({
+        doctorId: doctor._id,
+        doctorName: doctor.name,
+        department: doctor.doctor_info?.department?.name || 'General',
+        totalAppointments,
+        morningAppointments,
+        afternoonAppointments,
+        autoAssignedCount,
+        manualAssignedCount,
+        avgWaitTime
+      });
+    }
+
+    // Sort by total appointments (descending)
+    analytics.sort((a, b) => b.totalAppointments - a.totalAppointments);
+
+    res.json({ analytics });
+  } catch (error) {
+    console.error('Get doctor load analytics error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 // Get recent activity (Admin only)
 router.get('/activity', adminMiddleware, async (req, res) => {
   try {
@@ -836,7 +900,9 @@ router.get('/doctor-schedules/:doctorId', adminMiddleware, async (req, res) => {
         maxPatientsPerSlot: schedule.max_patients_per_slot,
         bookedSlots: schedule.booked_slots,
         leaveReason: schedule.leave_reason,
-        notes: schedule.notes
+        notes: schedule.notes,
+        morningSession: schedule.morning_session,
+        afternoonSession: schedule.afternoon_session
       }))
     });
   } catch (error) {
@@ -857,7 +923,9 @@ router.post('/doctor-schedules/:doctorId', adminMiddleware, async (req, res) => 
       slotDuration,
       maxPatientsPerSlot,
       leaveReason,
-      notes
+      notes,
+      morningSession,
+      afternoonSession
     } = req.body;
 
     // Verify doctor exists
@@ -884,6 +952,9 @@ router.post('/doctor-schedules/:doctorId', adminMiddleware, async (req, res) => 
       schedule.max_patients_per_slot = maxPatientsPerSlot || schedule.max_patients_per_slot;
       schedule.leave_reason = leaveReason || schedule.leave_reason;
       schedule.notes = notes || schedule.notes;
+      // Update session data
+      schedule.morning_session = morningSession || schedule.morning_session;
+      schedule.afternoon_session = afternoonSession || schedule.afternoon_session;
       
       await schedule.save();
     } else {
@@ -903,7 +974,20 @@ router.post('/doctor-schedules/:doctorId', adminMiddleware, async (req, res) => 
         slot_duration: slotDuration || 30,
         max_patients_per_slot: maxPatientsPerSlot || 1,
         leave_reason: leaveReason || '',
-        notes: notes || ''
+        notes: notes || '',
+        // Session-based scheduling
+        morning_session: morningSession || {
+          available: true,
+          start_time: '09:00',
+          end_time: '13:00',
+          max_patients: 10
+        },
+        afternoon_session: afternoonSession || {
+          available: true,
+          start_time: '14:00',
+          end_time: '18:00',
+          max_patients: 10
+        }
       });
       
       await schedule.save();
@@ -920,7 +1004,9 @@ router.post('/doctor-schedules/:doctorId', adminMiddleware, async (req, res) => 
         slotDuration: schedule.slot_duration,
         maxPatientsPerSlot: schedule.max_patients_per_slot,
         leaveReason: schedule.leave_reason,
-        notes: schedule.notes
+        notes: schedule.notes,
+        morningSession: schedule.morning_session,
+        afternoonSession: schedule.afternoon_session
       }
     });
   } catch (error) {
@@ -1206,7 +1292,20 @@ router.post('/doctor-schedules/:doctorId/bulk', adminMiddleware, async (req, res
             end_time: '14:00'
           },
           slot_duration: scheduleTemplate.slotDuration || 30,
-          max_patients_per_slot: scheduleTemplate.maxPatientsPerSlot || 1
+          max_patients_per_slot: scheduleTemplate.maxPatientsPerSlot || 1,
+          // Session-based scheduling
+          morning_session: scheduleTemplate.morningSession || {
+            available: true,
+            start_time: '09:00',
+            end_time: '13:00',
+            max_patients: 10
+          },
+          afternoon_session: scheduleTemplate.afternoonSession || {
+            available: true,
+            start_time: '14:00',
+            end_time: '18:00',
+            max_patients: 10
+          }
         });
 
         schedules.push(schedule);
