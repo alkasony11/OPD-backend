@@ -114,6 +114,7 @@ router.get('/appointments', authMiddleware, doctorMiddleware, async (req, res) =
       ...dateFilter
     })
     .populate('patient_id', 'name email phone patient_info')
+    .populate('family_member_id', 'name relation patientId')
     .sort({ booking_date: 1, time_slot: 1 })
     .limit(limit * 1)
     .skip((page - 1) * limit);
@@ -126,8 +127,8 @@ router.get('/appointments', authMiddleware, doctorMiddleware, async (req, res) =
     // Transform to match expected format
     const transformedAppointments = appointments.map(apt => ({
       _id: apt._id,
-      patient_name: apt.patient_id?.name || 'Unknown Patient',
-      patientName: apt.patient_id?.name || 'Unknown Patient',
+      patient_name: apt.family_member_id ? apt.family_member_id.name : (apt.patient_id?.name || 'Unknown Patient'),
+      patientName: apt.family_member_id ? apt.family_member_id.name : (apt.patient_id?.name || 'Unknown Patient'),
       patientEmail: apt.patient_id?.email || '',
       patientPhone: apt.patient_id?.phone || '',
       booking_date: apt.booking_date,

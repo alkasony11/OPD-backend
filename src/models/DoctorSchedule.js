@@ -62,6 +62,43 @@ const doctorScheduleSchema = new mongoose.Schema({
   notes: {
     type: String,
     default: ''
+  },
+  // Session-based scheduling
+  morning_session: {
+    available: {
+      type: Boolean,
+      default: true
+    },
+    start_time: {
+      type: String,
+      default: '09:00'
+    },
+    end_time: {
+      type: String,
+      default: '13:00'
+    },
+    max_patients: {
+      type: Number,
+      default: 10
+    }
+  },
+  afternoon_session: {
+    available: {
+      type: Boolean,
+      default: true
+    },
+    start_time: {
+      type: String,
+      default: '14:00'
+    },
+    end_time: {
+      type: String,
+      default: '18:00'
+    },
+    max_patients: {
+      type: Number,
+      default: 10
+    }
   }
 }, {
   timestamps: true
