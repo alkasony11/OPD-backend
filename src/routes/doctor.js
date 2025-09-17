@@ -7,6 +7,19 @@ const DoctorStats = require('../models/DoctorStats');
 const DoctorStatsService = require('../services/doctorStatsService');
 const { authMiddleware } = require('../middleware/authMiddleware');
 
+// Helper: parse YYYY-MM-DD as local date (avoid UTC shift)
+function parseLocalYMD(ymd) {
+  if (!ymd || typeof ymd !== 'string') return null;
+  const parts = ymd.split('-');
+  if (parts.length !== 3) return null;
+  const year = Number(parts[0]);
+  const month = Number(parts[1]) - 1;
+  const day = Number(parts[2]);
+  const d = new Date(year, month, day);
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
 // Doctor role guard
 const doctorMiddleware = async (req, res, next) => {
   try {
@@ -28,7 +41,7 @@ router.post('/leave-requests', authMiddleware, doctorMiddleware, async (req, res
   try {
     const { date, reason } = req.body;
     if (!date) return res.status(400).json({ message: 'Date is required' });
-    const leaveDate = new Date(date);
+    const leaveDate = parseLocalYMD(date) || new Date(date);
     leaveDate.setHours(0, 0, 0, 0);
 
     const leave = await LeaveRequest.findOneAndUpdate(
@@ -69,7 +82,7 @@ router.get('/appointments', authMiddleware, doctorMiddleware, async (req, res) =
 
     // If specific date is provided, use it
     if (date) {
-      const selectedDate = new Date(date);
+      const selectedDate = parseLocalYMD(date) || new Date(date);
       selectedDate.setHours(0, 0, 0, 0);
       const nextDay = new Date(selectedDate);
       nextDay.setDate(nextDay.getDate() + 1);
@@ -157,6 +170,193 @@ router.get('/appointments', authMiddleware, doctorMiddleware, async (req, res) =
     });
   } catch (error) {
     console.error('Get appointments error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get today's queue grouped by session (morning/afternoon/evening)
+router.get('/today-queue', authMiddleware, doctorMiddleware, async (req, res) => {
+  try {
+    const doctorId = req.doctor._id;
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+
+    // Fetch today's tokens for this doctor
+    const tokens = await Token.find({
+      doctor_id: doctorId,
+      booking_date: { $gte: today, $lt: tomorrow }
+    })
+    .populate('patient_id', 'name patient_info')
+    .populate('family_member_id', 'name relation')
+    .sort({ time_slot: 1, createdAt: 1 });
+
+    const toMinutes = (t) => {
+      if (!t || typeof t !== 'string') return 0;
+      const [h, m] = t.split(':').map(Number);
+      return (h || 0) * 60 + (m || 0);
+    };
+
+    const sessionOf = (time) => {
+      const mins = toMinutes(time);
+      if (mins >= 9 * 60 && mins < 13 * 60) return 'morning';
+      if (mins >= 14 * 60 && mins < 18 * 60) return 'afternoon';
+      return 'evening';
+    };
+
+    const result = { morning: [], afternoon: [], evening: [] };
+
+    tokens.forEach((t) => {
+      const patientName = t.family_member_id ? t.family_member_id.name : (t.patient_id?.name || 'Patient');
+      const age = t.patient_id?.patient_info?.age || null;
+      const gender = t.patient_id?.patient_info?.gender || null;
+      const session = t.session_type || sessionOf(t.time_slot);
+      result[session] = result[session] || [];
+      result[session].push({
+        id: t._id,
+        tokenNumber: t.token_number,
+        patientName,
+        age,
+        gender,
+        symptoms: t.symptoms,
+        bookingStatus: t.status,
+        paymentStatus: t.payment_status,
+        time: t.time_slot
+      });
+    });
+
+    res.json({
+      date: today.toISOString().split('T')[0],
+      sessions: [
+        { id: 'morning', name: 'Morning', range: '9:00 AM - 1:00 PM', queue: result.morning },
+        { id: 'afternoon', name: 'Afternoon', range: '2:00 PM - 6:00 PM', queue: result.afternoon },
+        { id: 'evening', name: 'Evening', range: '6:00 PM - 9:00 PM', queue: result.evening }
+      ]
+    });
+  } catch (error) {
+    console.error('Get today queue error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get next patient in today's queue (earliest time among booked/in_queue)
+router.get('/next-patient', authMiddleware, doctorMiddleware, async (req, res) => {
+  try {
+    const doctorId = req.doctor._id;
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+
+    const next = await Token.findOne({
+      doctor_id: doctorId,
+      booking_date: { $gte: today, $lt: tomorrow },
+      status: { $in: ['booked', 'in_queue'] }
+    })
+    .populate('patient_id', 'name patient_info')
+    .populate('family_member_id', 'name relation')
+    .sort({ status: 1, time_slot: 1, createdAt: 1 });
+
+    if (!next) {
+      return res.json({ next: null });
+    }
+
+    const patientName = next.family_member_id ? next.family_member_id.name : (next.patient_id?.name || 'Patient');
+    const age = next.patient_id?.patient_info?.age || null;
+    const gender = next.patient_id?.patient_info?.gender || null;
+
+    res.json({
+      next: {
+        id: next._id,
+        tokenNumber: next.token_number,
+        patientName,
+        age,
+        gender,
+        symptoms: next.symptoms,
+        status: next.status,
+        time: next.time_slot
+      }
+    });
+  } catch (error) {
+    console.error('Get next patient error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Start consultation: mark token in_queue and set consultation_started_at
+router.post('/consultation/start', authMiddleware, doctorMiddleware, async (req, res) => {
+  try {
+    const { tokenId } = req.body;
+    if (!tokenId) return res.status(400).json({ message: 'tokenId is required' });
+
+    const token = await Token.findOneAndUpdate(
+      { _id: tokenId, doctor_id: req.doctor._id },
+      { status: 'in_queue', consultation_started_at: new Date() },
+      { new: true }
+    );
+    if (!token) return res.status(404).json({ message: 'Appointment not found' });
+    res.json({ message: 'Consultation started', tokenId: token._id });
+  } catch (error) {
+    console.error('Start consultation error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Skip / Call later: keep as booked, optionally bump updatedAt
+router.post('/consultation/skip', authMiddleware, doctorMiddleware, async (req, res) => {
+  try {
+    const { tokenId } = req.body;
+    if (!tokenId) return res.status(400).json({ message: 'tokenId is required' });
+    // Touch document to move later in sort by createdAt (optional)
+    await Token.findOneAndUpdate(
+      { _id: tokenId, doctor_id: req.doctor._id },
+      { $set: { updatedAt: new Date() } }
+    );
+    res.json({ message: 'Patient skipped' });
+  } catch (error) {
+    console.error('Skip consultation error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Mark as no-show
+router.post('/consultation/no-show', authMiddleware, doctorMiddleware, async (req, res) => {
+  try {
+    const { tokenId } = req.body;
+    if (!tokenId) return res.status(400).json({ message: 'tokenId is required' });
+    const token = await Token.findOneAndUpdate(
+      { _id: tokenId, doctor_id: req.doctor._id },
+      { status: 'missed' },
+      { new: true }
+    );
+    if (!token) return res.status(404).json({ message: 'Appointment not found' });
+    res.json({ message: 'Marked as no-show' });
+  } catch (error) {
+    console.error('No-show error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Complete consultation
+router.post('/consultation/complete', authMiddleware, doctorMiddleware, async (req, res) => {
+  try {
+    const { tokenId, notes, diagnosis } = req.body;
+    if (!tokenId) return res.status(400).json({ message: 'tokenId is required' });
+    const update = { status: 'consulted', consultation_completed_at: new Date() };
+    if (notes) update.consultation_notes = String(notes);
+    if (diagnosis) update.diagnosis = String(diagnosis);
+
+    const token = await Token.findOneAndUpdate(
+      { _id: tokenId, doctor_id: req.doctor._id },
+      update,
+      { new: true }
+    );
+    if (!token) return res.status(404).json({ message: 'Appointment not found' });
+    res.json({ message: 'Consultation completed' });
+  } catch (error) {
+    console.error('Complete consultation error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 });

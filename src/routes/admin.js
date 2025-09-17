@@ -1146,8 +1146,12 @@ router.post('/leave-requests/:id/approve', adminMiddleware, async (req, res) => 
     console.log('Leave request updated successfully');
 
     // Ensure schedule is marked unavailable for that date
-    const scheduleDate = new Date(leave.date);
-    scheduleDate.setHours(0, 0, 0, 0);
+    const scheduleDate = new Date(
+      new Date(leave.date).getFullYear(),
+      new Date(leave.date).getMonth(),
+      new Date(leave.date).getDate(),
+      0, 0, 0, 0
+    );
     console.log('Schedule date:', scheduleDate);
 
     let schedule = await DoctorSchedule.findOne({ doctor_id: leave.doctor_id, date: scheduleDate });

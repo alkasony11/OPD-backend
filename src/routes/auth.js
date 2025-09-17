@@ -252,19 +252,25 @@ router.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body;
     
-    console.log('Login attempt for:', email);
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('Login attempt for:', email);
+    }
     
     // Find user
     const user = await User.findOne({ email });
     if (!user) {
-      console.log('User not found');
+      if (process.env.NODE_ENV !== 'production') {
+        console.log('User not found');
+      }
       return res.status(400).json({ message: 'Invalid credentials' });
     }
     
     // Check password
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) {
-      console.log('Password mismatch');
+      if (process.env.NODE_ENV !== 'production') {
+        console.log('Password mismatch');
+      }
       return res.status(400).json({ message: 'Invalid credentials' });
     }
     
@@ -293,7 +299,9 @@ router.post('/login', async (req, res) => {
       role: user.role
     }, process.env.JWT_SECRET || 'your_jwt_secret', { expiresIn: '1d' });
 
-    console.log('Login successful');
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('Login successful');
+    }
     res.json({
       token,
       user: {
