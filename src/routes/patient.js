@@ -1085,7 +1085,11 @@ router.post('/book-appointment', authMiddleware, patientMiddleware, async (req, 
     }
 
     // Validate appointment date and time
-    const selectedDate = new Date(appointmentDate);
+    // Parse appointmentDate safely as local date (YYYY-MM-DD)
+    const parts = String(appointmentDate).split('-').map(Number);
+    const selectedDate = (parts.length === 3 && parts.every(n => !Number.isNaN(n)))
+      ? new Date(parts[0], parts[1] - 1, parts[2])
+      : new Date(appointmentDate);
     selectedDate.setHours(0, 0, 0, 0);
     
     // Check if doctor is available on that date (match by day range to avoid timezone issues)
@@ -1110,7 +1114,10 @@ router.post('/book-appointment', authMiddleware, patientMiddleware, async (req, 
     }
 
     // Validate session-based availability
-    const appointmentMinutes = parseTime(appointmentTime);
+    const appointmentMinutes = parseTime(appointmentTime || '');
+    if (!Number.isFinite(appointmentMinutes)) {
+      return res.status(400).json({ message: 'Invalid appointment time' });
+    }
     let isSessionValid = false;
     let sessionName = '';
 
@@ -1228,8 +1235,14 @@ router.post('/book-appointment', authMiddleware, patientMiddleware, async (req, 
       status: { $nin: ['cancelled', 'missed'] }
     });
 
-    const maxDailyTokens = schedule?.max_patients_per_slot * 
-      calculateTotalSlots(workingHours, breakTime, schedule?.slot_duration || 30) || 50;
+    // Derive working hours and break time from schedule or doctor defaults
+    const workingHours = schedule?.working_hours || doctor.doctor_info?.default_working_hours || { start_time: '09:00', end_time: '17:00' };
+    const breakTime = schedule?.break_time || doctor.doctor_info?.default_break_time || { start_time: '13:00', end_time: '14:00' };
+    const slotDuration = schedule?.slot_duration || 30;
+
+    const perSlotMax = schedule?.max_patients_per_slot || 1;
+    const totalSlotsForDay = calculateTotalSlots(workingHours, breakTime, slotDuration);
+    const maxDailyTokens = (perSlotMax * totalSlotsForDay) || 50;
 
     if (dailyTokenCount >= maxDailyTokens) {
       return res.status(400).json({ 
@@ -1298,8 +1311,13 @@ router.post('/book-appointment', authMiddleware, patientMiddleware, async (req, 
     });
 
   } catch (error) {
-    console.error('Book appointment error:', error);
-    res.status(500).json({ message: 'Server error' });
+    console.error('Book appointment error:', error && error.stack ? error.stack : error);
+    // Return more detail in development to aid debugging
+    const payload = { message: 'Server error' };
+    if (process.env.NODE_ENV !== 'production') {
+      payload.error = error?.message || String(error);
+    }
+    res.status(500).json(payload);
   }
 });
 
@@ -1310,7 +1328,7 @@ router.get('/appointments', authMiddleware, patientMiddleware, async (req, res) 
     
     // Build query
     let query = { patient_id: req.patient._id };
-    if (familyMemberId) {
+    if (familyMemberId && familyMemberId !== 'self') {
       query.family_member_id = familyMemberId;
     }
     if (status) {
@@ -1365,10 +1383,10 @@ router.get('/appointments', authMiddleware, patientMiddleware, async (req, res) 
   }
 });
 
-// Get family members for filtering appointments
-router.get('/family-members', authMiddleware, patientMiddleware, async (req, res) => {
+// Get family members for filtering appointments (legacy endpoint - keeping for backward compatibility)
+router.get('/family-members-filter', authMiddleware, patientMiddleware, async (req, res) => {
   try {
-    const familyMembers = await FamilyMember.find({ patientId: req.patient._id })
+    const familyMembers = await FamilyMember.find({ patient_id: req.patient._id, isActive: true })
       .select('_id name relation patientId')
       .sort({ name: 1 });
 
@@ -1385,6 +1403,39 @@ router.get('/family-members', authMiddleware, patientMiddleware, async (req, res
     res.json({ familyMembers: familyList });
   } catch (error) {
     console.error('Get family members error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get single appointment by id (for reschedule prefill)
+router.get('/appointments/:appointmentId', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    const { appointmentId } = req.params;
+    const apt = await Token.findById(appointmentId)
+      .populate('doctor_id', 'name email doctor_info')
+      .populate('patient_id', 'name email');
+    if (!apt) {
+      return res.status(404).json({ message: 'Appointment not found' });
+    }
+    if (apt.patient_id._id.toString() !== req.patient._id.toString()) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+    const dept = await Department.findOne({ name: apt.department }).select('_id name');
+    res.json({
+      appointment: {
+        id: apt._id,
+        doctorId: apt.doctor_id?._id,
+        doctorName: apt.doctor_id?.name,
+        doctorEmail: apt.doctor_id?.email,
+        departmentId: dept?._id || null,
+        departmentName: apt.department,
+        appointmentDate: apt.booking_date,
+        appointmentTime: apt.time_slot,
+        status: apt.status
+      }
+    });
+  } catch (error) {
+    console.error('Get appointment error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -1824,42 +1875,7 @@ router.delete('/family-members/:memberId', authMiddleware, patientMiddleware, as
 
 // ===== PATIENT APPOINTMENT ACTIONS =====
 
-// Cancel appointment (allowed until 2 hours before)
-router.post('/appointments/:id/cancel', authMiddleware, patientMiddleware, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { reason } = req.body || {};
-
-    const appointment = await Token.findOne({ _id: id, patient_id: req.patient._id });
-    if (!appointment) {
-      return res.status(404).json({ message: 'Appointment not found' });
-    }
-
-    if (['cancelled', 'missed', 'consulted'].includes(appointment.status)) {
-      return res.status(400).json({ message: `Cannot cancel a ${appointment.status} appointment` });
-    }
-
-    const now = new Date();
-    const aptDate = new Date(appointment.booking_date);
-    const [h, m] = (appointment.time_slot || '00:00').split(':').map(Number);
-    aptDate.setHours(h || 0, m || 0, 0, 0);
-
-    const msUntil = aptDate.getTime() - now.getTime();
-    const twoHoursMs = 2 * 60 * 60 * 1000;
-    if (msUntil <= twoHoursMs) {
-      return res.status(400).json({ message: 'Cancellations are only allowed up to 2 hours before the appointment' });
-    }
-
-    appointment.status = 'cancelled';
-    if (reason) appointment.cancellation_reason = reason;
-    await appointment.save();
-
-    return res.json({ message: 'Appointment cancelled successfully' });
-  } catch (error) {
-    console.error('Cancel appointment error:', error);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
+// (Removed duplicate simple cancel route; using advanced cancel with refund logic above)
 
 // Reschedule appointment (change date/time if available)
 router.post('/appointments/:id/reschedule', authMiddleware, patientMiddleware, async (req, res) => {
@@ -1922,15 +1938,136 @@ router.post('/appointments/:id/reschedule', authMiddleware, patientMiddleware, a
       return res.status(400).json({ message: 'Selected time slot is no longer available' });
     }
 
+    // Generate new token number for rescheduled appointment
+    const newTokenNumber = `T${Date.now().toString().slice(-4)}`;
+
     appointment.doctor_id = doctorId;
     appointment.booking_date = selectedDate;
     appointment.time_slot = newTime;
     appointment.status = 'booked';
+    appointment.token_number = newTokenNumber;
     await appointment.save();
 
-    res.json({ message: 'Appointment rescheduled successfully' });
+    // Notify patient & doctor via email (best-effort)
+    try {
+      const { transporter } = require('../config/email');
+      const patientEmail = appointment.patient_id?.email;
+      const doctorEmail = appointment.doctor_id?.email;
+      const dateStr = new Date(selectedDate).toLocaleDateString();
+
+      if (patientEmail) {
+        transporter.sendMail({
+          to: patientEmail,
+          subject: 'Appointment Rescheduled',
+          text: `Your appointment has been rescheduled to ${dateStr} at ${newTime}. Token: ${newTokenNumber}`
+        }).catch(() => {});
+      }
+      if (doctorEmail) {
+        transporter.sendMail({
+          to: doctorEmail,
+          subject: 'Patient Rescheduled Appointment',
+          text: `A patient has rescheduled to ${dateStr} at ${newTime}. Token: ${newTokenNumber}`
+        }).catch(() => {});
+      }
+    } catch {}
+
+    res.json({ message: 'Appointment rescheduled successfully', tokenNumber: newTokenNumber });
   } catch (error) {
     console.error('Reschedule appointment error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ===== DEV UTILITIES (seed test data) =====
+// Seed a few test appointments and schedules for the logged-in patient
+// Enabled only in development environment
+router.post('/dev/seed-appointments', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    if (process.env.NODE_ENV && process.env.NODE_ENV !== 'development') {
+      return res.status(403).json({ message: 'Seeding is only allowed in development mode' });
+    }
+
+    // Find any doctor and their department
+    const doctor = await User.findOne({ role: 'doctor' }).populate('doctor_info.department', 'name');
+    if (!doctor) {
+      return res.status(400).json({ message: 'No doctors found. Please create a doctor first.' });
+    }
+
+    const departmentName = doctor.doctor_info?.department?.name || 'General';
+
+    // Prepare two future dates (tomorrow and day after)
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const d1 = new Date(today); d1.setDate(today.getDate() + 1);
+    const d2 = new Date(today); d2.setDate(today.getDate() + 2);
+
+    // Ensure schedules exist for those dates for reschedule/availability logic
+    const scheduleTemplates = [d1, d2].map(date => ({
+      doctor_id: doctor._id,
+      date,
+      is_available: true,
+      working_hours: { start_time: '09:00', end_time: '18:00' },
+      break_time: { start_time: '13:00', end_time: '14:00' },
+      slot_duration: 30,
+      morning_session: { available: true, max_patients: 10 },
+      afternoon_session: { available: true, max_patients: 10 }
+    }));
+
+    for (const tpl of scheduleTemplates) {
+      const start = new Date(tpl.date); start.setHours(0, 0, 0, 0);
+      const end = new Date(start); end.setDate(end.getDate() + 1);
+      const existing = await DoctorSchedule.findOne({ doctor_id: tpl.doctor_id, date: { $gte: start, $lt: end } });
+      if (!existing) {
+        await DoctorSchedule.create(tpl);
+      }
+    }
+
+    // Create two test appointments (pending payment)
+    const appointments = [];
+    const items = [
+      { booking_date: d1, time_slot: '10:00', session_type: 'morning', session_time_range: '9:00 AM - 1:00 PM' },
+      { booking_date: d2, time_slot: '15:00', session_type: 'afternoon', session_time_range: '2:00 PM - 6:00 PM' }
+    ];
+
+    for (const item of items) {
+      const tokenNumber = `T${Date.now().toString().slice(-4)}${Math.floor(Math.random()*90+10)}`;
+      const tok = new Token({
+        patient_id: req.patient._id,
+        family_member_id: null,
+        doctor_id: doctor._id,
+        department: departmentName,
+        symptoms: 'Test data - seeded',
+        booking_date: item.booking_date,
+        time_slot: item.time_slot,
+        session_type: item.session_type,
+        session_time_range: item.session_time_range,
+        status: 'booked',
+        token_number: tokenNumber,
+        payment_status: 'pending',
+        created_by: 'patient',
+        estimated_wait_time: Math.floor(Math.random() * 30) + 15
+      });
+      await tok.save();
+      appointments.push(tok);
+
+      // Push to patient's booking history
+      await User.findByIdAndUpdate(req.patient._id, { $push: { 'patient_info.booking_history': tok._id } });
+    }
+
+    res.status(201).json({
+      message: 'Seeded test appointments successfully',
+      count: appointments.length,
+      appointments: appointments.map(a => ({
+        id: a._id,
+        tokenNumber: a.token_number,
+        date: a.booking_date,
+        time: a.time_slot,
+        status: a.status,
+        paymentStatus: a.payment_status
+      }))
+    });
+  } catch (error) {
+    console.error('Seed appointments error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 });
