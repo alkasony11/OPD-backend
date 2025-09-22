@@ -1,13 +1,51 @@
 const express = require('express');
 const router = express.Router();
+const mongoose = require('mongoose');
 const { User, Token, Appointment } = require('../models/User');
 const Department = require('../models/Department');
 const FamilyMember = require('../models/FamilyMember');
 const DoctorSchedule = require('../models/DoctorSchedule');
 const { authMiddleware } = require('../middleware/authMiddleware');
 const SymptomAnalysisService = require('../services/symptomAnalysisService');
+const whatsappBotService = require('../services/whatsappBotService');
+const notificationService = require('../services/notificationService');
+const meetingLinkService = require('../services/meetingLinkService');
 const crypto = require('crypto');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
 let Razorpay; try { Razorpay = require('razorpay'); } catch { Razorpay = null; }
+
+// Configure multer for file uploads
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    const uploadPath = path.join(__dirname, '../../uploads/profile-photos');
+    if (!fs.existsSync(uploadPath)) {
+      fs.mkdirSync(uploadPath, { recursive: true });
+    }
+    cb(null, uploadPath);
+  },
+  filename: function (req, file, cb) {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, 'profile-' + uniqueSuffix + path.extname(file.originalname));
+  }
+});
+
+const upload = multer({
+  storage: storage,
+  limits: {
+    fileSize: 2 * 1024 * 1024 // 2MB limit as per requirements
+  },
+  fileFilter: function (req, file, cb) {
+    // Only allow JPG and PNG files
+    const allowedTypes = ['image/jpeg', 'image/jpg', 'image/png'];
+    if (allowedTypes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only JPG and PNG files are allowed'), false);
+    }
+  }
+});
 
 // Middleware to check if user is a patient
 const patientMiddleware = async (req, res, next) => {
@@ -91,6 +129,39 @@ router.get('/departments', async (req, res) => {
     res.json({ departments: departmentList });
   } catch (error) {
     console.error('Get departments error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get all doctors (public endpoint)
+router.get('/doctors', async (req, res) => {
+  try {
+    const doctors = await User.find({ role: 'doctor' })
+      .select('-password')
+      .populate('doctor_info.department', 'name description')
+      .sort({ createdAt: -1 });
+
+    const doctorsWithInfo = doctors.map(doctor => ({
+      _id: doctor._id,
+      name: doctor.name,
+      email: doctor.email,
+      phone: doctor.phone,
+      profile_photo: doctor.profile_photo,
+      doctor_info: {
+        department: doctor.doctor_info?.department,
+        specialization: doctor.doctor_info?.specialization,
+        experience_years: doctor.doctor_info?.experience_years,
+        consultation_fee: doctor.doctor_info?.consultation_fee,
+        qualifications: doctor.doctor_info?.qualifications,
+        bio: doctor.doctor_info?.bio,
+        default_working_hours: doctor.doctor_info?.default_working_hours,
+        default_break_time: doctor.doctor_info?.default_break_time
+      }
+    }));
+
+    res.json(doctorsWithInfo);
+  } catch (error) {
+    console.error('Get all doctors error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -195,13 +266,21 @@ router.get('/departments/:departmentId/available-dates', async (req, res) => {
     }).sort({ date: 1 });
 
 
+    // Helper: format date to local YYYY-MM-DD to avoid UTC day shifts
+    const toLocalYMD = (d) => {
+      const year = d.getFullYear();
+      const month = String(d.getMonth() + 1).padStart(2, '0');
+      const day = String(d.getDate()).padStart(2, '0');
+      return `${year}-${month}-${day}`;
+    };
+
     // Map dateStr -> aggregate available sessions (sum across doctors)
     const dateAvailabilityMap = new Map();
 
     for (const schedule of schedules) {
       const date = new Date(schedule.date);
       date.setHours(0, 0, 0, 0);
-      const dateStr = date.toISOString().split('T')[0];
+      const dateStr = toLocalYMD(date);
 
       const nextDay = new Date(date);
       nextDay.setDate(date.getDate() + 1);
@@ -257,73 +336,15 @@ router.get('/departments/:departmentId/available-dates', async (req, res) => {
       }
     }
 
-    // If no schedules contributed availability, fall back to defaults for next 7 days
+    // If no schedules contributed availability, return empty list (no fabricated defaults)
     if (dateAvailabilityMap.size === 0) {
-      const next7 = [];
-      for (let i = 0; i < 7; i++) {
-        const d = new Date(today);
-        d.setDate(today.getDate() + i);
-        d.setHours(0, 0, 0, 0);
-        next7.push(d);
-      }
-
-      for (const d of next7) {
-        const dateStr = d.toISOString().split('T')[0];
-
-        // Default session-based availability (2 sessions per doctor)
-        let dayAvailableSessions = 0;
-        let dayTotalSessions = 0;
-
-        for (const docId of doctorIds) {
-          // Each doctor has 2 default sessions (morning + afternoon)
-          dayTotalSessions += 2;
-          
-          // Check if doctor has any appointments for this date
-          const nextDay = new Date(d);
-          nextDay.setDate(d.getDate() + 1);
-          const hasAppointments = await Token.countDocuments({
-            doctor_id: docId,
-            booking_date: { $gte: d, $lt: nextDay },
-            status: { $nin: ['cancelled', 'missed'] }
-          });
-          
-          // If no appointments, both sessions are available
-          if (hasAppointments === 0) {
-            dayAvailableSessions += 2;
-          } else {
-            // Check individual session capacity (default 10 patients per session)
-            const morningAppointments = await Token.countDocuments({
-              doctor_id: docId,
-              booking_date: { $gte: d, $lt: nextDay },
-              time_slot: { $gte: '09:00', $lt: '13:00' },
-              status: { $nin: ['cancelled', 'missed'] }
-            });
-            const afternoonAppointments = await Token.countDocuments({
-              doctor_id: docId,
-              booking_date: { $gte: d, $lt: nextDay },
-              time_slot: { $gte: '14:00', $lt: '18:00' },
-              status: { $nin: ['cancelled', 'missed'] }
-            });
-            
-            if (morningAppointments < 10) dayAvailableSessions++;
-            if (afternoonAppointments < 10) dayAvailableSessions++;
-          }
-        }
-
-        if (dayAvailableSessions > 0) {
-          dateAvailabilityMap.set(dateStr, {
-            date: d,
-            availableSessions: dayAvailableSessions,
-            totalSessions: dayTotalSessions
-          });
-        }
-      }
+      return res.json({ availableDates: [] });
     }
 
     const availableDates = Array.from(dateAvailabilityMap.entries()).map(([dateStr, info]) => ({
       date: dateStr,
       dayName: info.date.toLocaleDateString('en-US', { weekday: 'long' }),
-      isToday: dateStr === today.toISOString().split('T')[0],
+      isToday: dateStr === toLocalYMD(today),
       availableSessions: info.availableSessions || 0,
       totalSessions: info.totalSessions || 0,
       // Keep backward compatibility
@@ -440,39 +461,22 @@ async function checkDoctorSessionAvailability(doctorId, date, startTime, endTime
       is_available: true
     });
 
+    // If no schedule for this date, doctor is not available
+    if (!schedule) return false;
 
-    if (schedule) {
-      // Check session-based availability first
-      if (startTime >= '09:00' && endTime <= '13:00') {
-        // Morning session
-        const isAvailable = schedule.morning_session?.available !== false;
-        return isAvailable;
-      } else if (startTime >= '14:00' && endTime <= '18:00') {
-        // Afternoon session
-        const isAvailable = schedule.afternoon_session?.available !== false;
-        return isAvailable;
-      } else {
-        // Fallback to working hours for other times
-        const scheduleStart = schedule.working_hours?.start_time || '09:00';
-        const scheduleEnd = schedule.working_hours?.end_time || '17:00';
-        return startTime >= scheduleStart && endTime <= scheduleEnd;
-      }
-    } else {
-      // If no schedule, use default session availability
-      if (startTime >= '09:00' && endTime <= '13:00') {
-        // Morning session - default available
-        return true;
-      } else if (startTime >= '14:00' && endTime <= '18:00') {
-        // Afternoon session - default available
-        return true;
-      } else {
-        // Fallback to doctor's default working hours
-        const doctor = await User.findById(doctorId).select('doctor_info');
-        const defaultStart = doctor?.doctor_info?.default_working_hours?.start_time || '09:00';
-        const defaultEnd = doctor?.doctor_info?.default_working_hours?.end_time || '17:00';
-        return startTime >= defaultStart && endTime <= defaultEnd;
-      }
+    // Check session-based availability first
+    if (startTime >= '09:00' && endTime <= '13:00') {
+      // Morning session
+      return schedule.morning_session?.available !== false;
+    } else if (startTime >= '14:00' && endTime <= '18:00') {
+      // Afternoon session
+      return schedule.afternoon_session?.available !== false;
     }
+
+    // Otherwise ensure within working hours
+    const scheduleStart = schedule.working_hours?.start_time || '09:00';
+    const scheduleEnd = schedule.working_hours?.end_time || '17:00';
+    return startTime >= scheduleStart && endTime <= scheduleEnd;
   } catch (error) {
     console.error('Error checking doctor session availability:', error);
     return false;
@@ -520,17 +524,14 @@ async function getDoctorSessionAvailability(doctorId, date, startTime, endTime) 
 
     // Check if doctor has a schedule for this session
     let hasSchedule = false;
-    if (schedule) {
-      if (startTime >= '09:00' && endTime <= '13:00') {
-        hasSchedule = schedule.morning_session?.available !== false;
-      } else if (startTime >= '14:00' && endTime <= '18:00') {
-        hasSchedule = schedule.afternoon_session?.available !== false;
-      } else {
-        hasSchedule = true; // For other times, use working hours
-      }
+    if (!schedule) {
+      hasSchedule = false;
+    } else if (startTime >= '09:00' && endTime <= '13:00') {
+      hasSchedule = schedule.morning_session?.available !== false;
+    } else if (startTime >= '14:00' && endTime <= '18:00') {
+      hasSchedule = schedule.afternoon_session?.available !== false;
     } else {
-      // If no schedule, default to available for session times
-      hasSchedule = (startTime >= '09:00' && endTime <= '13:00') || (startTime >= '14:00' && endTime <= '18:00');
+      hasSchedule = true; // For other times, use working hours
     }
 
     return {
@@ -681,10 +682,10 @@ router.get('/departments/:departmentId/available-doctors', async (req, res) => {
       'doctor_info.department': departmentId
     }).select('name doctor_info email profile_photo');
 
-    // Filter to those with schedule and free at time
+    // Filter to those with schedule and free at time, and consider session capacity
     const available = [];
     for (const doctor of doctors) {
-      // Prefer explicit schedule; if none, fall back to doctor's default hours
+      // Require explicit schedule on the selected date
       console.log('[AVAIL-DOCTORS] doctorId=', doctor._id.toString(), 'date=', date, 'time=', time, 'range=', selectedDate.toISOString(), 'to', nextDay.toISOString());
       const schedule = await DoctorSchedule.findOne({
         doctor_id: doctor._id,
@@ -693,10 +694,11 @@ router.get('/departments/:departmentId/available-doctors', async (req, res) => {
       });
       if (!schedule) {
         console.log('[AVAIL-DOCTORS] No schedule found in range for doctor');
+        continue;
       }
 
-      const workingHours = schedule?.working_hours || doctor.doctor_info?.default_working_hours || { start_time: '09:00', end_time: '17:00' };
-      const breakTime = schedule?.break_time || doctor.doctor_info?.default_break_time || { start_time: '13:00', end_time: '14:00' };
+      const workingHours = schedule.working_hours;
+      const breakTime = schedule.break_time;
 
       // Check time in working hours and not during break
       const t = parseTime(time);
@@ -707,6 +709,12 @@ router.get('/departments/:departmentId/available-doctors', async (req, res) => {
       const within = t >= start && t < end && !(t >= bs && t < be);
       if (!within) continue;
 
+      // Ensure time falls in an available session if within session windows
+      const inMorning = t >= parseTime('09:00') && t < parseTime('13:00');
+      const inAfternoon = t >= parseTime('14:00') && t < parseTime('18:00');
+      if (inMorning && schedule.morning_session?.available === false) continue;
+      if (inAfternoon && schedule.afternoon_session?.available === false) continue;
+
       const conflict = await Token.findOne({
         doctor_id: doctor._id,
         booking_date: { $gte: selectedDate, $lt: nextDay },
@@ -714,6 +722,29 @@ router.get('/departments/:departmentId/available-doctors', async (req, res) => {
         status: { $nin: ['cancelled', 'missed'] }
       });
       if (conflict) continue;
+
+      // Check session capacity against current bookings in the session window
+      let sessionStart = workingHours.start_time;
+      let sessionEnd = workingHours.end_time;
+      let maxPatients = 10;
+      if (inMorning) {
+        sessionStart = '09:00';
+        sessionEnd = '13:00';
+        maxPatients = schedule.morning_session?.max_patients || 10;
+      } else if (inAfternoon) {
+        sessionStart = '14:00';
+        sessionEnd = '18:00';
+        maxPatients = schedule.afternoon_session?.max_patients || 10;
+      }
+
+      const currentAppointments = await Token.countDocuments({
+        doctor_id: doctor._id,
+        booking_date: { $gte: selectedDate, $lt: nextDay },
+        time_slot: { $gte: sessionStart, $lt: sessionEnd },
+        status: { $nin: ['cancelled', 'missed', 'completed'] }
+      });
+      const hasCapacity = currentAppointments < maxPatients;
+      if (!hasCapacity) continue;
 
       available.push({
         id: doctor._id,
@@ -727,6 +758,7 @@ router.get('/departments/:departmentId/available-doctors', async (req, res) => {
         rating: 4.5,
         reviews: 50,
         isAvailable: true,
+        hasAvailableSlots: true,
         availableDays: 1,
         nextAvailableDate: date
       });
@@ -739,12 +771,11 @@ router.get('/departments/:departmentId/available-doctors', async (req, res) => {
   }
 });
 
-// ===== PAYMENTS (Razorpay - test) =====
+// ===== PAYMENTS (Razorpay - test/dummy) =====
 router.get('/payment/key', authMiddleware, async (req, res) => {
   try {
-    const keyId = process.env.RAZORPAY_KEY_ID || '';
-    if (!keyId) return res.status(500).json({ message: 'Razorpay key not configured' });
-    res.json({ keyId });
+    const keyId = process.env.RAZORPAY_KEY_ID || 'rzp_test_dummy_key';
+    res.json({ keyId, dummy: !process.env.RAZORPAY_KEY_ID });
   } catch (error) {
     res.status(500).json({ message: 'Server error' });
   }
@@ -757,18 +788,58 @@ router.post('/payment/create-order', authMiddleware, async (req, res) => {
 
     const keyId = process.env.RAZORPAY_KEY_ID;
     const keySecret = process.env.RAZORPAY_KEY_SECRET;
-    if (!keyId || !keySecret) return res.status(500).json({ message: 'Razorpay keys not configured' });
 
-    const instance = new Razorpay({ key_id: keyId, key_secret: keySecret });
-    const order = await instance.orders.create({
+    // If real keys are present and SDK is available, create a live test order
+    if (keyId && keySecret && Razorpay) {
+      const instance = new Razorpay({ key_id: keyId, key_secret: keySecret });
+      const order = await instance.orders.create({
+        amount: Math.round(Number(amount) * 100),
+        currency,
+        receipt: receipt || `rcpt_${Date.now()}`
+      });
+      return res.json({ order, dummy: false });
+    }
+
+    // Dummy fallback (no keys): simulate an order
+    const order = {
+      id: `order_dummy_${Date.now()}`,
       amount: Math.round(Number(amount) * 100),
       currency,
-      receipt: receipt || `rcpt_${Date.now()}`
-    });
-    res.json({ order });
+      receipt: receipt || `rcpt_${Date.now()}`,
+      status: 'created',
+      created_at: Math.floor(Date.now() / 1000)
+    };
+    return res.json({ order, dummy: true });
   } catch (error) {
     console.error('Razorpay create order error:', error);
     res.status(500).json({ message: 'Failed to create payment order' });
+  }
+});
+
+// Mark an appointment as paid (dummy verification)
+router.post('/payment/mark-paid', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    const { appointmentId, amount, method = 'card', reference } = req.body;
+    if (!appointmentId) return res.status(400).json({ message: 'appointmentId is required' });
+
+    const appointment = await Token.findOne({ _id: appointmentId, patient_id: req.patient._id });
+    if (!appointment) {
+      return res.status(404).json({ message: 'Appointment not found' });
+    }
+
+    await Token.findByIdAndUpdate(appointmentId, {
+      $set: {
+        payment_status: 'paid',
+        paid_amount: amount || appointment.paid_amount || (appointment.doctor_id?.doctor_info?.consultation_fee || 500),
+        payment_method: method,
+        payment_reference: reference || `PAY${Date.now().toString().slice(-8)}`
+      }
+    });
+
+    return res.json({ message: 'Payment marked as paid', status: 'paid' });
+  } catch (error) {
+    console.error('Mark paid error:', error);
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -1062,7 +1133,8 @@ router.post('/book-appointment', authMiddleware, patientMiddleware, async (req, 
       appointmentDate,
       appointmentTime,
       symptoms,
-      familyMemberId
+      familyMemberId,
+      appointmentType = 'in-person' // Default to in-person if not specified
     } = req.body;
 
     // Validate required fields
@@ -1268,6 +1340,26 @@ router.post('/book-appointment', authMiddleware, patientMiddleware, async (req, 
       sessionTimeRange = '6:00 PM - 9:00 PM';
     }
 
+    // Generate meeting link for video consultations
+    let meetingLinkData = null;
+    if (appointmentType === 'video') {
+      try {
+        const tempAppointmentId = new mongoose.Types.ObjectId();
+        meetingLinkData = meetingLinkService.generateMeetingLink(
+          tempAppointmentId.toString(),
+          doctorId,
+          req.patient._id,
+          appointmentDate,
+          appointmentTime,
+          'jitsi' // Default to Jitsi, can be made configurable
+        );
+        console.log('Generated meeting link for video consultation:', meetingLinkData);
+      } catch (error) {
+        console.error('Error generating meeting link:', error);
+        // Continue with booking even if meeting link generation fails
+      }
+    }
+
     // Create appointment token
     const appointmentToken = new Token({
       patient_id: req.patient._id,
@@ -1279,6 +1371,15 @@ router.post('/book-appointment', authMiddleware, patientMiddleware, async (req, 
       time_slot: appointmentTime,
       session_type: sessionType,
       session_time_range: sessionTimeRange,
+      appointment_type: appointmentType, // Add appointment type
+      meeting_link: meetingLinkData ? {
+        meetingId: meetingLinkData.meetingId,
+        meetingUrl: meetingLinkData.meetingUrl,
+        meetingPassword: meetingLinkData.meetingPassword,
+        provider: meetingLinkData.provider,
+        expiresAt: meetingLinkData.expiresAt,
+        isActive: meetingLinkData.isActive
+      } : undefined,
       status: 'booked',
       token_number: tokenNumber,
       payment_status: 'pending',
@@ -1294,21 +1395,56 @@ router.post('/book-appointment', authMiddleware, patientMiddleware, async (req, 
       { $push: { 'patient_info.booking_history': appointmentToken._id } }
     );
 
-    res.status(201).json({
+    // Send comprehensive notifications (email, SMS, WhatsApp) - async, don't wait for it
+    console.log('🔔 Sending booking confirmation notifications for appointment:', appointmentToken._id);
+    console.log('📧 Patient email:', req.patient.email);
+    console.log('📱 Patient phone:', req.patient.phone);
+    
+    notificationService.sendBookingConfirmation(appointmentToken._id).then(result => {
+      console.log('✅ Booking confirmation notifications sent successfully:', result);
+    }).catch(error => {
+      console.error('❌ Failed to send booking confirmation notifications:', error);
+    });
+
+    // Prepare response data
+    const responseData = {
       message: 'Appointment booked successfully',
       appointment: {
+        id: appointmentToken._id,
         tokenNumber,
         doctorName: doctor.name,
         departmentName: department.name,
         appointmentDate,
         appointmentTime,
+        appointmentType,
+        paymentStatus: 'pending',
         patientName: familyMember ? familyMember.name : req.patient.name,
         isForFamilyMember: !!familyMember,
         familyMemberRelation: familyMember ? familyMember.relation : null,
         status: 'booked',
         estimatedWaitTime: appointmentToken.estimated_wait_time
       }
-    });
+    };
+
+    // Add meeting link information for video consultations
+    if (appointmentType === 'video' && meetingLinkData) {
+      responseData.appointment.meetingLink = {
+        meetingUrl: meetingLinkData.meetingUrl,
+        meetingId: meetingLinkData.meetingId,
+        meetingPassword: meetingLinkData.meetingPassword,
+        provider: meetingLinkData.provider,
+        expiresAt: meetingLinkData.expiresAt,
+        instructions: meetingLinkService.generateMeetingInstructions(
+          meetingLinkData,
+          familyMember ? familyMember.name : req.patient.name,
+          doctor.name,
+          appointmentDate,
+          appointmentTime
+        )
+      };
+    }
+
+    res.status(201).json(responseData);
 
   } catch (error) {
     console.error('Book appointment error:', error && error.stack ? error.stack : error);
@@ -1328,8 +1464,12 @@ router.get('/appointments', authMiddleware, patientMiddleware, async (req, res) 
     
     // Build query
     let query = { patient_id: req.patient._id };
-    if (familyMemberId && familyMemberId !== 'self') {
-      query.family_member_id = familyMemberId;
+    if (familyMemberId) {
+      if (familyMemberId === 'self') {
+        query.family_member_id = null; // self means appointments not for a family member
+      } else {
+        query.family_member_id = familyMemberId;
+      }
     }
     if (status) {
       query.status = status;
@@ -1372,7 +1512,16 @@ router.get('/appointments', authMiddleware, patientMiddleware, async (req, res) 
         consultationNotes: apt.consultation_notes,
         diagnosis: apt.diagnosis,
         prescriptions: apt.prescriptions || [],
-        cancellationReason: apt.cancellation_reason
+        cancellationReason: apt.cancellation_reason,
+        // Video consultation fields
+        appointmentType: apt.appointment_type || 'in-person',
+        meetingLink: apt.meeting_link ? {
+          meetingUrl: apt.meeting_link.meetingUrl,
+          meetingId: apt.meeting_link.meetingId,
+          meetingPassword: apt.meeting_link.meetingPassword,
+          provider: apt.meeting_link.provider,
+          expiresAt: apt.meeting_link.expiresAt
+        } : null
       };
     });
 
@@ -1545,15 +1694,16 @@ router.post('/appointments/:appointmentId/cancel', authMiddleware, patientMiddle
       }
     }
 
-    // Send notifications
-    await sendCancellationNotifications({
-      appointment: updatedAppointment,
-      patient: req.patient,
-      doctor: appointment.doctor_id,
-      familyMember: appointment.family_member_id,
-      refundEligible,
-      refundAmount,
-      refundResult
+    // Send comprehensive cancellation notifications (email, SMS, WhatsApp) - async, don't wait for it
+    const refundInfo = {
+      eligible: refundEligible,
+      amount: refundAmount,
+      method: refundMethod,
+      status: refundResult?.success ? 'processed' : 'failed'
+    };
+    
+    notificationService.sendCancellationConfirmation(appointmentId, refundInfo).catch(error => {
+      console.error('Failed to send cancellation confirmation notifications:', error);
     });
 
     // Prepare response
@@ -2068,6 +2218,305 @@ router.post('/dev/seed-appointments', authMiddleware, patientMiddleware, async (
     });
   } catch (error) {
     console.error('Seed appointments error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ===== ACCOUNT MANAGEMENT ROUTES =====
+
+// Get patient profile
+router.get('/profile', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    console.log('Profile request - Patient ID:', req.patient._id);
+    const user = await User.findById(req.patient._id).select('-password');
+    console.log('Found user:', user ? 'Yes' : 'No');
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    res.json({ user });
+  } catch (error) {
+    console.error('Get profile error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Update patient profile
+router.put('/profile', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    const {
+      name,
+      age,
+      gender,
+      phone,
+      email,
+      address,
+      bloodGroup,
+      allergies,
+      chronicConditions,
+      emergencyContact
+    } = req.body;
+
+    const updateData = {
+      name,
+      age,
+      gender,
+      phone,
+      email,
+      address,
+      bloodGroup,
+      allergies,
+      chronicConditions,
+      emergencyContact
+    };
+
+    // Remove undefined values
+    Object.keys(updateData).forEach(key => {
+      if (updateData[key] === undefined) {
+        delete updateData[key];
+      }
+    });
+
+    const user = await User.findByIdAndUpdate(
+      req.patient._id,
+      { $set: updateData },
+      { new: true, select: '-password' }
+    );
+
+    res.json({ message: 'Profile updated successfully', user });
+  } catch (error) {
+    console.error('Update profile error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Upload profile photo
+router.post('/upload-photo', authMiddleware, patientMiddleware, upload.single('photo'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: 'No photo uploaded' });
+    }
+
+    const profilePhoto = `/uploads/profile-photos/${req.file.filename}`;
+    
+    // Remove old photo if exists
+    const user = await User.findById(req.patient._id);
+    if (user.profile_photo) {
+      const oldPhotoPath = path.join(__dirname, '../../', user.profile_photo);
+      if (fs.existsSync(oldPhotoPath)) {
+        fs.unlinkSync(oldPhotoPath);
+      }
+    }
+    
+    await User.findByIdAndUpdate(req.patient._id, {
+      $set: { profile_photo: profilePhoto }
+    });
+
+    res.json({ message: 'Photo uploaded successfully', profilePhoto });
+  } catch (error) {
+    console.error('Upload photo error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Remove profile photo
+router.delete('/remove-photo', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    const user = await User.findById(req.patient._id);
+    
+    if (user.profile_photo) {
+      // Remove file from filesystem
+      const photoPath = path.join(__dirname, '../../', user.profile_photo);
+      if (fs.existsSync(photoPath)) {
+        fs.unlinkSync(photoPath);
+      }
+      
+      // Remove photo reference from database
+      await User.findByIdAndUpdate(req.patient._id, {
+        $unset: { profile_photo: 1 }
+      });
+    }
+
+    res.json({ message: 'Photo removed successfully' });
+  } catch (error) {
+    console.error('Remove photo error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get family members
+router.get('/family-members', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    const familyMembers = await FamilyMember.find({ patient_id: req.patient._id });
+    res.json({ familyMembers });
+  } catch (error) {
+    console.error('Get family members error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Add family member
+router.post('/family-members', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    const {
+      name,
+      age,
+      gender,
+      phone,
+      relation,
+      bloodGroup,
+      allergies,
+      chronicConditions
+    } = req.body;
+
+    // Generate unique patient ID for family member
+    const patientId = `FM${Date.now().toString().slice(-6)}`;
+
+    const familyMember = new FamilyMember({
+      patient_id: req.patient._id,
+      name,
+      age,
+      gender,
+      phone,
+      relation,
+      patientId,
+      bloodGroup,
+      allergies,
+      chronicConditions
+    });
+
+    await familyMember.save();
+    res.status(201).json({ message: 'Family member added successfully', familyMember });
+  } catch (error) {
+    console.error('Add family member error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Update family member
+router.put('/family-members/:id', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updateData = req.body;
+
+    // Remove undefined values
+    Object.keys(updateData).forEach(key => {
+      if (updateData[key] === undefined) {
+        delete updateData[key];
+      }
+    });
+
+    const familyMember = await FamilyMember.findOneAndUpdate(
+      { _id: id, patient_id: req.patient._id },
+      { $set: updateData },
+      { new: true }
+    );
+
+    if (!familyMember) {
+      return res.status(404).json({ message: 'Family member not found' });
+    }
+
+    res.json({ message: 'Family member updated successfully', familyMember });
+  } catch (error) {
+    console.error('Update family member error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Delete family member
+router.delete('/family-members/:id', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const familyMember = await FamilyMember.findOneAndDelete({
+      _id: id,
+      patient_id: req.patient._id
+    });
+
+    if (!familyMember) {
+      return res.status(404).json({ message: 'Family member not found' });
+    }
+
+    res.json({ message: 'Family member deleted successfully' });
+  } catch (error) {
+    console.error('Delete family member error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Change password
+router.put('/change-password', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ message: 'Current password and new password are required' });
+    }
+
+    const user = await User.findById(req.patient._id);
+    
+    // Verify current password
+    const bcrypt = require('bcryptjs');
+    const isCurrentPasswordValid = await bcrypt.compare(currentPassword, user.password);
+    
+    if (!isCurrentPasswordValid) {
+      return res.status(400).json({ message: 'Current password is incorrect' });
+    }
+
+    // Hash new password
+    const saltRounds = 10;
+    const hashedNewPassword = await bcrypt.hash(newPassword, saltRounds);
+
+    await User.findByIdAndUpdate(req.patient._id, {
+      $set: { password: hashedNewPassword }
+    });
+
+    res.json({ message: 'Password changed successfully' });
+  } catch (error) {
+    console.error('Change password error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get account settings
+router.get('/account-settings', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    const user = await User.findById(req.patient._id).select('account_settings');
+    res.json({ settings: user.account_settings || {} });
+  } catch (error) {
+    console.error('Get account settings error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Update account settings
+router.put('/account-settings', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    const settings = req.body;
+
+    await User.findByIdAndUpdate(req.patient._id, {
+      $set: { account_settings: settings }
+    });
+
+    res.json({ message: 'Account settings updated successfully' });
+  } catch (error) {
+    console.error('Update account settings error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Deactivate account
+router.put('/deactivate-account', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    await User.findByIdAndUpdate(req.patient._id, {
+      $set: { 
+        isActive: false,
+        deactivatedAt: new Date()
+      }
+    });
+
+    res.json({ message: 'Account deactivated successfully' });
+  } catch (error) {
+    console.error('Deactivate account error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 });

@@ -37,14 +37,22 @@ const familyMemberSchema = new mongoose.Schema({
     type: String,
     default: ''
   },
+  bloodGroup: {
+    type: String,
+    default: ''
+  },
+  allergies: {
+    type: String,
+    default: ''
+  },
+  chronicConditions: {
+    type: String,
+    default: ''
+  },
   medical_history: [{
     condition: String,
     diagnosed_date: Date,
     notes: String
-  }],
-  allergies: [{
-    type: String,
-    trim: true
   }],
   emergency_contact: {
     name: String,

@@ -148,7 +148,8 @@ router.get('/appointments', authMiddleware, doctorMiddleware, async (req, res) =
       appointmentDate: apt.booking_date,
       time_slot: apt.time_slot,
       appointmentTime: apt.time_slot,
-      appointmentType: 'consultation', // Default type
+      // Use stored appointment type if available (video/in-person)
+      appointmentType: apt.appointment_type || 'consultation',
       status: apt.status,
       symptoms: apt.symptoms,
       doctorNotes: '', // Not in tokens collection
@@ -159,7 +160,9 @@ router.get('/appointments', authMiddleware, doctorMiddleware, async (req, res) =
       payment_status: apt.payment_status,
       paymentStatus: apt.payment_status,
       estimated_wait_time: apt.estimated_wait_time,
-      estimatedWaitTime: apt.estimated_wait_time
+      estimatedWaitTime: apt.estimated_wait_time,
+      // Surface meeting link for video consultations
+      meeting_link: apt.meeting_link || null
     }));
 
     res.json({
@@ -223,7 +226,9 @@ router.get('/today-queue', authMiddleware, doctorMiddleware, async (req, res) =>
         symptoms: t.symptoms,
         bookingStatus: t.status,
         paymentStatus: t.payment_status,
-        time: t.time_slot
+        time: t.time_slot,
+        appointmentType: t.appointment_type || 'consultation',
+        meetingLink: t.meeting_link || null
       });
     });
 
@@ -276,7 +281,9 @@ router.get('/next-patient', authMiddleware, doctorMiddleware, async (req, res) =
         gender,
         symptoms: next.symptoms,
         status: next.status,
-        time: next.time_slot
+        time: next.time_slot,
+        appointmentType: next.appointment_type || 'consultation',
+        meetingLink: next.meeting_link || null
       }
     });
   } catch (error) {

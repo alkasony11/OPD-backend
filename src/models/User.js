@@ -71,6 +71,33 @@ const userSchema = new mongoose.Schema({
   age: { type: Number },
   dob: { type: Date },
   gender: { type: String },
+  address: { type: String, default: '' },
+  bloodGroup: { type: String, default: '' },
+  allergies: { type: String, default: '' },
+  chronicConditions: { type: String, default: '' },
+  emergencyContact: {
+    name: { type: String, default: '' },
+    phone: { type: String, default: '' },
+    relation: { type: String, default: '' }
+  },
+  account_settings: {
+    notifications: {
+      email: { type: Boolean, default: true },
+      sms: { type: Boolean, default: true },
+      whatsapp: { type: Boolean, default: false }
+    },
+    privacy: {
+      familyAccess: { type: Boolean, default: true },
+      bookingHistory: { type: Boolean, default: true }
+    },
+    preferences: {
+      preferredDoctor: { type: String, default: '' },
+      preferredDepartment: { type: String, default: '' },
+      language: { type: String, default: 'en' }
+    }
+  },
+  isActive: { type: Boolean, default: true },
+  deactivatedAt: { type: Date },
   clerkId: { type: String },
   profileImage: { type: String },
   role: {
@@ -103,6 +130,17 @@ const userSchema = new mongoose.Schema({
       default: 0
     }
   },
+  
+  // Patient management fields
+  isBlocked: { type: Boolean, default: false },
+  blockReason: { type: String, default: '' },
+  blockHistory: [{
+    reason: String,
+    blockedAt: { type: Date, default: Date.now },
+    blockedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    unblockedAt: Date,
+    unblockedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
+  }],
   
   doctor_info: {
     department: {
@@ -428,6 +466,37 @@ const tokenSchema = new mongoose.Schema({
   session_time_range: {
     type: String,
     required: true
+  },
+  appointment_type: {
+    type: String,
+    enum: ['in-person', 'video'],
+    default: 'in-person'
+  },
+  meeting_link: {
+    meetingId: {
+      type: String,
+      default: ''
+    },
+    meetingUrl: {
+      type: String,
+      default: ''
+    },
+    meetingPassword: {
+      type: String,
+      default: ''
+    },
+    provider: {
+      type: String,
+      enum: ['jitsi', 'zoom', 'google-meet', 'webrtc'],
+      default: 'jitsi'
+    },
+    expiresAt: {
+      type: Date
+    },
+    isActive: {
+      type: Boolean,
+      default: true
+    }
   },
   consultation_notes: {
     type: String,
