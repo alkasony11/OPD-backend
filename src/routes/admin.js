@@ -182,27 +182,50 @@ router.delete('/users/:id', adminMiddleware, async (req, res) => {
 router.get('/stats', adminMiddleware, async (req, res) => {
   try {
     const totalUsers = await User.countDocuments({});
+    const totalDoctors = await User.countDocuments({ role: 'doctor' });
+    const totalPatients = await User.countDocuments({ role: 'patient' });
     const verifiedUsers = await User.countDocuments({ isVerified: true });
     const recentUsers = await User.countDocuments({
       createdAt: { $gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) }
     });
 
-    // Mock appointment data (you can replace with actual appointment model)
-    const mockAppointmentStats = {
-      totalAppointments: 156,
-      todayAppointments: 12,
-      pendingAppointments: 8,
-      completedAppointments: 134
-    };
+    // Get real appointment data from Token model
+    const totalAppointments = await Token.countDocuments({});
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    
+    const todayAppointments = await Token.countDocuments({
+      booking_date: { $gte: today, $lt: tomorrow }
+    });
+    
+    const pendingAppointments = await Token.countDocuments({
+      status: { $in: ['booked', 'in_queue'] }
+    });
+    
+    const completedAppointments = await Token.countDocuments({
+      status: 'consulted'
+    });
 
     res.json({
+      totalUsers,
+      totalDoctors,
+      totalPatients,
+      totalAppointments,
+      recentActivity: recentUsers,
       users: {
         total: totalUsers,
         verified: verifiedUsers,
         recent: recentUsers,
         unverified: totalUsers - verifiedUsers
       },
-      appointments: mockAppointmentStats,
+      appointments: {
+        total: totalAppointments,
+        today: todayAppointments,
+        pending: pendingAppointments,
+        completed: completedAppointments
+      },
       systemHealth: {
         uptime: process.uptime(),
         memoryUsage: process.memoryUsage(),
@@ -211,6 +234,77 @@ router.get('/stats', adminMiddleware, async (req, res) => {
     });
   } catch (error) {
     console.error('Get stats error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get appointment statistics for charts (Admin only)
+router.get('/appointment-stats', adminMiddleware, async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+    
+    let dateFilter = {};
+    if (startDate && endDate) {
+      dateFilter.booking_date = {
+        $gte: new Date(startDate),
+        $lte: new Date(endDate)
+      };
+    }
+
+    // Get appointment counts by status
+    const statusCounts = await Token.aggregate([
+      { $match: dateFilter },
+      {
+        $group: {
+          _id: '$status',
+          count: { $sum: 1 }
+        }
+      }
+    ]);
+
+    // Get daily appointment trends (last 7 days)
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+    sevenDaysAgo.setHours(0, 0, 0, 0);
+
+    const dailyTrends = await Token.aggregate([
+      {
+        $match: {
+          booking_date: { $gte: sevenDaysAgo }
+        }
+      },
+      {
+        $group: {
+          _id: {
+            date: { $dateToString: { format: '%Y-%m-%d', date: '$booking_date' } }
+          },
+          appointments: { $sum: 1 },
+          newPatients: {
+            $sum: {
+              $cond: [{ $eq: ['$created_by', 'patient'] }, 1, 0]
+            }
+          }
+        }
+      },
+      { $sort: { '_id.date': 1 } }
+    ]);
+
+    // Format the response
+    const stats = {
+      statusCounts: statusCounts.reduce((acc, item) => {
+        acc[item._id] = item.count;
+        return acc;
+      }, {}),
+      dailyTrends: dailyTrends.map(day => ({
+        date: day._id.date,
+        appointments: day.appointments,
+        newPatients: day.newPatients
+      }))
+    };
+
+    res.json(stats);
+  } catch (error) {
+    console.error('Get appointment stats error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -359,13 +453,473 @@ router.get('/health', adminMiddleware, async (req, res) => {
 
 router.get('/patients', adminMiddleware, async (req, res) => {
   try {
-    const patients = await User.find({ role: 'patient' })
+    // Get all main account patients
+    const mainPatients = await User.find({ role: 'patient' })
       .select('-password')
       .sort({ createdAt: -1 });
-    res.json(patients);
+    
+    // Get all family members who have appointments
+    const familyMembers = await mongoose.model('FamilyMember').find({});
+    
+    // Get all unique patient IDs from appointments (both main accounts and family members)
+    const appointments = await mongoose.model('Token').find({});
+    const allPatientIds = new Set();
+    
+    appointments.forEach(apt => {
+      if (apt.patient_id) allPatientIds.add(apt.patient_id.toString());
+      if (apt.family_member_id) allPatientIds.add(apt.family_member_id.toString());
+    });
+    
+    // Create enhanced patients list
+    const enhancedPatients = [];
+    
+    // Process main account patients
+    for (const patient of mainPatients) {
+      const familyMembersList = await mongoose.model('FamilyMember').find({ patient_id: patient._id });
+      const hasFamilyMembers = familyMembersList.length > 0;
+      const blockHistory = patient.blockHistory || [];
+      
+      // Check if this patient has any appointments
+      const hasAppointments = allPatientIds.has(patient._id.toString());
+      
+      enhancedPatients.push({
+        ...patient.toObject(),
+        hasFamilyMembers,
+        blockHistory,
+        hasAppointments,
+        isMainAccount: true
+      });
+    }
+    
+    // Process family members who have appointments but aren't main account holders
+    for (const familyMember of familyMembers) {
+      // Check if this family member has appointments
+      const hasAppointments = allPatientIds.has(familyMember._id.toString());
+      
+      if (hasAppointments) {
+        // Check if we already have this family member as a main account
+        const isMainAccount = mainPatients.some(p => p._id.toString() === familyMember._id.toString());
+        
+        if (!isMainAccount) {
+          // Create a patient object for this family member
+          const familyPatient = {
+            _id: familyMember._id,
+            patientId: familyMember.patientId || `FM${familyMember._id.toString().slice(-6)}`,
+            name: familyMember.name,
+            email: familyMember.email || '',
+            phone: familyMember.phone || '',
+            age: familyMember.age,
+            gender: familyMember.gender,
+            address: familyMember.address || '',
+            bloodGroup: familyMember.bloodGroup || '',
+            allergies: familyMember.allergies || '',
+            chronicConditions: familyMember.chronicConditions || '',
+            emergencyContact: familyMember.emergency_contact || {},
+            profile_photo: familyMember.profile_photo || '',
+            isBlocked: familyMember.isBlocked || false,
+            blockReason: familyMember.blockReason || '',
+            blockHistory: familyMember.blockHistory || [],
+            createdAt: familyMember.createdAt || new Date(),
+            updatedAt: familyMember.updatedAt || new Date(),
+            hasFamilyMembers: false,
+            hasAppointments: true,
+            isMainAccount: false,
+            relation: familyMember.relation,
+            parentPatientId: familyMember.patient_id
+          };
+          
+          enhancedPatients.push(familyPatient);
+        }
+      }
+    }
+    
+    // Sort by creation date (newest first)
+    enhancedPatients.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    
+    res.json(enhancedPatients);
   } catch (err) {
     console.error('Get patients error:', err);
     res.status(500).json({ error: 'Failed to fetch patients' });
+  }
+});
+
+// Get single patient details
+router.get('/patients/:patientId', adminMiddleware, async (req, res) => {
+  try {
+    const { patientId } = req.params;
+    
+    const patient = await User.findOne({ 
+      role: 'patient', 
+      $or: [
+        { patientId: patientId },
+        { _id: patientId }
+      ]
+    }).select('-password');
+    
+    if (!patient) {
+      return res.status(404).json({ message: 'Patient not found' });
+    }
+    
+    // Get family members
+    const familyMembers = await mongoose.model('FamilyMember').find({ patient_id: patient._id });
+    
+    res.json({
+      ...patient.toObject(),
+      familyMembers
+    });
+  } catch (error) {
+    console.error('Get patient details error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get patient history (bookings, cancellations, etc.)
+router.get('/patients/:patientId/history', adminMiddleware, async (req, res) => {
+  try {
+    const { patientId } = req.params;
+    
+    // Find patient
+    const patient = await User.findOne({ 
+      role: 'patient', 
+      $or: [
+        { patientId: patientId },
+        { _id: patientId }
+      ]
+    });
+    
+    if (!patient) {
+      return res.status(404).json({ message: 'Patient not found' });
+    }
+    
+    // Get appointments (populate doctor, department, and family member)
+    const appointments = await mongoose.model('Token').find({ 
+      patient_id: patient._id 
+    })
+      .populate('doctor_id', 'name')
+      .populate('family_member_id', 'name relation patientId')
+      .sort({ createdAt: -1 });
+    
+    const now = new Date();
+    const upcoming = appointments.filter(apt => new Date(apt.booking_date) >= now);
+    const past = appointments.filter(apt => new Date(apt.booking_date) < now);
+    
+    // Get cancellations
+    const cancellations = appointments.filter(apt => apt.status === 'cancelled');
+    
+    res.json({
+      upcoming: upcoming.map(apt => ({
+        id: apt._id,
+        doctorName: apt.doctor_id?.name || 'Unknown',
+        departmentName: apt.department || 'Unknown',
+        appointmentDate: apt.booking_date,
+        appointmentTime: apt.time_slot,
+        status: apt.status,
+        tokenNumber: apt.token_number,
+        familyMemberId: apt.family_member_id?._id || null,
+        familyMemberName: apt.family_member_id?.name || null,
+        familyMemberRelation: apt.family_member_id?.relation || null
+      })),
+      past: past.map(apt => ({
+        id: apt._id,
+        doctorName: apt.doctor_id?.name || 'Unknown',
+        departmentName: apt.department || 'Unknown',
+        appointmentDate: apt.booking_date,
+        outcome: apt.status === 'consulted' ? 'Completed' : (apt.status === 'missed' ? 'No-show' : apt.status),
+        familyMemberId: apt.family_member_id?._id || null,
+        familyMemberName: apt.family_member_id?.name || null,
+        familyMemberRelation: apt.family_member_id?.relation || null
+      })),
+      cancellations: cancellations.map(apt => ({
+        id: apt._id,
+        cancelledDate: apt.cancelled_at || apt.updatedAt,
+        reason: apt.cancellation_reason || 'No reason provided',
+        familyMemberId: apt.family_member_id?._id || null,
+        familyMemberName: apt.family_member_id?.name || null,
+        familyMemberRelation: apt.family_member_id?.relation || null
+      }))
+    });
+  } catch (error) {
+    console.error('Get patient history error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get patient family members
+router.get('/patients/:patientId/family', adminMiddleware, async (req, res) => {
+  try {
+    const { patientId } = req.params;
+    
+    // Find patient
+    const patient = await User.findOne({ 
+      role: 'patient', 
+      $or: [
+        { patientId: patientId },
+        { _id: patientId }
+      ]
+    });
+    
+    if (!patient) {
+      return res.status(404).json({ message: 'Patient not found' });
+    }
+    
+    // Get family members
+    const familyMembers = await mongoose.model('FamilyMember').find({ patient_id: patient._id });
+    
+    res.json({ familyMembers });
+  } catch (error) {
+    console.error('Get patient family error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Block/Unblock patient
+router.put('/patients/:patientId/block', adminMiddleware, async (req, res) => {
+  try {
+    const { patientId } = req.params;
+    const { blocked, reason } = req.body;
+    
+    const patient = await User.findOne({ 
+      role: 'patient', 
+      $or: [
+        { patientId: patientId },
+        { _id: patientId }
+      ]
+    });
+    
+    if (!patient) {
+      return res.status(404).json({ message: 'Patient not found' });
+    }
+    
+    // Update patient status
+    patient.isBlocked = blocked;
+    if (blocked && reason) {
+      patient.blockReason = reason;
+      // Add to block history
+      if (!patient.blockHistory) {
+        patient.blockHistory = [];
+      }
+      patient.blockHistory.push({
+        reason,
+        blockedAt: new Date(),
+        blockedBy: req.user._id
+      });
+    } else if (!blocked) {
+      patient.blockReason = '';
+    }
+    
+    await patient.save();
+    
+    res.json({ 
+      message: `Patient ${blocked ? 'blocked' : 'unblocked'} successfully`,
+      patient: {
+        patientId: patient.patientId,
+        name: patient.name,
+        isBlocked: patient.isBlocked,
+        blockReason: patient.blockReason
+      }
+    });
+  } catch (error) {
+    console.error('Block/Unblock patient error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Update patient information
+router.put('/patients/:patientId', adminMiddleware, async (req, res) => {
+  try {
+    const { patientId } = req.params;
+    const { name, email, phone } = req.body;
+    
+    const patient = await User.findOne({ 
+      role: 'patient', 
+      $or: [
+        { patientId: patientId },
+        { _id: patientId }
+      ]
+    });
+    
+    if (!patient) {
+      return res.status(404).json({ message: 'Patient not found' });
+    }
+    
+    // Update allowed fields only
+    if (name) patient.name = name;
+    if (email) patient.email = email;
+    if (phone) patient.phone = phone;
+    
+    await patient.save();
+    
+    res.json({ 
+      message: 'Patient updated successfully',
+      patient: {
+        patientId: patient.patientId,
+        name: patient.name,
+        email: patient.email,
+        phone: patient.phone
+      }
+    });
+  } catch (error) {
+    console.error('Update patient error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Admin: Cancel an appointment for a patient
+router.put('/patients/:patientId/appointments/:appointmentId/cancel', adminMiddleware, async (req, res) => {
+  try {
+    const { patientId, appointmentId } = req.params;
+    const { reason } = req.body;
+
+    // Resolve patient
+    const patient = await User.findOne({
+      role: 'patient',
+      $or: [
+        { patientId: patientId },
+        { _id: patientId }
+      ]
+    });
+    if (!patient) {
+      return res.status(404).json({ message: 'Patient not found' });
+    }
+
+    const Token = mongoose.model('Token');
+    const appointment = await Token.findById(appointmentId);
+    if (!appointment) {
+      return res.status(404).json({ message: 'Appointment not found' });
+    }
+
+    // Ensure appointment belongs to patient (main or family)
+    const isOwnedByPatient = appointment.patient_id?.toString() === patient._id.toString();
+    if (!isOwnedByPatient) {
+      return res.status(403).json({ message: 'Appointment does not belong to this patient' });
+    }
+
+    // Update status
+    appointment.status = 'cancelled';
+    appointment.cancellation_reason = reason || 'Cancelled by admin';
+    appointment.cancelled_by = 'admin';
+    appointment.cancelled_at = new Date();
+    await appointment.save();
+
+    res.json({ message: 'Appointment cancelled successfully' });
+  } catch (error) {
+    console.error('Admin cancel appointment error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Admin: Reschedule an appointment for a patient
+router.put('/patients/:patientId/appointments/:appointmentId/reschedule', adminMiddleware, async (req, res) => {
+  try {
+    const { patientId, appointmentId } = req.params;
+    const { appointmentDate, appointmentTime } = req.body;
+
+    if (!appointmentDate || !appointmentTime) {
+      return res.status(400).json({ message: 'appointmentDate and appointmentTime are required' });
+    }
+
+    // Resolve patient
+    const patient = await User.findOne({
+      role: 'patient',
+      $or: [
+        { patientId: patientId },
+        { _id: patientId }
+      ]
+    });
+    if (!patient) {
+      return res.status(404).json({ message: 'Patient not found' });
+    }
+
+    const Token = mongoose.model('Token');
+    const appointment = await Token.findById(appointmentId);
+    if (!appointment) {
+      return res.status(404).json({ message: 'Appointment not found' });
+    }
+
+    // Ensure appointment belongs to patient (main or family)
+    const isOwnedByPatient = appointment.patient_id?.toString() === patient._id.toString();
+    if (!isOwnedByPatient) {
+      return res.status(403).json({ message: 'Appointment does not belong to this patient' });
+    }
+
+    // Apply new schedule
+    appointment.booking_date = new Date(appointmentDate);
+    appointment.time_slot = appointmentTime;
+    if (appointment.status === 'cancelled') {
+      appointment.status = 'booked';
+      appointment.cancellation_reason = '';
+      appointment.cancelled_at = undefined;
+      appointment.cancelled_by = undefined;
+    }
+    await appointment.save();
+
+    res.json({ message: 'Appointment rescheduled successfully' });
+  } catch (error) {
+    console.error('Admin reschedule appointment error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Admin: Export patient history (CSV)
+router.get('/patients/:patientId/history/export', adminMiddleware, async (req, res) => {
+  try {
+    const { patientId } = req.params;
+    const { includeFamily = 'false' } = req.query;
+
+    const patient = await User.findOne({
+      role: 'patient',
+      $or: [
+        { patientId: patientId },
+        { _id: patientId }
+      ]
+    });
+    if (!patient) {
+      return res.status(404).json({ message: 'Patient not found' });
+    }
+
+    const Token = mongoose.model('Token');
+
+    let query = { patient_id: patient._id };
+    if (includeFamily === 'true') {
+      // Include family members linked to this patient
+      const FamilyMember = mongoose.model('FamilyMember');
+      const members = await FamilyMember.find({ patient_id: patient._id }).select('_id');
+      const memberIds = members.map(m => m._id);
+      query = { $or: [ { patient_id: patient._id }, { family_member_id: { $in: memberIds } } ] };
+    }
+
+    const appointments = await Token.find(query)
+      .populate('doctor_id', 'name')
+      .populate('family_member_id', 'name relation patientId')
+      .sort({ createdAt: -1 });
+
+    const rows = [
+      ['Type','Doctor','Department','Date','Time','Status','Token','For','Relation','Cancellation Reason']
+    ];
+
+    appointments.forEach(apt => {
+      const type = new Date(apt.booking_date) >= new Date() ? 'Upcoming' : (apt.status === 'cancelled' ? 'Cancelled' : 'Past');
+      rows.push([
+        type,
+        apt.doctor_id?.name || 'Unknown',
+        apt.department || 'Unknown',
+        apt.booking_date ? new Date(apt.booking_date).toISOString() : '',
+        apt.time_slot || '',
+        apt.status || '',
+        apt.token_number || '',
+        apt.family_member_id?.name || '',
+        apt.family_member_id?.relation || '',
+        apt.cancellation_reason || ''
+      ]);
+    });
+
+    const csv = rows.map(r => r.map(v => (v === null || v === undefined) ? '' : `${String(v).replace(/"/g, '""')}`).join(',')).join('\n');
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename=patient_${patient.patientId || patient._id}_history.csv`);
+    return res.send(csv);
+  } catch (error) {
+    console.error('Admin export history error:', error);
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -943,6 +1497,18 @@ router.post('/doctor-schedules/:doctorId', adminMiddleware, async (req, res) => 
       date: scheduleDate
     });
 
+    // Helper to normalize session payload keys (maxPatients -> max_patients)
+    const normalizeSession = (session, fallback) => {
+      const base = fallback || {};
+      if (!session && fallback) return base;
+      return {
+        available: session?.available ?? base.available ?? true,
+        start_time: session?.start_time ?? base.start_time ?? '09:00',
+        end_time: session?.end_time ?? base.end_time ?? '13:00',
+        max_patients: (session?.maxPatients ?? session?.max_patients ?? base.max_patients ?? 10)
+      };
+    };
+
     if (schedule) {
       // Update existing schedule
       schedule.is_available = isAvailable !== undefined ? isAvailable : schedule.is_available;
@@ -953,8 +1519,8 @@ router.post('/doctor-schedules/:doctorId', adminMiddleware, async (req, res) => 
       schedule.leave_reason = leaveReason || schedule.leave_reason;
       schedule.notes = notes || schedule.notes;
       // Update session data
-      schedule.morning_session = morningSession || schedule.morning_session;
-      schedule.afternoon_session = afternoonSession || schedule.afternoon_session;
+      schedule.morning_session = normalizeSession(morningSession, schedule.morning_session);
+      schedule.afternoon_session = normalizeSession(afternoonSession, schedule.afternoon_session);
       
       await schedule.save();
     } else {
@@ -976,18 +1542,18 @@ router.post('/doctor-schedules/:doctorId', adminMiddleware, async (req, res) => 
         leave_reason: leaveReason || '',
         notes: notes || '',
         // Session-based scheduling
-        morning_session: morningSession || {
+        morning_session: normalizeSession(morningSession, {
           available: true,
           start_time: '09:00',
           end_time: '13:00',
           max_patients: 10
-        },
-        afternoon_session: afternoonSession || {
+        }),
+        afternoon_session: normalizeSession(afternoonSession, {
           available: true,
           start_time: '14:00',
           end_time: '18:00',
           max_patients: 10
-        }
+        })
       });
       
       await schedule.save();

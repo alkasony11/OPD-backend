@@ -15,6 +15,7 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 app.use(express.json());
+app.use('/uploads', express.static('uploads'));
 
 // Test route
 app.get('/test', (req, res) => {
@@ -22,7 +23,9 @@ app.get('/test', (req, res) => {
 });
 
 // Connect to MongoDB
-mongoose.connect(process.env.MONGODB_URI || "mongodb+srv://alkasony2026:alka2003@cluster0.fl4gy.mongodb.net/Mediq?retryWrites=true&w=majority&appName=Cluster0").then(() => {
+const mongoUri = process.env.MONGODB_URI || 'mongodb://localhost:27017/opd';
+console.log(`Connecting to MongoDB at ${mongoUri.includes('mongodb+srv') ? 'Atlas cluster (from env)' : mongoUri}`);
+mongoose.connect(mongoUri).then(() => {
     console.log("Connected to MongoDB");
 }).catch(err => console.error("Database connection error:", err));
 
@@ -56,6 +59,18 @@ const receptionistRoutes = require("./src/routes/receptionist.js");
 console.log("Receptionist routes loaded, registering...");
 app.use("/api/receptionist", receptionistRoutes);
 console.log("Receptionist routes registered successfully");
+
+console.log("Loading chatbot routes...");
+const chatbotRoutes = require("./src/routes/chatbot.js");
+console.log("Chatbot routes loaded, registering...");
+app.use("/api/chatbot", chatbotRoutes);
+console.log("Chatbot routes registered successfully");
+
+console.log("Loading WhatsApp routes...");
+const whatsappRoutes = require("./src/routes/whatsapp.js");
+console.log("WhatsApp routes loaded, registering...");
+app.use("/api/whatsapp", whatsappRoutes);
+console.log("WhatsApp routes registered successfully");
 
 
 // Start server
