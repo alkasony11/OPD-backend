@@ -265,6 +265,11 @@ router.post('/login', async (req, res) => {
       return res.status(400).json({ message: 'Invalid credentials' });
     }
     
+    // Block inactive users
+    if (user.status === 'inactive' || user.isActive === false) {
+      return res.status(403).json({ message: 'Your account has been deactivated by the administrator. Please contact support.' });
+    }
+
     // Check password
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) {
@@ -309,6 +314,7 @@ router.post('/login', async (req, res) => {
         name: user.name,
         email: user.email,
         role: user.role,
+        status: user.status || (user.isActive === false ? 'inactive' : 'active'),
         patientId: user.role === 'patient' ? user.patientId : undefined
       },
       redirectTo,

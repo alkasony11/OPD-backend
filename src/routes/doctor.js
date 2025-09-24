@@ -1,6 +1,9 @@
 const express = require('express');
 const router = express.Router();
 const { User, Appointment, Token } = require('../models/User');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
 const DoctorSchedule = require('../models/DoctorSchedule');
 const LeaveRequest = require('../models/LeaveRequest');
 const DoctorStats = require('../models/DoctorStats');
@@ -21,6 +24,31 @@ function parseLocalYMD(ymd) {
 }
 
 // Doctor role guard
+// Multer storage for qualification/certification documents
+const docStorage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    const uploadPath = path.join(__dirname, '../../uploads/doctor-docs');
+    if (!fs.existsSync(uploadPath)) {
+      fs.mkdirSync(uploadPath, { recursive: true });
+    }
+    cb(null, uploadPath);
+  },
+  filename: function (req, file, cb) {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+    cb(null, 'doc-' + uniqueSuffix + path.extname(file.originalname));
+  }
+});
+
+const docUpload = multer({
+  storage: docStorage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  fileFilter: function (req, file, cb) {
+    const allowed = ['application/pdf', 'image/jpeg', 'image/jpg', 'image/png'];
+    if (allowed.includes(file.mimetype)) cb(null, true); else cb(new Error('Only PDF/JPG/PNG allowed'));
+  }
+});
+
+// Upload qualification/certification proof (defined after doctorMiddleware)
 const doctorMiddleware = async (req, res, next) => {
   try {
     const user = await User.findById(req.user.userId);
@@ -34,6 +62,18 @@ const doctorMiddleware = async (req, res, next) => {
     res.status(500).json({ message: 'Server error' });
   }
 };
+
+// Upload qualification/certification proof (now safely after doctorMiddleware definition)
+router.post('/upload-proof', authMiddleware, doctorMiddleware, docUpload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ message: 'File is required' });
+    const fileUrl = `/uploads/doctor-docs/${req.file.filename}`;
+    res.json({ message: 'Uploaded', fileUrl });
+  } catch (error) {
+    console.error('Upload proof error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
 
 // Leave Requests
 // Doctor submits a leave request
@@ -1251,7 +1291,16 @@ router.put('/profile', authMiddleware, doctorMiddleware, async (req, res) => {
       experience_years, 
       consultation_fee,
       phone,
-      profile_photo 
+      profile_photo,
+      qualifications,
+      certifications,
+      license_number,
+      bio,
+      languages,
+      consultation_type,
+      slot_duration,
+      qualification_proofs,
+      certification_proofs
     } = req.body;
 
     const updateData = {};
@@ -1260,16 +1309,35 @@ router.put('/profile', authMiddleware, doctorMiddleware, async (req, res) => {
     if (consultation_fee) updateData['doctor_info.consultation_fee'] = consultation_fee;
     if (phone) updateData.phone = phone;
     if (profile_photo) updateData.profile_photo = profile_photo;
+    if (qualifications) updateData['doctor_info.qualifications'] = qualifications;
+    if (certifications) updateData['doctor_info.certifications'] = certifications;
+    if (license_number) updateData['doctor_info.license_number'] = license_number;
+    if (bio !== undefined) updateData['doctor_info.bio'] = String(bio || '');
+    if (languages) updateData['doctor_info.languages'] = Array.isArray(languages) ? languages : String(languages).split(',').map(s=>s.trim()).filter(Boolean);
+    if (consultation_type) updateData['doctor_info.consultation_type'] = consultation_type;
+    if (slot_duration) updateData['doctor_info.default_slot_duration'] = parseInt(slot_duration) || 30;
+    if (qualification_proofs) updateData['doctor_info.qualification_proofs'] = Array.isArray(qualification_proofs) ? qualification_proofs : [qualification_proofs];
+    if (certification_proofs) updateData['doctor_info.certification_proofs'] = Array.isArray(certification_proofs) ? certification_proofs : [certification_proofs];
 
-    const updatedDoctor = await User.findByIdAndUpdate(
+    let updatedDoctor = await User.findByIdAndUpdate(
       doctorId,
       { $set: updateData },
       { new: true }
     ).select('-password');
 
+    // Auto-activate if profile was pending and mandatory fields are completed
+    const mandatoryFilled = !!(updatedDoctor?.doctor_info?.license_number && updatedDoctor?.doctor_info?.qualifications && (updatedDoctor?.doctor_info?.bio || '').length >= 10);
+    let profileCompleted = false;
+    if (updatedDoctor?.status === 'pending' && mandatoryFilled) {
+      updatedDoctor.status = 'active';
+      await updatedDoctor.save();
+      profileCompleted = true;
+    }
+
     res.json({
       message: 'Profile updated successfully',
-      doctor: updatedDoctor
+      doctor: updatedDoctor,
+      profileCompleted
     });
   } catch (error) {
     console.error('Update doctor profile error:', error);
