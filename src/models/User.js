@@ -153,7 +153,17 @@ const userSchema = new mongoose.Schema({
       type: Number,
       default: 500
     },
+    video_fee: {
+      type: Number,
+      default: 0
+    },
+    followup_fee: {
+      type: Number,
+      default: 0
+    },
     qualifications: String,
+    certifications: String,
+    license_number: String,
     bio: String,
     calendar: [{
       date: Date,
@@ -166,6 +176,11 @@ const userSchema = new mongoose.Schema({
       type: String,
       enum: ['active', 'on_leave'],
       default: 'active'
+    },
+    consultation_type: {
+      type: String,
+      enum: ['physical', 'video', 'both'],
+      default: 'physical'
     },
     default_working_hours: {
       start_time: {
@@ -190,6 +205,15 @@ const userSchema = new mongoose.Schema({
     default_slot_duration: {
       type: Number,
       default: 30
+    },
+    employment_type: {
+      type: String,
+      enum: ['full-time', 'part-time', 'visiting'],
+      default: 'full-time'
+    },
+    active_days: {
+      type: [String],
+      default: ['Mon','Tue','Wed','Thu','Fri']
     }
   },
   

@@ -78,16 +78,85 @@ const sendAccountCredentialsEmail = async (email, password, role, name) => {
   await transporter.sendMail(mailOptions);
 };
 
-// Get all users (Admin only)
+// Get users with basic filtering and pagination (Admin only)
 router.get('/users', adminMiddleware, async (req, res) => {
   try {
-    const users = await User.find({})
-      .select('-password')
-      .sort({ createdAt: -1 });
+    const { q = '', role = '', page = 1, limit = 10 } = req.query;
 
-    res.json(users);
+    const query = {};
+    if (q) {
+      const regex = new RegExp(q, 'i');
+      query.$or = [{ name: regex }, { email: regex }];
+    }
+    if (role) {
+      query.role = role;
+    }
+
+    const pageNum = Math.max(1, parseInt(page));
+    const pageSize = Math.max(1, Math.min(100, parseInt(limit)));
+
+    const total = await User.countDocuments(query);
+    const users = await User.find(query)
+      .select('-password')
+      .sort({ createdAt: -1 })
+      .skip((pageNum - 1) * pageSize)
+      .limit(pageSize);
+
+    res.json({ users, total, page: pageNum, limit: pageSize });
   } catch (error) {
     console.error('Get users error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Patch user status/role (Admin only)
+router.patch('/users/:id', adminMiddleware, async (req, res) => {
+  try {
+    const { status, role } = req.body;
+    const user = await User.findById(req.params.id);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    if (role && ['patient', 'doctor', 'receptionist', 'admin'].includes(role)) {
+      user.role = role;
+    }
+
+    if (status && ['active', 'inactive'].includes(status)) {
+      user.status = status;
+      user.isActive = status === 'active';
+
+      // Send notification email to user on deactivate/activate
+      try {
+        const mailOptions = {
+          from: process.env.EMAIL_USER,
+          to: user.email,
+          subject: status === 'inactive' ? 'Your MediQ account has been deactivated' : 'Your MediQ account has been reactivated',
+          html: `
+            <div style="font-family:Arial,Helvetica,sans-serif;max-width:640px;margin:0 auto;padding:24px;">
+              <h2 style="margin:0 0 16px;color:#111;">${status === 'inactive' ? 'Account Deactivated' : 'Account Reactivated'}</h2>
+              <p style="color:#333;line-height:1.6;">Hello ${user.name || 'User'},</p>
+              ${status === 'inactive' ? `
+                <p style="color:#444;line-height:1.6;">Your account has been deactivated by the administrator. You will not be able to sign in until your account is reactivated.</p>
+                <p style="color:#444;line-height:1.6;">If you believe this is a mistake or need assistance, please contact our support team.</p>
+              ` : `
+                <p style="color:#444;line-height:1.6;">Your account has been reactivated. You can now sign in and continue using MediQ.</p>
+              `}
+              <p style="margin-top:24px;color:#666;font-size:12px;">This is an automated message. Please do not reply.</p>
+            </div>
+          `
+        };
+        await transporter.sendMail(mailOptions);
+      } catch (mailErr) {
+        console.error('Deactivation email send failed:', mailErr.message);
+      }
+    }
+
+    await user.save();
+    const updated = await User.findById(user._id).select('-password');
+    res.json(updated);
+  } catch (error) {
+    console.error('Patch user error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -1063,8 +1132,17 @@ router.post('/users', adminMiddleware, async (req, res) => {
       specialization, 
       experience_years, 
       consultation_fee,
+      video_fee,
+      followup_fee,
       qualifications,
-      bio 
+      certifications,
+      license_number,
+      bio,
+      consultation_type,
+      slot_duration,
+      employment_type,
+      active_days,
+      status
     } = req.body;
 
     console.log('Received doctor creation request:', { 
@@ -1117,10 +1195,15 @@ router.post('/users', adminMiddleware, async (req, res) => {
         specialization: specialization || '',
         experience_years: parseInt(experience_years) || 0,
         consultation_fee: parseInt(consultation_fee) || 500,
+        video_fee: parseInt(video_fee) || 0,
+        followup_fee: parseInt(followup_fee) || 0,
         qualifications: qualifications || '',
+        certifications: certifications || '',
+        license_number: license_number || '',
         bio: bio || '',
         calendar: [],
-        status: 'active',
+        status: status === 'inactive' ? 'inactive' : (status === 'pending' ? 'pending' : 'active'),
+        consultation_type: consultation_type || 'physical',
         default_working_hours: {
           start_time: '09:00',
           end_time: '17:00'
@@ -1129,7 +1212,9 @@ router.post('/users', adminMiddleware, async (req, res) => {
           start_time: '13:00',
           end_time: '14:00'
         },
-        default_slot_duration: 30
+        default_slot_duration: parseInt(slot_duration) || 30,
+        employment_type: employment_type || 'full-time',
+        active_days: Array.isArray(active_days) && active_days.length ? active_days : ['Mon','Tue','Wed','Thu','Fri']
       };
     } else if (role === 'receptionist') {
       userData.receptionist_info = {
