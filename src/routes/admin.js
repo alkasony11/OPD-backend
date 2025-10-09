@@ -7,10 +7,26 @@ const { User, PasswordResetToken, OTP, Token } = require('../models/User');
 const LeaveRequest = require('../models/LeaveRequest');
 const Department = require('../models/Department');
 const DoctorSchedule = require('../models/DoctorSchedule');
+const Feedback = require('../models/Feedback');
 const { transporter } = require('../config/email');
 const { extractToken } = require('../middleware/authMiddleware');
 
 const router = express.Router();
+
+// Helper to resolve patient by patientId (string like P001) or by Mongo ObjectId
+const isValidObjectId = (id) => {
+  try {
+    return mongoose.Types.ObjectId.isValid(id);
+  } catch { return false; }
+};
+
+async function findPatientByAnyId(patientIdParam) {
+  const or = [{ patientId: patientIdParam }];
+  if (isValidObjectId(patientIdParam)) {
+    or.push({ _id: patientIdParam });
+  }
+  return await User.findOne({ role: 'patient', $or: or });
+}
 
 // Admin middleware to check if user is admin
 const adminMiddleware = async (req, res, next) => {
@@ -171,6 +187,24 @@ router.get('/doctors', adminMiddleware, async (req, res) => {
     res.json(doctors);
   } catch (error) {
     console.error('Get doctors error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get single doctor with populated details
+router.get('/doctors/:id', adminMiddleware, async (req, res) => {
+  try {
+    const doctor = await User.findOne({ _id: req.params.id, role: 'doctor' })
+      .select('-password')
+      .populate('doctor_info.department', 'name description');
+
+    if (!doctor) {
+      return res.status(404).json({ message: 'Doctor not found' });
+    }
+
+    res.json(doctor);
+  } catch (error) {
+    console.error('Get doctor by id error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -374,6 +408,109 @@ router.get('/appointment-stats', adminMiddleware, async (req, res) => {
     res.json(stats);
   } catch (error) {
     console.error('Get appointment stats error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// List all appointments with patient/family and doctor details (Admin only)
+router.get('/appointments', adminMiddleware, async (req, res) => {
+  try {
+    const {
+      page = 1,
+      limit = 20,
+      status = '',
+      doctorId = '',
+      startDate = '',
+      endDate = ''
+    } = req.query;
+
+    const pageNum = Math.max(1, parseInt(page));
+    const pageSize = Math.max(1, Math.min(200, parseInt(limit)));
+
+    const query = {};
+    if (status) query.status = status;
+    if (doctorId) query.doctor_id = doctorId;
+    if (startDate && endDate) {
+      query.booking_date = { $gte: new Date(startDate), $lte: new Date(endDate) };
+    }
+
+    const total = await Token.countDocuments(query);
+    const appointments = await Token.find(query)
+      .sort({ booking_date: -1, createdAt: -1 })
+      .skip((pageNum - 1) * pageSize)
+      .limit(pageSize)
+      .populate('patient_id', 'name patientId')
+      .populate('family_member_id', 'name relation patientId')
+      .populate({
+        path: 'doctor_id',
+        select: 'name doctor_info',
+        populate: { path: 'doctor_info.department', select: 'name' }
+      });
+
+    const rows = appointments.map(apt => ({
+      id: apt._id,
+      patientId: apt.family_member_id?.patientId || apt.patient_id?.patientId || null,
+      patientName: apt.family_member_id?.name || apt.patient_id?.name || 'Unknown',
+      linkedAccount: apt.family_member_id ? (apt.patient_id?.name || 'Main Account') : '',
+      doctor: apt.doctor_id?.name || 'Unknown',
+      department: apt.department || apt.doctor_id?.doctor_info?.department?.name || 'Unknown',
+      date: apt.booking_date,
+      time: apt.time_slot || '',
+      status: apt.status || 'booked'
+    }));
+
+    res.json({ appointments: rows, total, page: pageNum, limit: pageSize });
+  } catch (error) {
+    console.error('Admin list appointments error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Update appointment status (Admin)
+router.patch('/appointments/:id', adminMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, notes } = req.body;
+
+    const validStatuses = ['booked', 'in_queue', 'consulted', 'cancelled', 'missed'];
+    if (!status || !validStatuses.includes(status)) {
+      return res.status(400).json({ message: 'Invalid status' });
+    }
+
+    const appointment = await Token.findByIdAndUpdate(
+      id,
+      {
+        status,
+        ...(notes ? { admin_notes: notes } : {}),
+        updatedAt: new Date(),
+      },
+      { new: true }
+    )
+      .populate('patient_id', 'name email phone')
+      .populate({
+        path: 'doctor_id',
+        select: 'name doctor_info',
+        populate: { path: 'doctor_info.department', select: 'name' }
+      });
+
+    if (!appointment) {
+      return res.status(404).json({ message: 'Appointment not found' });
+    }
+
+    res.json({
+      message: 'Appointment status updated successfully',
+      appointment: {
+        id: appointment._id,
+        patientName: appointment.patient_id?.name || 'Unknown',
+        doctor: appointment.doctor_id?.name || 'Unknown',
+        department: appointment.department || appointment.doctor_id?.doctor_info?.department?.name || 'Unknown',
+        date: appointment.booking_date,
+        time: appointment.time_slot,
+        status: appointment.status
+      }
+    });
+  } catch (error) {
+    console.error('Admin update appointment status error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -612,18 +749,43 @@ router.get('/patients', adminMiddleware, async (req, res) => {
   }
 });
 
+// Registered patients (main accounts with family member counts)
+router.get('/registered-patients', adminMiddleware, async (req, res) => {
+  try {
+    const mainPatients = await User.find({ role: 'patient' })
+      .select('_id name email phone createdAt patientId patient_info')
+      .sort({ createdAt: -1 });
+
+    const FamilyMember = mongoose.model('FamilyMember');
+    const families = await FamilyMember.aggregate([
+      { $group: { _id: '$patient_id', count: { $sum: 1 } } }
+    ]);
+    const familyMap = new Map(families.map(f => [String(f._id), f.count]));
+
+    const patients = mainPatients.map(p => ({
+      _id: p._id,
+      patientId: p.patientId || `P${String(p._id).slice(-6).toUpperCase()}`,
+      regId: p.patientId || p._id,
+      name: p.name,
+      email: p.email || '',
+      phone: p.phone || '',
+      createdAt: p.createdAt,
+      familyCount: familyMap.get(String(p._id)) || 0
+    }));
+
+    res.json({ patients });
+  } catch (error) {
+    console.error('Get registered patients error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 // Get single patient details
 router.get('/patients/:patientId', adminMiddleware, async (req, res) => {
   try {
     const { patientId } = req.params;
     
-    const patient = await User.findOne({ 
-      role: 'patient', 
-      $or: [
-        { patientId: patientId },
-        { _id: patientId }
-      ]
-    }).select('-password');
+    const patient = await findPatientByAnyId(patientId).select('-password');
     
     if (!patient) {
       return res.status(404).json({ message: 'Patient not found' });
@@ -648,13 +810,7 @@ router.get('/patients/:patientId/history', adminMiddleware, async (req, res) => 
     const { patientId } = req.params;
     
     // Find patient
-    const patient = await User.findOne({ 
-      role: 'patient', 
-      $or: [
-        { patientId: patientId },
-        { _id: patientId }
-      ]
-    });
+    const patient = await findPatientByAnyId(patientId);
     
     if (!patient) {
       return res.status(404).json({ message: 'Patient not found' });
@@ -719,13 +875,7 @@ router.get('/patients/:patientId/family', adminMiddleware, async (req, res) => {
     const { patientId } = req.params;
     
     // Find patient
-    const patient = await User.findOne({ 
-      role: 'patient', 
-      $or: [
-        { patientId: patientId },
-        { _id: patientId }
-      ]
-    });
+    const patient = await findPatientByAnyId(patientId);
     
     if (!patient) {
       return res.status(404).json({ message: 'Patient not found' });
@@ -741,19 +891,41 @@ router.get('/patients/:patientId/family', adminMiddleware, async (req, res) => {
   }
 });
 
+// Toggle family member active status (Admin)
+router.put('/patients/:patientId/family/:memberId/block', adminMiddleware, async (req, res) => {
+  try {
+    const { patientId, memberId } = req.params;
+    const { active } = req.body;
+
+    const patient = await findPatientByAnyId(patientId);
+
+    if (!patient) {
+      return res.status(404).json({ message: 'Patient not found' });
+    }
+
+    const FamilyMember = mongoose.model('FamilyMember');
+    const member = await FamilyMember.findOne({ _id: memberId, patient_id: patient._id });
+    if (!member) {
+      return res.status(404).json({ message: 'Family member not found' });
+    }
+
+    member.isActive = active !== false;
+    await member.save();
+
+    res.json({ message: `Family member ${member.isActive ? 'activated' : 'deactivated'} successfully` });
+  } catch (error) {
+    console.error('Toggle family member active error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 // Block/Unblock patient
 router.put('/patients/:patientId/block', adminMiddleware, async (req, res) => {
   try {
     const { patientId } = req.params;
     const { blocked, reason } = req.body;
     
-    const patient = await User.findOne({ 
-      role: 'patient', 
-      $or: [
-        { patientId: patientId },
-        { _id: patientId }
-      ]
-    });
+    const patient = await findPatientByAnyId(patientId);
     
     if (!patient) {
       return res.status(404).json({ message: 'Patient not found' });
@@ -799,13 +971,7 @@ router.put('/patients/:patientId', adminMiddleware, async (req, res) => {
     const { patientId } = req.params;
     const { name, email, phone } = req.body;
     
-    const patient = await User.findOne({ 
-      role: 'patient', 
-      $or: [
-        { patientId: patientId },
-        { _id: patientId }
-      ]
-    });
+    const patient = await findPatientByAnyId(patientId);
     
     if (!patient) {
       return res.status(404).json({ message: 'Patient not found' });
@@ -925,6 +1091,61 @@ router.put('/patients/:patientId/appointments/:appointmentId/reschedule', adminM
     res.json({ message: 'Appointment rescheduled successfully' });
   } catch (error) {
     console.error('Admin reschedule appointment error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Admin: Assign another doctor for a patient's appointment
+router.put('/patients/:patientId/appointments/:appointmentId/assign-doctor', adminMiddleware, async (req, res) => {
+  try {
+    const { patientId, appointmentId } = req.params;
+    const { doctorId } = req.body;
+
+    if (!doctorId) {
+      return res.status(400).json({ message: 'doctorId is required' });
+    }
+
+    // Resolve patient
+    const patient = await User.findOne({
+      role: 'patient',
+      $or: [
+        { patientId: patientId },
+        { _id: patientId }
+      ]
+    });
+    if (!patient) {
+      return res.status(404).json({ message: 'Patient not found' });
+    }
+
+    // Validate doctor
+    const doctor = await User.findById(doctorId).select('name role doctor_info');
+    if (!doctor || doctor.role !== 'doctor') {
+      return res.status(404).json({ message: 'Doctor not found' });
+    }
+
+    const Token = mongoose.model('Token');
+    const appointment = await Token.findById(appointmentId);
+    if (!appointment) {
+      return res.status(404).json({ message: 'Appointment not found' });
+    }
+
+    // Ensure appointment belongs to patient (main or family captured by patient_id)
+    const isOwnedByPatient = appointment.patient_id?.toString() === patient._id.toString();
+    if (!isOwnedByPatient) {
+      return res.status(403).json({ message: 'Appointment does not belong to this patient' });
+    }
+
+    // Assign doctor and optionally update department if blank
+    appointment.doctor_id = doctor._id;
+    if (!appointment.department && doctor.doctor_info?.department) {
+      // Persist department name for convenience if present on doctor
+      appointment.department = doctor.doctor_info.department.name || appointment.department;
+    }
+    await appointment.save();
+
+    res.json({ message: 'Doctor reassigned successfully' });
+  } catch (error) {
+    console.error('Admin assign doctor error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -1227,8 +1448,9 @@ router.post('/users', adminMiddleware, async (req, res) => {
 
     console.log('User created successfully:', user._id);
 
-    // Create initial schedule for the next 30 days for doctors
-    if (role === 'doctor') {
+    // Optionally create initial schedules for new doctors (disabled by default)
+    // Enable by setting env AUTO_CREATE_DOCTOR_SCHEDULES=true
+    if (role === 'doctor' && process.env.AUTO_CREATE_DOCTOR_SCHEDULES === 'true') {
       try {
         await createInitialDoctorSchedule(user._id);
         console.log('Initial schedule created for doctor:', user._id);
@@ -1475,6 +1697,36 @@ router.put('/departments/:id', adminMiddleware, async (req, res) => {
 });
 
 // Delete department
+// Update department status (activate/deactivate)
+router.patch('/departments/:id/status', adminMiddleware, async (req, res) => {
+  try {
+    const { isActive } = req.body;
+    
+    if (typeof isActive !== 'boolean') {
+      return res.status(400).json({ message: 'isActive must be a boolean value' });
+    }
+
+    const department = await Department.findByIdAndUpdate(
+      req.params.id,
+      { isActive },
+      { new: true }
+    ).populate('head_of_department', 'name email')
+     .populate('created_by', 'name email');
+
+    if (!department) {
+      return res.status(404).json({ message: 'Department not found' });
+    }
+
+    res.json({ 
+      message: `Department ${isActive ? 'activated' : 'deactivated'} successfully`,
+      department 
+    });
+  } catch (error) {
+    console.error('Update department status error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 router.delete('/departments/:id', adminMiddleware, async (req, res) => {
   try {
     // Check if any doctors are assigned to this department
@@ -1766,7 +2018,18 @@ router.get('/leave-requests', adminMiddleware, async (req, res) => {
     const { status } = req.query;
     const query = {};
     if (status) query.status = status;
-    const leaves = await LeaveRequest.find(query).populate('doctor_id', 'name email');
+    
+    const leaves = await LeaveRequest.find(query)
+      .populate({
+        path: 'doctor_id',
+        select: 'name email phone',
+        populate: {
+          path: 'doctor_info.department',
+          select: 'name'
+        }
+      })
+      .sort({ start_date: -1, createdAt: -1 });
+    
     res.json({ leaves });
   } catch (error) {
     console.error('List leave requests error:', error);
@@ -1782,7 +2045,7 @@ router.post('/leave-requests/:id/approve', adminMiddleware, async (req, res) => 
     
     console.log('Approving leave request:', id, 'with comment:', admin_comment);
     
-    const leave = await LeaveRequest.findById(id);
+    const leave = await LeaveRequest.findById(id).populate('doctor_id');
     if (!leave) {
       console.log('Leave request not found:', id);
       return res.status(404).json({ message: 'Leave request not found' });
@@ -1796,70 +2059,166 @@ router.post('/leave-requests/:id/approve', adminMiddleware, async (req, res) => 
     await leave.save();
     console.log('Leave request updated successfully');
 
-    // Ensure schedule is marked unavailable for that date
-    const scheduleDate = new Date(
-      new Date(leave.date).getFullYear(),
-      new Date(leave.date).getMonth(),
-      new Date(leave.date).getDate(),
-      0, 0, 0, 0
-    );
-    console.log('Schedule date:', scheduleDate);
-
-    let schedule = await DoctorSchedule.findOne({ doctor_id: leave.doctor_id, date: scheduleDate });
-    console.log('Existing schedule found:', !!schedule);
+    // Handle schedule updates for the date range
+    const startDate = new Date(leave.start_date);
+    const endDate = new Date(leave.end_date);
     
-    if (!schedule) {
-      console.log('Creating new schedule for leave date');
-      schedule = new DoctorSchedule({
-        doctor_id: leave.doctor_id,
-        date: scheduleDate,
-        is_available: false,
-        working_hours: { start_time: '09:00', end_time: '17:00' },
-        break_time: { start_time: '13:00', end_time: '14:00' },
-        slot_duration: 30,
-        max_patients_per_slot: 1,
-        leave_reason: leave.reason || 'Approved leave',
-        notes: 'Auto-set by admin leave approval'
+    // Process each day in the leave period
+    let cancelledAppointmentsCount = 0;
+    for (let currentDate = new Date(startDate); currentDate <= endDate; currentDate.setDate(currentDate.getDate() + 1)) {
+      const scheduleDate = new Date(currentDate);
+      scheduleDate.setHours(0, 0, 0, 0);
+      
+      console.log('Processing schedule for date:', scheduleDate);
+
+      let schedule = await DoctorSchedule.findOne({ 
+        doctor_id: leave.doctor_id, 
+        date: scheduleDate 
       });
-    } else {
-      console.log('Updating existing schedule');
-      schedule.is_available = false;
-      schedule.leave_reason = leave.reason || 'Approved leave';
-    }
-    
-    await schedule.save();
-    console.log('Schedule saved successfully');
+      
+      if (!schedule) {
+        console.log('Creating new schedule for leave date');
+        schedule = new DoctorSchedule({
+          doctor_id: leave.doctor_id,
+          date: scheduleDate,
+          is_available: false,
+          leave_reason: leave.reason || 'Approved leave',
+          notes: 'Auto-set by admin leave approval'
+        });
+      } else {
+        console.log('Updating existing schedule');
+        schedule.is_available = false;
+        schedule.leave_reason = leave.reason || 'Approved leave';
+      }
 
-    // Cancel or disable tokens for that date
-    const nextDay = new Date(scheduleDate);
-    nextDay.setDate(nextDay.getDate() + 1);
-    
-    const tokenUpdateResult = await Token.updateMany(
-      {
+      // Handle half-day leave
+      if (leave.leave_type === 'half_day') {
+        schedule.is_available = true; // Doctor is available for the other session
+        
+        if (leave.session === 'morning') {
+          // Block morning session, keep afternoon available
+          schedule.morning_session = {
+            available: false,
+            start_time: '09:00',
+            end_time: '13:00',
+            max_patients: 0
+          };
+          schedule.afternoon_session = {
+            available: true,
+            start_time: '14:00',
+            end_time: '18:00',
+            max_patients: 10
+          };
+        } else {
+          // Block afternoon session, keep morning available
+          schedule.morning_session = {
+            available: true,
+            start_time: '09:00',
+            end_time: '13:00',
+            max_patients: 10
+          };
+          schedule.afternoon_session = {
+            available: false,
+            start_time: '14:00',
+            end_time: '18:00',
+            max_patients: 0
+          };
+        }
+      } else {
+        // Full day leave - block all sessions
+        schedule.morning_session = {
+          available: false,
+          start_time: '09:00',
+          end_time: '13:00',
+          max_patients: 0
+        };
+        schedule.afternoon_session = {
+          available: false,
+          start_time: '14:00',
+          end_time: '18:00',
+          max_patients: 0
+        };
+      }
+      
+      await schedule.save();
+      console.log('Schedule saved successfully for date:', scheduleDate);
+
+      // Cancel existing appointments for this date
+      const appointmentDate = new Date(scheduleDate);
+      appointmentDate.setHours(0, 0, 0, 0);
+      const nextDay = new Date(appointmentDate);
+      nextDay.setDate(nextDay.getDate() + 1);
+
+      // Find and cancel appointments (booked / in_queue / confirmed)
+      const appointments = await Token.find({
         doctor_id: leave.doctor_id,
-        booking_date: { $gte: scheduleDate, $lt: nextDay },
-        status: { $in: ['booked', 'in_queue'] }
-      },
-      { $set: { status: 'cancelled' } }
-    );
-    
-    console.log('Tokens updated:', tokenUpdateResult);
+        booking_date: { $gte: appointmentDate, $lt: nextDay },
+        status: { $in: ['booked', 'in_queue', 'confirmed'] }
+      }).populate('patient_id', 'name email');
+
+      console.log(`Found ${appointments.length} appointments to cancel`);
+
+      for (const appointment of appointments) {
+        // Check if it's a half-day leave and appointment is in available session
+        if (leave.leave_type === 'half_day') {
+          const timeStr = appointment.time_slot || '09:00';
+          const appointmentHour = parseInt(String(timeStr).split(':')[0] || '9', 10);
+          
+          if (leave.session === 'morning' && appointmentHour >= 14) {
+            // Morning leave, afternoon appointment - keep it
+            continue;
+          } else if (leave.session === 'afternoon' && appointmentHour < 14) {
+            // Afternoon leave, morning appointment - keep it
+            continue;
+          }
+        }
+        
+        // Cancel the appointment
+        appointment.status = 'cancelled_by_hospital';
+        appointment.cancellation_reason = `Doctor on leave: ${leave.reason || 'No reason provided'}`;
+        appointment.cancelled_at = new Date();
+        appointment.cancelled_by = 'system';
+        await appointment.save();
+        cancelledAppointmentsCount += 1;
+        
+        // Send notification to patient
+        try {
+          const notificationService = require('../services/notificationService');
+          await notificationService.sendLeaveCancellationNotification(appointment._id, {
+            leave_type: leave.leave_type,
+            session: leave.session,
+            reason: leave.reason
+          });
+          // Best-effort email
+          try {
+            const { transporter } = require('../config/email');
+            if (appointment.patient_id?.email) {
+              await transporter.sendMail({
+                to: appointment.patient_id.email,
+                subject: 'Appointment Cancelled - Doctor on Leave',
+                html: `<p>Dear ${appointment.patient_id.name || 'Patient'},</p>
+                       <p>Your appointment on ${appointment.booking_date.toLocaleDateString()} at ${appointment.time_slot || ''} was cancelled because the doctor is on leave.</p>
+                       <p>Please reschedule from the portal. We apologize for the inconvenience.</p>`
+              });
+            }
+          } catch (mailErr) {
+            console.warn('Email send failed:', mailErr?.message || mailErr);
+          }
+          console.log(`📧📱💬 Leave cancellation notification sent for appointment: ${appointment._id}`);
+        } catch (notificationError) {
+          console.error('Failed to send leave cancellation notification:', notificationError);
+        }
+      }
+    }
 
     res.json({ 
-      message: 'Leave approved and day blocked', 
-      leave: {
-        _id: leave._id,
-        status: leave.status,
-        admin_comment: leave.admin_comment
-      }
+      message: 'Leave request approved successfully',
+      leave: leave,
+      cancelledAppointments: cancelledAppointmentsCount
     });
   } catch (error) {
     console.error('Approve leave request error:', error);
-    console.error('Error stack:', error.stack);
-    res.status(500).json({ 
-      message: 'Server error', 
-      error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
-    });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -1869,36 +2228,175 @@ router.post('/leave-requests/:id/reject', adminMiddleware, async (req, res) => {
     const { id } = req.params;
     const { admin_comment } = req.body;
     
-    console.log('Rejecting leave request:', id, 'with comment:', admin_comment);
-    
     const leave = await LeaveRequest.findById(id);
     if (!leave) {
-      console.log('Leave request not found:', id);
       return res.status(404).json({ message: 'Leave request not found' });
     }
 
-    console.log('Found leave request:', leave);
-
+    // Update leave request status
     leave.status = 'rejected';
     if (admin_comment) leave.admin_comment = admin_comment;
     await leave.save();
-    console.log('Leave request rejected successfully');
 
     res.json({ 
-      message: 'Leave rejected', 
-      leave: {
-        _id: leave._id,
-        status: leave.status,
-        admin_comment: leave.admin_comment
-      }
+      message: 'Leave request rejected successfully',
+      leave: leave
     });
   } catch (error) {
     console.error('Reject leave request error:', error);
-    console.error('Error stack:', error.stack);
-    res.status(500).json({ 
-      message: 'Server error', 
-      error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Messaging: Admin send message/notification to a patient by appointment
+router.post('/messages/patient', adminMiddleware, async (req, res) => {
+  try {
+    const { appointmentId, subject, message } = req.body;
+    if (!appointmentId || !message) return res.status(400).json({ message: 'appointmentId and message are required' });
+
+    const { Token } = require('../models/User');
+    const appointment = await Token.findById(appointmentId).populate('patient_id', 'email phone name');
+    if (!appointment) return res.status(404).json({ message: 'Appointment not found' });
+
+    // Email (best-effort)
+    try {
+      const { transporter } = require('../config/email');
+      if (appointment.patient_id?.email) {
+        await transporter.sendMail({
+          to: appointment.patient_id.email,
+          subject: subject || 'Message from Hospital Administration',
+          html: `<p>Dear ${appointment.patient_id.name || 'Patient'},</p><p>${message}</p>`
+        });
+      }
+    } catch (e) {
+      console.warn('Admin -> patient email failed:', e?.message || e);
+    }
+
+    // Optional: enqueue SMS via smsService if configured
+    try {
+      const smsService = require('../services/smsService');
+      if (appointment.patient_id?.phone) {
+        await smsService.sendGeneric(appointment.patient_id.phone, message);
+      }
+    } catch (e) {
+      console.warn('Admin -> patient SMS failed:', e?.message || e);
+    }
+
+    res.json({ message: 'Message sent to patient (best-effort)' });
+  } catch (error) {
+    console.error('Admin message patient error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Feedback/Complaints: Patient to Admin
+router.post('/feedback', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || req.headers.Authorization;
+    let authPatientId = null;
+    try {
+      if (authHeader && authHeader.startsWith('Bearer ')) {
+        const token = authHeader.split(' ')[1];
+        const jwt = require('jsonwebtoken');
+        const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your_jwt_secret');
+        authPatientId = decoded?.userId || null;
+      }
+    } catch {}
+
+    const {
+      patient_id: bodyPatientId,
+      doctor_id,
+      appointment_id,
+      type = 'feedback',
+      subject = '',
+      message,
+      guest_name = '',
+      guest_email = '',
+      guest_phone = ''
+    } = req.body;
+
+    if (!message) return res.status(400).json({ message: 'message is required' });
+
+    // Determine patient_id (auth wins), else accept guest
+    const patient_id = authPatientId || bodyPatientId || null;
+
+    if (!patient_id && !guest_email) {
+      return res.status(400).json({ message: 'guest_email is required for guest submission' });
+    }
+
+    const payload = {
+      patient_id,
+      doctor_id,
+      appointment_id,
+      type,
+      subject,
+      message,
+      guest_name,
+      guest_email,
+      guest_phone
+    };
+
+    const feedback = await Feedback.create(payload);
+
+    // Hydrate minimal patient view in response
+    let patient = null;
+    if (patient_id) {
+      const { User } = require('../models/User');
+      patient = await User.findById(patient_id).select('name email phone patientId');
+    }
+
+    res.json({
+      message: 'Submitted',
+      feedback: {
+        _id: feedback._id,
+        type: feedback.type,
+        subject: feedback.subject,
+        message: feedback.message,
+        status: feedback.status,
+        createdAt: feedback.createdAt,
+        patient: patient ? {
+          id: patient._id,
+          name: patient.name,
+          email: patient.email,
+          phone: patient.phone,
+          patientId: patient.patientId
+        } : null,
+        guest: !patient ? {
+          name: feedback.guest_name,
+          email: feedback.guest_email,
+          phone: feedback.guest_phone
+        } : null
+      }
     });
+  } catch (error) {
+    console.error('Create feedback error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.get('/feedback', adminMiddleware, async (req, res) => {
+  try {
+    const { status } = req.query;
+    const query = {};
+    if (status) query.status = status;
+    const items = await Feedback.find(query).populate('patient_id', 'name email phone').populate('doctor_id', 'name').sort({ createdAt: -1 });
+    res.json({ items });
+  } catch (error) {
+    console.error('List feedback error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.patch('/feedback/:id', adminMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, admin_notes } = req.body;
+    const item = await Feedback.findByIdAndUpdate(id, { $set: { ...(status && { status }), ...(admin_notes !== undefined ? { admin_notes } : {}) } }, { new: true });
+    if (!item) return res.status(404).json({ message: 'Feedback not found' });
+    res.json({ message: 'Updated', item });
+  } catch (error) {
+    console.error('Update feedback error:', error);
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -1986,6 +2484,598 @@ router.post('/doctor-schedules/:doctorId/bulk', adminMiddleware, async (req, res
     });
   } catch (error) {
     console.error('Bulk create doctor schedules error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Family Member Management Routes
+
+// Get all family members with parent patient details
+router.get('/family-members', adminMiddleware, async (req, res) => {
+  try {
+    const { page = 1, limit = 20, search = '' } = req.query;
+    const pageNum = Math.max(1, parseInt(page));
+    const pageSize = Math.max(1, Math.min(200, parseInt(limit)));
+
+    // Build query with optional name/email/phone search
+    const FamilyMember = mongoose.model('FamilyMember');
+    const UserModel = mongoose.model('User');
+
+    const fmQuery = {};
+    if (search && String(search).trim().length > 0) {
+      const regex = new RegExp(String(search).trim(), 'i');
+      fmQuery.$or = [
+        { name: regex },
+        { patientId: regex },
+        { relation: regex }
+      ];
+    }
+
+    const total = await FamilyMember.countDocuments(fmQuery);
+
+    const familyMembers = await FamilyMember.find(fmQuery)
+      .populate('patient_id', 'name email phone patientId')
+      .sort({ createdAt: -1 })
+      .skip((pageNum - 1) * pageSize)
+      .limit(pageSize);
+
+    const membersWithParent = familyMembers.map(member => ({
+      _id: member._id,
+      patientId: member.patientId,
+      name: member.name,
+      age: member.age,
+      gender: member.gender,
+      relation: member.relation,
+      phone: member.phone,
+      bloodGroup: member.bloodGroup,
+      allergies: member.allergies,
+      chronicConditions: member.chronicConditions,
+      emergency_contact: member.emergency_contact,
+      isActive: member.isActive,
+      createdAt: member.createdAt,
+      updatedAt: member.updatedAt,
+      parentPatient: member.patient_id ? {
+        _id: member.patient_id._id,
+        name: member.patient_id.name,
+        email: member.patient_id.email,
+        phone: member.patient_id.phone,
+        patientId: member.patient_id.patientId
+      } : null
+    }));
+
+    res.json({ 
+      familyMembers: membersWithParent,
+      total,
+      page: pageNum,
+      limit: pageSize,
+      totalPages: Math.ceil(total / pageSize)
+    });
+  } catch (error) {
+    console.error('Get family members error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Create new family member
+router.post('/family-members', adminMiddleware, async (req, res) => {
+  try {
+    const { patient_id, name, age, gender, relation, phone, bloodGroup, allergies, chronicConditions, emergency_contact } = req.body;
+
+    if (!patient_id || !name || !age || !gender || !relation) {
+      return res.status(400).json({ message: 'Required fields: patient_id, name, age, gender, relation' });
+    }
+
+    // Verify parent patient exists
+    const parentPatient = await User.findById(patient_id);
+    if (!parentPatient || parentPatient.role !== 'patient') {
+      return res.status(404).json({ message: 'Parent patient not found' });
+    }
+
+    const familyMember = await mongoose.model('FamilyMember').create({
+      patient_id,
+      name,
+      age: parseInt(age),
+      gender,
+      relation,
+      phone: phone || '',
+      bloodGroup: bloodGroup || '',
+      allergies: allergies || '',
+      chronicConditions: chronicConditions || '',
+      emergency_contact: emergency_contact || {}
+    });
+
+    await familyMember.populate('patient_id', 'name email phone patientId');
+
+    res.json({
+      message: 'Family member created successfully',
+      familyMember: {
+        _id: familyMember._id,
+        patientId: familyMember.patientId,
+        name: familyMember.name,
+        age: familyMember.age,
+        gender: familyMember.gender,
+        relation: familyMember.relation,
+        phone: familyMember.phone,
+        bloodGroup: familyMember.bloodGroup,
+        allergies: familyMember.allergies,
+        chronicConditions: familyMember.chronicConditions,
+        emergency_contact: familyMember.emergency_contact,
+        isActive: familyMember.isActive,
+        createdAt: familyMember.createdAt,
+        updatedAt: familyMember.updatedAt,
+        parentPatient: {
+          _id: familyMember.patient_id._id,
+          name: familyMember.patient_id.name,
+          email: familyMember.patient_id.email,
+          phone: familyMember.patient_id.phone,
+          patientId: familyMember.patient_id.patientId
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Create family member error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Update family member
+router.put('/family-members/:id', adminMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, age, gender, relation, phone, bloodGroup, allergies, chronicConditions, emergency_contact } = req.body;
+
+    const familyMember = await mongoose.model('FamilyMember').findByIdAndUpdate(
+      id,
+      {
+        $set: {
+          ...(name && { name }),
+          ...(age && { age: parseInt(age) }),
+          ...(gender && { gender }),
+          ...(relation && { relation }),
+          ...(phone !== undefined && { phone }),
+          ...(bloodGroup !== undefined && { bloodGroup }),
+          ...(allergies !== undefined && { allergies }),
+          ...(chronicConditions !== undefined && { chronicConditions }),
+          ...(emergency_contact && { emergency_contact })
+        }
+      },
+      { new: true }
+    ).populate('patient_id', 'name email phone patientId');
+
+    if (!familyMember) {
+      return res.status(404).json({ message: 'Family member not found' });
+    }
+
+    res.json({
+      message: 'Family member updated successfully',
+      familyMember: {
+        _id: familyMember._id,
+        patientId: familyMember.patientId,
+        name: familyMember.name,
+        age: familyMember.age,
+        gender: familyMember.gender,
+        relation: familyMember.relation,
+        phone: familyMember.phone,
+        bloodGroup: familyMember.bloodGroup,
+        allergies: familyMember.allergies,
+        chronicConditions: familyMember.chronicConditions,
+        emergency_contact: familyMember.emergency_contact,
+        isActive: familyMember.isActive,
+        createdAt: familyMember.createdAt,
+        updatedAt: familyMember.updatedAt,
+        parentPatient: {
+          _id: familyMember.patient_id._id,
+          name: familyMember.patient_id.name,
+          email: familyMember.patient_id.email,
+          phone: familyMember.patient_id.phone,
+          patientId: familyMember.patient_id.patientId
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Update family member error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Toggle family member active status
+router.put('/family-members/:id/status', adminMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { isActive } = req.body;
+
+    const familyMember = await mongoose.model('FamilyMember').findByIdAndUpdate(
+      id,
+      { $set: { isActive } },
+      { new: true }
+    ).populate('patient_id', 'name email phone patientId');
+
+    if (!familyMember) {
+      return res.status(404).json({ message: 'Family member not found' });
+    }
+
+    res.json({
+      message: `Family member ${isActive ? 'activated' : 'deactivated'} successfully`,
+      familyMember: {
+        _id: familyMember._id,
+        patientId: familyMember.patientId,
+        name: familyMember.name,
+        age: familyMember.age,
+        gender: familyMember.gender,
+        relation: familyMember.relation,
+        phone: familyMember.phone,
+        bloodGroup: familyMember.bloodGroup,
+        allergies: familyMember.allergies,
+        chronicConditions: familyMember.chronicConditions,
+        emergency_contact: familyMember.emergency_contact,
+        isActive: familyMember.isActive,
+        createdAt: familyMember.createdAt,
+        updatedAt: familyMember.updatedAt,
+        parentPatient: {
+          _id: familyMember.patient_id._id,
+          name: familyMember.patient_id.name,
+          email: familyMember.patient_id.email,
+          phone: familyMember.patient_id.phone,
+          patientId: familyMember.patient_id.patientId
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Toggle family member status error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Delete family member
+router.delete('/family-members/:id', adminMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const familyMember = await mongoose.model('FamilyMember').findByIdAndDelete(id);
+    if (!familyMember) {
+      return res.status(404).json({ message: 'Family member not found' });
+    }
+
+    res.json({ message: 'Family member deleted successfully' });
+  } catch (error) {
+    console.error('Delete family member error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Payment Management Routes
+
+// Get all payments with filtering and pagination
+router.get('/payments', adminMiddleware, async (req, res) => {
+  try {
+    const {
+      page = 1,
+      limit = 20,
+      status = '',
+      method = '',
+      date = ''
+    } = req.query;
+
+    const pageNum = Math.max(1, parseInt(page));
+    const pageSize = Math.max(1, Math.min(200, parseInt(limit)));
+
+    const query = {};
+    if (status) query.payment_status = status;
+    if (method) query.paymentMethod = method;
+    if (date) {
+      const startDate = new Date(date);
+      startDate.setHours(0, 0, 0, 0);
+      const endDate = new Date(date);
+      endDate.setHours(23, 59, 59, 999);
+      query.createdAt = { $gte: startDate, $lte: endDate };
+    }
+
+    const total = await Token.countDocuments(query);
+    const appointments = await Token.find(query)
+      .sort({ createdAt: -1 })
+      .skip((pageNum - 1) * pageSize)
+      .limit(pageSize)
+      .populate('patient_id', 'name email phone patientId')
+      .populate('family_member_id', 'name relation patientId')
+      .populate({
+        path: 'doctor_id',
+        select: 'name doctor_info',
+        populate: { path: 'doctor_info.department', select: 'name' }
+      });
+
+    const payments = appointments.map(apt => ({
+      _id: apt._id,
+      transactionId: apt._id.toString().slice(-8).toUpperCase(),
+      appointmentId: apt._id,
+      patientId: apt.family_member_id?.patientId || apt.patient_id?.patientId || null,
+      patientName: apt.family_member_id?.name || apt.patient_id?.name || 'Unknown',
+      patientEmail: apt.patient_id?.email || '',
+      patientPhone: apt.patient_id?.phone || '',
+      doctorName: apt.doctor_id?.name || 'Unknown',
+      department: apt.department || apt.doctor_id?.doctor_info?.department?.name || 'Unknown',
+      appointmentDate: apt.booking_date,
+      amount: apt.fee || 500, // Default fee if not set
+      method: apt.paymentMethod || 'cash',
+      status: apt.payment_status || 'pending',
+      refundReason: apt.refund_reason || '',
+      paidAt: apt.paid_at || null,
+      refundedAt: apt.refunded_at || null,
+      createdAt: apt.createdAt,
+      updatedAt: apt.updatedAt
+    }));
+
+    res.json({ 
+      payments, 
+      total, 
+      page: pageNum, 
+      limit: pageSize,
+      totalPages: Math.ceil(total / pageSize)
+    });
+  } catch (error) {
+    console.error('Get payments error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Process refund for a payment
+router.post('/payments/:id/refund', adminMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { reason, amount, method } = req.body;
+
+    if (!reason) {
+      return res.status(400).json({ message: 'Refund reason is required' });
+    }
+
+    const appointment = await Token.findById(id);
+    if (!appointment) {
+      return res.status(404).json({ message: 'Payment not found' });
+    }
+
+    if (appointment.payment_status !== 'paid') {
+      return res.status(400).json({ message: 'Only paid payments can be refunded' });
+    }
+
+    // Update appointment with refund information
+    appointment.payment_status = 'refunded';
+    appointment.refund_reason = reason;
+    appointment.refunded_at = new Date();
+    appointment.refund_amount = amount || appointment.fee || 500;
+    appointment.refund_method = method || 'original';
+    await appointment.save();
+
+    // Send refund notification email to patient
+    try {
+      const notificationService = require('../services/notificationService');
+      await notificationService.sendRefundNotification({
+        patientName: appointment.patient_id?.name || 'Patient',
+        patientEmail: appointment.patient_id?.email,
+        amount: appointment.refund_amount,
+        reason: reason,
+        appointmentDate: appointment.booking_date,
+        doctorName: appointment.doctor_id?.name || 'Doctor'
+      });
+    } catch (notificationError) {
+      console.error('Failed to send refund notification:', notificationError);
+    }
+
+    res.json({
+      message: 'Refund processed successfully',
+      refund: {
+        id: appointment._id,
+        amount: appointment.refund_amount,
+        reason: appointment.refund_reason,
+        method: appointment.refund_method,
+        refundedAt: appointment.refunded_at
+      }
+    });
+  } catch (error) {
+    console.error('Process refund error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get payment statistics
+router.get('/payments/stats', adminMiddleware, async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+    
+    const query = {};
+    if (startDate && endDate) {
+      query.createdAt = { 
+        $gte: new Date(startDate), 
+        $lte: new Date(endDate) 
+      };
+    }
+
+    const stats = await Token.aggregate([
+      { $match: query },
+      {
+        $group: {
+          _id: '$payment_status',
+          count: { $sum: 1 },
+          totalAmount: { $sum: { $ifNull: ['$fee', 500] } }
+        }
+      }
+    ]);
+
+    const result = {
+      totalTransactions: 0,
+      totalRevenue: 0,
+      totalRefunded: 0,
+      pendingAmount: 0,
+      paidCount: 0,
+      refundedCount: 0,
+      pendingCount: 0
+    };
+
+    stats.forEach(stat => {
+      result.totalTransactions += stat.count;
+      if (stat._id === 'paid') {
+        result.totalRevenue += stat.totalAmount;
+        result.paidCount = stat.count;
+      } else if (stat._id === 'refunded') {
+        result.totalRefunded += stat.totalAmount;
+        result.refundedCount = stat.count;
+      } else if (stat._id === 'pending') {
+        result.pendingAmount += stat.totalAmount;
+        result.pendingCount = stat.count;
+      }
+    });
+
+    result.netRevenue = result.totalRevenue - result.totalRefunded;
+
+    res.json(result);
+  } catch (error) {
+    console.error('Get payment stats error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Communication Management Routes
+
+// Get all messages sent by admin
+router.get('/messages', adminMiddleware, async (req, res) => {
+  try {
+    const messages = await mongoose.model('Message').find({})
+      .populate('recipient_id', 'name email phone')
+      .sort({ createdAt: -1 });
+
+    const messagesWithRecipient = messages.map(msg => ({
+      _id: msg._id,
+      subject: msg.subject,
+      message: msg.message,
+      type: msg.type,
+      priority: msg.priority,
+      status: msg.status,
+      recipientType: msg.recipient_type,
+      recipientId: msg.recipient_id?._id,
+      recipientName: msg.recipient_id?.name || msg.recipient_name,
+      recipientEmail: msg.recipient_id?.email || msg.recipient_email,
+      recipientPhone: msg.recipient_id?.phone || msg.recipient_phone,
+      sentAt: msg.sent_at,
+      deliveredAt: msg.delivered_at,
+      readAt: msg.read_at,
+      createdAt: msg.createdAt,
+      updatedAt: msg.updatedAt
+    }));
+
+    res.json({ messages: messagesWithRecipient });
+  } catch (error) {
+    console.error('Get messages error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Send message to patients/doctors
+router.post('/messages', adminMiddleware, async (req, res) => {
+  try {
+    const { recipientType, recipientId, subject, message, priority, type } = req.body;
+
+    if (!subject || !message) {
+      return res.status(400).json({ message: 'Subject and message are required' });
+    }
+
+    const messages = [];
+    let recipients = [];
+
+    // Determine recipients based on type
+    if (recipientType === 'all_patients') {
+      recipients = await User.find({ role: 'patient' }).select('name email phone');
+    } else if (recipientType === 'all_doctors') {
+      recipients = await User.find({ role: 'doctor' }).select('name email phone');
+    } else if (recipientType === 'patient' || recipientType === 'doctor') {
+      if (!recipientId) {
+        return res.status(400).json({ message: 'Recipient ID is required for single recipient' });
+      }
+      const recipient = await User.findById(recipientId);
+      if (!recipient) {
+        return res.status(404).json({ message: 'Recipient not found' });
+      }
+      recipients = [recipient];
+    } else {
+      return res.status(400).json({ message: 'Invalid recipient type' });
+    }
+
+    // Create messages for each recipient
+    for (const recipient of recipients) {
+      const messageDoc = await mongoose.model('Message').create({
+        recipient_type: recipientType,
+        recipient_id: recipient._id,
+        recipient_name: recipient.name,
+        recipient_email: recipient.email,
+        recipient_phone: recipient.phone,
+        subject: subject,
+        message: message,
+        type: type || 'notification',
+        priority: priority || 'normal',
+        status: 'sent',
+        sent_at: new Date(),
+        sent_by: req.user.userId
+      });
+      messages.push(messageDoc);
+
+      // Send email notification
+      try {
+        const notificationService = require('../services/notificationService');
+        await notificationService.sendAdminMessage({
+          recipientName: recipient.name,
+          recipientEmail: recipient.email,
+          subject: subject,
+          message: message,
+          type: type || 'notification',
+          priority: priority || 'normal'
+        });
+      } catch (notificationError) {
+        console.error('Failed to send message notification:', notificationError);
+      }
+    }
+
+    res.json({
+      message: `Message sent to ${recipients.length} recipient(s)`,
+      sentCount: recipients.length,
+      messages: messages.map(msg => ({
+        _id: msg._id,
+        recipientName: msg.recipient_name,
+        recipientEmail: msg.recipient_email,
+        subject: msg.subject,
+        status: msg.status
+      }))
+    });
+  } catch (error) {
+    console.error('Send message error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get message statistics
+router.get('/messages/stats', adminMiddleware, async (req, res) => {
+  try {
+    const stats = await mongoose.model('Message').aggregate([
+      {
+        $group: {
+          _id: '$status',
+          count: { $sum: 1 }
+        }
+      }
+    ]);
+
+    const result = {
+      total: 0,
+      sent: 0,
+      delivered: 0,
+      read: 0,
+      failed: 0
+    };
+
+    stats.forEach(stat => {
+      result.total += stat.count;
+      result[stat._id] = stat.count;
+    });
+
+    res.json(result);
+  } catch (error) {
+    console.error('Get message stats error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 });

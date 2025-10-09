@@ -2227,9 +2227,7 @@ router.post('/dev/seed-appointments', authMiddleware, patientMiddleware, async (
 // Get patient profile
 router.get('/profile', authMiddleware, patientMiddleware, async (req, res) => {
   try {
-    console.log('Profile request - Patient ID:', req.patient._id);
     const user = await User.findById(req.patient._id).select('-password');
-    console.log('Found user:', user ? 'Yes' : 'No');
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
     }

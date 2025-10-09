@@ -87,6 +87,11 @@ class SMSService {
     return await this.sendSMS(phoneNumber, message);
   }
 
+  // Send generic admin message
+  async sendGeneric(phoneNumber, message) {
+    return await this.sendSMS(phoneNumber, message);
+  }
+
   // Send appointment reminder SMS
   async sendAppointmentReminder(appointmentData) {
     const {

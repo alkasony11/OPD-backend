@@ -10,15 +10,28 @@ const DoctorStats = require('../models/DoctorStats');
 const DoctorStatsService = require('../services/doctorStatsService');
 const { authMiddleware } = require('../middleware/authMiddleware');
 
-// Helper: parse YYYY-MM-DD as local date (avoid UTC shift)
-function parseLocalYMD(ymd) {
-  if (!ymd || typeof ymd !== 'string') return null;
-  const parts = ymd.split('-');
+// Helper: parse local date string in formats: YYYY-MM-DD or DD-MM-YYYY
+function parseLocalYMD(input) {
+  if (!input || typeof input !== 'string') return null;
+  const parts = input.split('-');
   if (parts.length !== 3) return null;
-  const year = Number(parts[0]);
-  const month = Number(parts[1]) - 1;
-  const day = Number(parts[2]);
+
+  let year, month, day;
+  // If first part has 4 digits, assume YYYY-MM-DD
+  if (parts[0].length === 4) {
+    year = Number(parts[0]);
+    month = Number(parts[1]) - 1;
+    day = Number(parts[2]);
+  } else {
+    // Assume DD-MM-YYYY
+    day = Number(parts[0]);
+    month = Number(parts[1]) - 1;
+    year = Number(parts[2]);
+  }
+
+  if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) return null;
   const d = new Date(year, month, day);
+  if (Number.isNaN(d.getTime())) return null;
   d.setHours(0, 0, 0, 0);
   return d;
 }
@@ -51,14 +64,29 @@ const docUpload = multer({
 // Upload qualification/certification proof (defined after doctorMiddleware)
 const doctorMiddleware = async (req, res, next) => {
   try {
+    console.log('🔍 Doctor middleware - req.user:', req.user);
+    console.log('🔍 Doctor middleware - req.user.userId:', req.user?.userId);
+    
+    if (!req.user || !req.user.userId) {
+      return res.status(401).json({ message: 'Authentication required' });
+    }
+    
     const user = await User.findById(req.user.userId);
-    if (!user || user.role !== 'doctor') {
+    console.log('🔍 Doctor middleware - found user:', user);
+    
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    
+    if (user.role !== 'doctor') {
       return res.status(403).json({ message: 'Access denied. Doctor role required.' });
     }
+    
     req.doctor = user;
+    console.log('✅ Doctor middleware - req.doctor set:', req.doctor._id);
     next();
   } catch (error) {
-    console.error('Doctor middleware error:', error);
+    console.error('❌ Doctor middleware error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 };
@@ -79,31 +107,128 @@ router.post('/upload-proof', authMiddleware, doctorMiddleware, docUpload.single(
 // Doctor submits a leave request
 router.post('/leave-requests', authMiddleware, doctorMiddleware, async (req, res) => {
   try {
-    const { date, reason } = req.body;
-    if (!date) return res.status(400).json({ message: 'Date is required' });
-    const leaveDate = parseLocalYMD(date) || new Date(date);
-    leaveDate.setHours(0, 0, 0, 0);
+    console.log('📝 Leave request received:', req.body);
+    console.log('👨‍⚕️ Doctor ID:', req.doctor?._id);
+    console.log('👤 User ID:', req.user?.userId);
+    
+    const { leave_type, start_date, end_date, session, reason, date } = req.body;
 
-    const leave = await LeaveRequest.findOneAndUpdate(
-      { doctor_id: req.doctor._id, date: leaveDate },
-      { reason: reason || '', status: 'pending' },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
-    );
+    // Backward compatibility: accept legacy payload { date, reason }
+    const effectiveLeaveType = leave_type || (date ? 'full_day' : undefined);
+    const effectiveStartDateStr = start_date || date;
+    const effectiveEndDateStr = end_date || date;
 
-    res.json({ message: 'Leave request submitted', leave });
+    if (!effectiveStartDateStr) return res.status(400).json({ message: 'Start date is required' });
+    if (effectiveLeaveType === 'full_day' && !effectiveEndDateStr) {
+      return res.status(400).json({ message: 'End date is required for full day leave' });
+    }
+
+    const startDate = parseLocalYMD(effectiveStartDateStr);
+    const endDate = effectiveLeaveType === 'full_day' ? parseLocalYMD(effectiveEndDateStr) : startDate;
+    if (!startDate || !endDate) {
+      return res.status(400).json({ message: 'Invalid date format. Use DD-MM-YYYY or YYYY-MM-DD' });
+    }
+    
+    startDate.setHours(0, 0, 0, 0);
+    endDate.setHours(0, 0, 0, 0);
+    
+    console.log('📅 Parsed dates:', { startDate, endDate });
+
+    // Check for overlapping leave requests
+    const existingLeave = await LeaveRequest.findOne({
+      doctor_id: req.doctor._id,
+      status: { $in: ['pending', 'approved'] },
+      $or: [
+        {
+          start_date: { $lte: endDate },
+          end_date: { $gte: startDate }
+        }
+      ]
+    });
+
+    if (existingLeave) {
+      return res.status(400).json({ 
+        message: 'You already have a leave request for this date range' 
+      });
+    }
+
+    console.log('🔄 Creating leave request with data:', {
+      doctor_id: req.doctor._id,
+      leave_type: effectiveLeaveType || 'full_day',
+      start_date: startDate,
+      end_date: endDate,
+      session: (effectiveLeaveType === 'half_day') ? (session || 'morning') : 'morning',
+      reason: reason || '',
+      status: 'pending'
+    });
+
+    const leave = new LeaveRequest({
+      doctor_id: req.doctor._id,
+      leave_type: effectiveLeaveType || 'full_day',
+      start_date: startDate,
+      end_date: endDate,
+      session: (effectiveLeaveType === 'half_day') ? (session || 'morning') : 'morning',
+      reason: reason || '',
+      status: 'pending'
+    });
+
+    console.log('💾 Saving leave request...');
+    await leave.save();
+    console.log('✅ Leave request saved successfully:', leave._id);
+
+    res.json({ message: 'Leave request submitted successfully', leaveRequest: leave });
   } catch (error) {
     console.error('Submit leave request error:', error);
-    res.status(500).json({ message: 'Server error' });
+    res.status(500).json({ 
+      message: 'Server error',
+      error: String(error?.message || error),
+      code: error?.code || undefined
+    });
   }
 });
 
 // Doctor lists their leave requests
 router.get('/leave-requests', authMiddleware, doctorMiddleware, async (req, res) => {
   try {
-    const leaves = await LeaveRequest.find({ doctor_id: req.doctor._id }).sort({ date: -1 });
-    res.json({ leaves });
+    const { status } = req.query;
+    const query = { doctor_id: req.doctor._id };
+    if (status) query.status = status;
+    
+    const leaveRequests = await LeaveRequest.find(query)
+      .sort({ start_date: -1, createdAt: -1 });
+    
+    res.json({ leaveRequests });
   } catch (error) {
     console.error('List leave requests error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Doctor cancels their own leave request
+router.put('/leave-requests/:id/cancel', authMiddleware, doctorMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const leave = await LeaveRequest.findOne({ 
+      _id: id, 
+      doctor_id: req.doctor._id,
+      status: 'pending'
+    });
+    
+    if (!leave) {
+      return res.status(404).json({ 
+        message: 'Leave request not found or cannot be cancelled' 
+      });
+    }
+    
+    leave.status = 'cancelled';
+    leave.cancelled_at = new Date();
+    leave.cancelled_by = 'doctor';
+    await leave.save();
+    
+    res.json({ message: 'Leave request cancelled successfully' });
+  } catch (error) {
+    console.error('Cancel leave request error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 });
