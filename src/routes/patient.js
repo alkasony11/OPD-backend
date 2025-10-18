@@ -1,6 +1,9 @@
 const express = require('express');
 const router = express.Router();
 const mongoose = require('mongoose');
+const bcrypt = require('bcrypt');
+const puppeteer = require('puppeteer');
+const htmlPdf = require('html-pdf-node');
 const { User, Token, Appointment } = require('../models/User');
 const Department = require('../models/Department');
 const FamilyMember = require('../models/FamilyMember');
@@ -10,6 +13,7 @@ const SymptomAnalysisService = require('../services/symptomAnalysisService');
 const whatsappBotService = require('../services/whatsappBotService');
 const notificationService = require('../services/notificationService');
 const meetingLinkService = require('../services/meetingLinkService');
+const { isSessionBookable, getSessionInfo, parseTime, formatTime, getBookingCutoffMessage, generateSequentialTokenNumber } = require('../utils/bookingUtils');
 const crypto = require('crypto');
 const multer = require('multer');
 const path = require('path');
@@ -50,10 +54,18 @@ const upload = multer({
 // Middleware to check if user is a patient
 const patientMiddleware = async (req, res, next) => {
   try {
+    console.log('Patient middleware - JWT userId:', req.user.userId);
     const user = await User.findById(req.user.userId);
     if (!user || user.role !== 'patient') {
+      console.log('Patient middleware - User not found or not patient:', { user: user ? user.email : 'null', role: user ? user.role : 'null' });
       return res.status(403).json({ message: 'Access denied. Patient role required.' });
     }
+    console.log('Patient middleware - Patient identified:', { 
+      userId: user._id, 
+      email: user.email, 
+      patientId: user.patientId,
+      name: user.name 
+    });
     req.patient = user;
     next();
   } catch (error) {
@@ -61,6 +73,206 @@ const patientMiddleware = async (req, res, next) => {
     res.status(500).json({ message: 'Server error' });
   }
 };
+
+// Debug endpoint to check all patients
+router.get('/debug/all-patients', authMiddleware, async (req, res) => {
+  try {
+    const patients = await User.find({ role: 'patient' }).select('_id email name patientId clerkId authProvider');
+    res.json({
+      success: true,
+      patients: patients.map(p => ({
+        id: p._id,
+        email: p.email,
+        name: p.name,
+        patientId: p.patientId,
+        clerkId: p.clerkId,
+        authProvider: p.authProvider
+      }))
+    });
+  } catch (error) {
+    console.error('Debug all patients error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Debug endpoint to check family members for current user
+router.get('/debug/family-members', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    console.log('Debug family members - Patient ID:', req.patient._id);
+    console.log('Debug family members - Patient Name:', req.patient.name);
+    console.log('Debug family members - Patient Email:', req.patient.email);
+    
+    const familyMembers = await FamilyMember.find({ 
+      patient_id: req.patient._id,
+      isActive: true 
+    }).sort({ createdAt: -1 });
+
+    console.log('Debug family members - Found members:', familyMembers.length);
+    familyMembers.forEach(member => {
+      console.log(`- ${member.name} (${member.relation}) - Patient ID: ${member.patient_id}`);
+    });
+
+    // Also check all family members in database to see if there's cross-contamination
+    const allFamilyMembers = await FamilyMember.find({ isActive: true })
+      .populate('patient_id', 'name email patientId')
+      .sort({ createdAt: -1 });
+
+    res.json({
+      success: true,
+      currentPatient: {
+        id: req.patient._id,
+        name: req.patient.name,
+        email: req.patient.email,
+        patientId: req.patient.patientId
+      },
+      familyMembers: familyMembers.map(member => ({
+        id: member._id,
+        patientId: member.patientId,
+        name: member.name,
+        age: member.age,
+        gender: member.gender,
+        relation: member.relation,
+        phone: member.phone,
+        allergies: member.allergies,
+        medicalHistory: member.medical_history,
+        ownerPatientId: member.patient_id
+      })),
+      allFamilyMembersInDB: allFamilyMembers.map(member => ({
+        id: member._id,
+        patientId: member.patientId,
+        name: member.name,
+        relation: member.relation,
+        ownerPatientId: member.patient_id,
+        ownerName: member.patient_id?.name,
+        ownerEmail: member.patient_id?.email
+      }))
+    });
+  } catch (error) {
+    console.error('Debug family members error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Database integrity check and fix endpoint
+router.post('/debug/fix-data-integrity', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    console.log('=== DATABASE INTEGRITY CHECK AND FIX ===');
+    console.log('Requested by:', req.patient.name, req.patient.email);
+    
+    const issues = [];
+    const fixes = [];
+    
+    // Check for family members with incorrect patient_id associations
+    const allFamilyMembers = await FamilyMember.find({ isActive: true })
+      .populate('patient_id', 'name email patientId');
+    
+    for (const member of allFamilyMembers) {
+      if (!member.patient_id) {
+        issues.push({
+          type: 'orphaned_family_member',
+          memberId: member._id,
+          memberName: member.name,
+          issue: 'Family member has no patient_id reference'
+        });
+        
+        // Fix: Deactivate orphaned family member
+        await FamilyMember.findByIdAndUpdate(member._id, { isActive: false });
+        fixes.push({
+          type: 'deactivated_orphaned_member',
+          memberId: member._id,
+          memberName: member.name
+        });
+      }
+    }
+    
+    // Check for appointments with incorrect patient_id associations
+    const allAppointments = await Token.find({})
+      .populate('patient_id', 'name email patientId');
+    
+    for (const appointment of allAppointments) {
+      if (!appointment.patient_id) {
+        issues.push({
+          type: 'orphaned_appointment',
+          appointmentId: appointment._id,
+          tokenNumber: appointment.token_number,
+          issue: 'Appointment has no patient_id reference'
+        });
+      }
+    }
+    
+    res.json({
+      success: true,
+      message: 'Database integrity check completed',
+      issues: issues,
+      fixes: fixes,
+      summary: {
+        totalIssues: issues.length,
+        totalFixes: fixes.length
+      }
+    });
+    
+  } catch (error) {
+    console.error('Database integrity check error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Debug endpoint to check appointments for a specific date
+router.get('/debug/appointments/:date', authMiddleware, async (req, res) => {
+  try {
+    const { date } = req.params;
+    const selectedDate = new Date(date);
+    const nextDay = new Date(selectedDate);
+    nextDay.setDate(nextDay.getDate() + 1);
+    
+    const appointments = await Token.find({
+      booking_date: { $gte: selectedDate, $lt: nextDay },
+      status: { $nin: ['cancelled', 'missed', 'consulted'] }
+    }).populate('patient_id', 'name email patientId').populate('doctor_id', 'name');
+    
+    res.json({
+      success: true,
+      date: date,
+      appointments: appointments.map(apt => ({
+        id: apt._id,
+        patientId: apt.patient_id._id,
+        patientName: apt.patient_id.name,
+        patientEmail: apt.patient_id.email,
+        patientPatientId: apt.patient_id.patientId,
+        doctorId: apt.doctor_id._id,
+        doctorName: apt.doctor_id.name,
+        timeSlot: apt.time_slot,
+        status: apt.status,
+        bookingDate: apt.booking_date
+      }))
+    });
+  } catch (error) {
+    console.error('Debug appointments error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Debug endpoint to check current patient info
+router.get('/debug/current-patient', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    res.json({
+      success: true,
+      patient: {
+        id: req.patient._id,
+        email: req.patient.email,
+        name: req.patient.name,
+        patientId: req.patient.patientId,
+        role: req.patient.role,
+        clerkId: req.patient.clerkId,
+        authProvider: req.patient.authProvider
+      },
+      jwt: req.user
+    });
+  } catch (error) {
+    console.error('Debug endpoint error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
 
 // Analyze symptoms and suggest departments
 router.post('/analyze-symptoms', async (req, res) => {
@@ -274,6 +486,7 @@ router.get('/departments/:departmentId/available-dates', async (req, res) => {
       return `${year}-${month}-${day}`;
     };
 
+
     // Map dateStr -> aggregate available sessions (sum across doctors)
     const dateAvailabilityMap = new Map();
 
@@ -298,7 +511,7 @@ router.get('/departments/:departmentId/available-dates', async (req, res) => {
 
 
       // Check morning session availability
-      if (schedule.morning_session?.available !== false) {
+      if (schedule.morning_session?.available !== false && isSessionBookable(date, 'morning')) {
         totalSessions++;
         const morningCapacity = schedule.morning_session?.max_patients || 10;
         const morningAppointments = await Token.countDocuments({
@@ -313,7 +526,7 @@ router.get('/departments/:departmentId/available-dates', async (req, res) => {
       }
 
       // Check afternoon session availability
-      if (schedule.afternoon_session?.available !== false) {
+      if (schedule.afternoon_session?.available !== false && isSessionBookable(date, 'afternoon')) {
         totalSessions++;
         const afternoonCapacity = schedule.afternoon_session?.max_patients || 10;
         const afternoonAppointments = await Token.countDocuments({
@@ -467,10 +680,10 @@ async function checkDoctorSessionAvailability(doctorId, date, startTime, endTime
     // Check session-based availability first
     if (startTime >= '09:00' && endTime <= '13:00') {
       // Morning session
-      return schedule.morning_session?.available !== false;
+      return schedule.morning_session?.available !== false && isSessionBookable(date, 'morning');
     } else if (startTime >= '14:00' && endTime <= '18:00') {
       // Afternoon session
-      return schedule.afternoon_session?.available !== false;
+      return schedule.afternoon_session?.available !== false && isSessionBookable(date, 'afternoon');
     }
 
     // Otherwise ensure within working hours
@@ -527,9 +740,9 @@ async function getDoctorSessionAvailability(doctorId, date, startTime, endTime) 
     if (!schedule) {
       hasSchedule = false;
     } else if (startTime >= '09:00' && endTime <= '13:00') {
-      hasSchedule = schedule.morning_session?.available !== false;
+      hasSchedule = schedule.morning_session?.available !== false && isSessionBookable(date, 'morning');
     } else if (startTime >= '14:00' && endTime <= '18:00') {
-      hasSchedule = schedule.afternoon_session?.available !== false;
+      hasSchedule = schedule.afternoon_session?.available !== false && isSessionBookable(date, 'afternoon');
     } else {
       hasSchedule = true; // For other times, use working hours
     }
@@ -682,6 +895,7 @@ router.get('/departments/:departmentId/available-doctors', async (req, res) => {
       'doctor_info.department': departmentId
     }).select('name doctor_info email profile_photo');
 
+
     // Filter to those with schedule and free at time, and consider session capacity
     const available = [];
     for (const doctor of doctors) {
@@ -712,14 +926,14 @@ router.get('/departments/:departmentId/available-doctors', async (req, res) => {
       // Ensure time falls in an available session if within session windows
       const inMorning = t >= parseTime('09:00') && t < parseTime('13:00');
       const inAfternoon = t >= parseTime('14:00') && t < parseTime('18:00');
-      if (inMorning && schedule.morning_session?.available === false) continue;
-      if (inAfternoon && schedule.afternoon_session?.available === false) continue;
+      if (inMorning && (schedule.morning_session?.available === false || !isSessionBookable(date, 'morning'))) continue;
+      if (inAfternoon && (schedule.afternoon_session?.available === false || !isSessionBookable(date, 'afternoon'))) continue;
 
       const conflict = await Token.findOne({
         doctor_id: doctor._id,
         booking_date: { $gte: selectedDate, $lt: nextDay },
         time_slot: time,
-        status: { $nin: ['cancelled', 'missed'] }
+        status: { $nin: ['cancelled', 'missed', 'consulted'] }
       });
       if (conflict) continue;
 
@@ -928,11 +1142,6 @@ function calculateTotalSlots(workingHours, breakTime, slotDuration) {
   return Math.floor(totalWorkingMinutes / slotDuration);
 }
 
-// Helper function to parse time string to minutes
-function parseTime(timeStr) {
-  const [hours, minutes] = timeStr.split(':').map(Number);
-  return hours * 60 + minutes;
-}
 
 // Get available time slots for a doctor on a specific date
 router.get('/doctors/:doctorId/availability/:date', async (req, res) => {
@@ -989,25 +1198,60 @@ router.get('/doctors/:doctorId/availability/:date', async (req, res) => {
     const slots = generateTimeSlots(workingHours, breakTime, slotDuration);
 
     // Get existing appointments for this date (use same nextDay calculated above)
-
     const existingAppointments = await Token.find({
       doctor_id: doctorId,
       booking_date: { $gte: selectedDate, $lt: nextDay },
-      status: { $nin: ['cancelled', 'missed'] }
+      status: { $nin: ['cancelled', 'missed', 'consulted'] }
     });
 
-    const bookedSlots = existingAppointments.map(apt => apt.time_slot);
+    // Count appointments per session instead of per time slot
+    const morningAppointments = existingAppointments.filter(apt => {
+      const aptTime = parseTime(apt.time_slot);
+      return aptTime >= parseTime('09:00') && aptTime < parseTime('13:00');
+    }).length;
 
-    // Mark slots as booked and add additional info
+    const afternoonAppointments = existingAppointments.filter(apt => {
+      const aptTime = parseTime(apt.time_slot);
+      return aptTime >= parseTime('14:00') && aptTime < parseTime('18:00');
+    }).length;
+
+    // Get session capacity limits from schedule
+    const morningMaxPatients = schedule?.morning_session?.max_patients || 10;
+    const afternoonMaxPatients = schedule?.afternoon_session?.max_patients || 10;
+
+
+    console.log('Session capacity check:', {
+      morningAppointments,
+      morningMaxPatients,
+      afternoonAppointments,
+      afternoonMaxPatients
+    });
+
+    // Mark slots as available based on session capacity, not individual time slots
     const availableSlots = slots.map((slot, index) => {
-      const isBooked = bookedSlots.includes(slot.time);
+      const slotTime = parseTime(slot.time);
+      const isMorning = slotTime >= parseTime('09:00') && slotTime < parseTime('13:00');
+      const isAfternoon = slotTime >= parseTime('14:00') && slotTime < parseTime('18:00');
+      
+      let isAvailable = true;
+      let sessionInfo = '';
+      
+      if (isMorning) {
+        isAvailable = morningAppointments < morningMaxPatients && isSessionBookable(date, 'morning');
+        sessionInfo = `Morning: ${morningAppointments}/${morningMaxPatients}`;
+      } else if (isAfternoon) {
+        isAvailable = afternoonAppointments < afternoonMaxPatients && isSessionBookable(date, 'afternoon');
+        sessionInfo = `Afternoon: ${afternoonAppointments}/${afternoonMaxPatients}`;
+      }
+
       return {
         time: slot.time,
         displayTime: slot.displayTime,
-        available: !isBooked,
-        isBooked,
+        available: isAvailable,
+        isBooked: !isAvailable,
         estimatedWaitTime: index * 5 + 10, // Progressive wait time
-        slotNumber: index + 1
+        slotNumber: index + 1,
+        sessionInfo: sessionInfo
       };
     });
 
@@ -1023,7 +1267,19 @@ router.get('/doctors/:doctorId/availability/:date', async (req, res) => {
       isAvailable: true,
       totalSlots: slots.length,
       availableCount: onlyAvailableSlots.length,
-      bookedCount: availableSlots.length - onlyAvailableSlots.length
+      bookedCount: availableSlots.length - onlyAvailableSlots.length,
+      sessionCapacity: {
+        morning: {
+          current: morningAppointments,
+          max: morningMaxPatients,
+          available: morningMaxPatients - morningAppointments
+        },
+        afternoon: {
+          current: afternoonAppointments,
+          max: afternoonMaxPatients,
+          available: afternoonMaxPatients - afternoonAppointments
+        }
+      }
     });
   } catch (error) {
     console.error('Get availability error:', error);
@@ -1035,11 +1291,28 @@ router.get('/doctors/:doctorId/availability/:date', async (req, res) => {
 router.get('/appointments/conflict', authMiddleware, patientMiddleware, async (req, res) => {
   try {
     const { date, doctorId, familyMemberId } = req.query;
+    
+    console.log('🔍 CONFLICT CHECK REQUEST:', { 
+      date, 
+      doctorId, 
+      familyMemberId, 
+      patientId: req.patient._id,
+      patientEmail: req.patient.email,
+      patientName: req.patient.name,
+      patientPatientId: req.patient.patientId,
+      jwtUserId: req.user.userId
+    });
+    
     if (!date) {
       return res.status(400).json({ message: 'date is required' });
     }
 
+    // Validate date format
     const selectedDate = new Date(date);
+    if (isNaN(selectedDate.getTime())) {
+      return res.status(400).json({ message: 'Invalid date format' });
+    }
+    
     selectedDate.setHours(0, 0, 0, 0);
     const nextDay = new Date(selectedDate);
     nextDay.setDate(nextDay.getDate() + 1);
@@ -1047,20 +1320,80 @@ router.get('/appointments/conflict', authMiddleware, patientMiddleware, async (r
     const query = {
       patient_id: req.patient._id,
       booking_date: { $gte: selectedDate, $lt: nextDay },
-      status: { $nin: ['cancelled', 'missed'] }
+      status: { $nin: ['cancelled', 'missed', 'consulted'] } // Also exclude consulted appointments
     };
+    
+    console.log('🔍 CONFLICT CHECK QUERY:', {
+      query: query,
+      patientDetails: {
+        id: req.patient._id,
+        email: req.patient.email,
+        name: req.patient.name,
+        patientId: req.patient.patientId,
+        clerkId: req.patient.clerkId
+      }
+    });
+    
     // Only consider the same person: either self (null) or the specific family member
-    if (familyMemberId && familyMemberId !== 'self' && familyMemberId !== 'undefined') {
+    if (familyMemberId && familyMemberId !== 'self' && familyMemberId !== 'undefined' && familyMemberId !== 'null') {
       query.family_member_id = familyMemberId;
     } else {
       query.family_member_id = null;
     }
+    
     if (doctorId) {
       query.doctor_id = doctorId;
     }
 
+    console.log('🔍 CONFLICT CHECK QUERY:', query);
+
     const existing = await Token.findOne(query).populate('doctor_id', 'name');
+    
+    console.log('🔍 CONFLICT CHECK RESULT:', {
+      foundExisting: !!existing,
+      existingAppointment: existing ? {
+        id: existing._id,
+        patient_id: existing.patient_id,
+        patient_name: existing.patient_name,
+        patient_email: existing.patient_email,
+        doctor_id: existing.doctor_id,
+        doctor_name: existing.doctor_id?.name,
+        time_slot: existing.time_slot,
+        booking_date: existing.booking_date,
+        status: existing.status,
+        family_member_id: existing.family_member_id
+      } : null
+    });
     if (existing) {
+      console.log('🚨 CONFLICT FOUND:', {
+        existingAppointment: {
+          id: existing._id,
+          patientId: existing.patient_id,
+          patientName: existing.patient_name,
+          patientEmail: existing.patient_email,
+          doctorId: existing.doctor_id,
+          doctorName: existing.doctor_id?.name,
+          timeSlot: existing.time_slot,
+          date: existing.booking_date,
+          status: existing.status
+        },
+        currentPatient: {
+          id: req.patient._id,
+          name: req.patient.name,
+          email: req.patient.email,
+          patientId: req.patient.patientId,
+          clerkId: req.patient.clerkId
+        },
+        areSamePatient: existing.patient_id.toString() === req.patient._id.toString(),
+        emailsMatch: (existing.patient_email || 'Unknown') === req.patient.email
+      });
+      
+      // TEMPORARY FIX: If emails are different, allow the booking (different patients)
+      if ((existing.patient_email || 'Unknown') !== req.patient.email) {
+        console.log('⚠️  DIFFERENT EMAILS DETECTED - Allowing booking to proceed (different patients)');
+        return res.json({ conflict: false });
+      }
+      
       return res.json({
         conflict: true,
         message: `This person already has an appointment on this date${doctorId ? ' with this doctor' : ''}.`,
@@ -1069,10 +1402,11 @@ router.get('/appointments/conflict', authMiddleware, patientMiddleware, async (r
       });
     }
 
+    console.log('No conflict found');
     res.json({ conflict: false });
   } catch (error) {
     console.error('Conflict check error:', error);
-    res.status(500).json({ message: 'Server error' });
+    res.status(500).json({ message: 'Server error', details: error.message });
   }
 });
 
@@ -1108,12 +1442,6 @@ function generateTimeSlots(workingHours, breakTime, slotDuration) {
   return slots;
 }
 
-// Helper function to format minutes to time string (24-hour format)
-function formatTime(minutes) {
-  const hours = Math.floor(minutes / 60);
-  const mins = minutes % 60;
-  return `${hours.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}`;
-}
 
 // Helper function to format display time (12-hour format)
 function formatDisplayTime(minutes) {
@@ -1137,10 +1465,18 @@ router.post('/book-appointment', authMiddleware, patientMiddleware, async (req, 
       appointmentType = 'in-person' // Default to in-person if not specified
     } = req.body;
 
-    // Validate required fields
-    if (!doctorId || !departmentId || !appointmentDate || !appointmentTime) {
-      return res.status(400).json({ message: 'doctorId, departmentId, appointmentDate and appointmentTime are required' });
-    }
+    console.log('Booking appointment for patient:', {
+      patientId: req.patient._id,
+      patientEmail: req.patient.email,
+      patientName: req.patient.name,
+      patientPatientId: req.patient.patientId,
+      jwtUserId: req.user.userId,
+      doctorId,
+      departmentId,
+      appointmentDate,
+      appointmentTime,
+      familyMemberId
+    });
 
     // Get doctor and department details
     const doctor = await User.findById(doctorId)
@@ -1185,6 +1521,7 @@ router.post('/book-appointment', authMiddleware, patientMiddleware, async (req, 
       });
     }
 
+
     // Validate session-based availability
     const appointmentMinutes = parseTime(appointmentTime || '');
     if (!Number.isFinite(appointmentMinutes)) {
@@ -1196,18 +1533,18 @@ router.post('/book-appointment', authMiddleware, patientMiddleware, async (req, 
     // Check morning session (9:00 AM - 1:00 PM)
     if (appointmentMinutes >= parseTime('09:00') && appointmentMinutes < parseTime('13:00')) {
       if (schedule) {
-        isSessionValid = schedule.morning_session?.available !== false;
+        isSessionValid = schedule.morning_session?.available !== false && isSessionBookable(appointmentDate, 'morning');
       } else {
-        isSessionValid = true; // Default available if no schedule
+        isSessionValid = isSessionBookable(appointmentDate, 'morning'); // Check time cutoff even without schedule
       }
       sessionName = 'Morning Session';
     }
     // Check afternoon session (2:00 PM - 6:00 PM)
     else if (appointmentMinutes >= parseTime('14:00') && appointmentMinutes < parseTime('18:00')) {
       if (schedule) {
-        isSessionValid = schedule.afternoon_session?.available !== false;
+        isSessionValid = schedule.afternoon_session?.available !== false && isSessionBookable(appointmentDate, 'afternoon');
       } else {
-        isSessionValid = true; // Default available if no schedule
+        isSessionValid = isSessionBookable(appointmentDate, 'afternoon'); // Check time cutoff even without schedule
       }
       sessionName = 'Afternoon Session';
     }
@@ -1221,8 +1558,59 @@ router.post('/book-appointment', authMiddleware, patientMiddleware, async (req, 
     }
 
     if (!isSessionValid) {
+      // Check if it's a time cutoff issue
+      const now = new Date();
+      const today = new Date(now);
+      today.setHours(0, 0, 0, 0);
+      
+      const scheduleDate = new Date(appointmentDate);
+      scheduleDate.setHours(0, 0, 0, 0);
+      
+      const isToday = scheduleDate.getTime() === today.getTime();
+      const currentTime = now.toTimeString().slice(0, 5);
+      
+      let errorMessage = `Doctor is not available during ${sessionName} on ${appointmentDate}`;
+      
+      if (isToday) {
+        if (sessionName === 'Morning Session' && currentTime >= '08:00') {
+          errorMessage = getBookingCutoffMessage(sessionName, currentTime);
+        } else if (sessionName === 'Afternoon Session' && currentTime >= '13:00') {
+          errorMessage = getBookingCutoffMessage(sessionName, currentTime);
+        }
+      }
+      
+      console.log('🚨 SESSION VALIDATION FAILED:', {
+        appointmentTime,
+        appointmentMinutes,
+        sessionName,
+        appointmentDate,
+        isToday,
+        currentTime,
+        schedule: schedule ? {
+          morning_session: schedule.morning_session,
+          afternoon_session: schedule.afternoon_session,
+          working_hours: schedule.working_hours
+        } : 'No schedule found',
+        doctor: {
+          id: doctor._id,
+          name: doctor.name,
+          default_working_hours: doctor.doctor_info?.default_working_hours
+        }
+      });
+      
       return res.status(400).json({ 
-        message: `Doctor is not available during ${sessionName} on ${appointmentDate}` 
+        message: errorMessage,
+        debug: {
+          appointmentTime,
+          sessionName,
+          hasSchedule: !!schedule,
+          isToday,
+          currentTime,
+          scheduleDetails: schedule ? {
+            morning_session: schedule.morning_session,
+            afternoon_session: schedule.afternoon_session
+          } : null
+        }
       });
     }
 
@@ -1230,15 +1618,95 @@ router.post('/book-appointment', authMiddleware, patientMiddleware, async (req, 
     const nextDay = new Date(selectedDate);
     nextDay.setDate(nextDay.getDate() + 1);
     
+    // Check if the same patient (or family member) already has an appointment at this exact time slot
+    // This prevents duplicate bookings by the same patient/family member
     const existingAppointment = await Token.findOne({
       doctor_id: doctorId,
       booking_date: { $gte: selectedDate, $lt: nextDay },
       time_slot: appointmentTime,
-      status: { $nin: ['cancelled', 'missed'] }
+      status: { $nin: ['cancelled', 'missed', 'consulted'] },
+      $or: [
+        { patient_id: req.patient._id },
+        { family_member_id: familyMemberId }
+      ]
     });
 
     if (existingAppointment) {
-      return res.status(400).json({ message: 'This time slot is no longer available' });
+      console.log('🚨 CONFLICT DETECTED - Same patient/family member slot conflict found:', {
+        existingId: existingAppointment._id,
+        existingStatus: existingAppointment.status,
+        existingPatient: existingAppointment.patient_id,
+        existingPatientName: existingAppointment.patient_name || 'Unknown',
+        existingPatientEmail: existingAppointment.patient_email || 'Unknown',
+        newPatient: req.patient._id,
+        newPatientName: req.patient.name,
+        newPatientEmail: req.patient.email,
+        jwtUserId: req.user.userId,
+        timeSlot: appointmentTime,
+        date: appointmentDate,
+        conflictCheck: {
+          existingPatientId: existingAppointment.patient_id.toString(),
+          newPatientId: req.patient._id.toString(),
+          areSame: existingAppointment.patient_id.toString() === req.patient._id.toString(),
+          existingEmail: existingAppointment.patient_email || 'Unknown',
+          newEmail: req.patient.email,
+          emailsMatch: (existingAppointment.patient_email || 'Unknown') === req.patient.email
+        }
+      });
+      // Check if this is actually the same patient or different patients
+      const isActuallySamePatient = existingAppointment.patient_id.toString() === req.patient._id.toString();
+      const isSameEmail = (existingAppointment.patient_email || 'Unknown') === req.patient.email;
+      
+      if (!isActuallySamePatient && !isSameEmail) {
+        console.log('⚠️  DIFFERENT PATIENTS DETECTED - Allowing booking to proceed');
+        // This is a different patient, allow the booking to proceed
+        // The session capacity check will handle the limit
+      } else {
+        console.log('✅ SAME PATIENT CONFIRMED - Blocking duplicate booking');
+        return res.status(400).json({ 
+          message: 'You already have an appointment at this time slot',
+          details: {
+            timeSlot: appointmentTime,
+            date: appointmentDate,
+            existingPatient: existingAppointment.patient_name || 'You',
+            conflictType: 'same_patient_time_slot'
+          }
+        });
+      }
+    }
+
+    // Check session capacity limits
+    let sessionStart = '09:00';
+    let sessionEnd = '13:00';
+    let maxPatients = 10;
+    sessionName = 'morning'; // Set default session name
+
+    if (appointmentMinutes >= parseTime('14:00')) {
+      sessionStart = '14:00';
+      sessionEnd = '18:00';
+      sessionName = 'afternoon';
+      maxPatients = schedule?.afternoon_session?.max_patients || 10;
+    } else if (appointmentMinutes >= parseTime('09:00')) {
+      maxPatients = schedule?.morning_session?.max_patients || 10;
+    }
+
+    const currentSessionAppointments = await Token.countDocuments({
+      doctor_id: doctorId,
+      booking_date: { $gte: selectedDate, $lt: nextDay },
+      time_slot: { $gte: sessionStart, $lt: sessionEnd },
+      status: { $nin: ['cancelled', 'missed', 'consulted'] }
+    });
+
+    if (currentSessionAppointments >= maxPatients) {
+      return res.status(400).json({ 
+        message: `Doctor's ${sessionName} session is full (${currentSessionAppointments}/${maxPatients} patients). Please choose another time slot or doctor.`,
+        sessionCapacity: {
+          current: currentSessionAppointments,
+          max: maxPatients,
+          session: sessionName,
+          sessionTime: `${sessionStart} - ${sessionEnd}`
+        }
+      });
     }
 
     // Validate family member if provided
@@ -1322,9 +1790,6 @@ router.post('/book-appointment', authMiddleware, patientMiddleware, async (req, 
       });
     }
 
-    // Generate token number
-    const tokenNumber = `T${Date.now().toString().slice(-4)}`;
-
     // Determine session type and time range
     let sessionType = 'morning';
     let sessionTimeRange = '9:00 AM - 1:00 PM';
@@ -1339,6 +1804,9 @@ router.post('/book-appointment', authMiddleware, patientMiddleware, async (req, 
       sessionType = 'evening';
       sessionTimeRange = '6:00 PM - 9:00 PM';
     }
+
+    // Generate sequential token number based on session type
+    const tokenNumber = await generateSequentialTokenNumber(doctorId, selectedDate, sessionType);
 
     // Generate meeting link for video consultations
     let meetingLinkData = null;
@@ -1363,6 +1831,8 @@ router.post('/book-appointment', authMiddleware, patientMiddleware, async (req, 
     // Create appointment token
     const appointmentToken = new Token({
       patient_id: req.patient._id,
+      patient_name: familyMember ? familyMember.name : req.patient.name,
+      patient_email: req.patient.email,
       family_member_id: familyMember ? familyMember._id : null,
       doctor_id: doctorId,
       department: department.name,
@@ -1460,6 +1930,12 @@ router.post('/book-appointment', authMiddleware, patientMiddleware, async (req, 
 // Get patient's appointments with enhanced details
 router.get('/appointments', authMiddleware, patientMiddleware, async (req, res) => {
   try {
+    console.log('=== APPOINTMENTS API CALL ===');
+    console.log('Authenticated User ID:', req.user.userId);
+    console.log('Patient ID:', req.patient._id);
+    console.log('Patient Name:', req.patient.name);
+    console.log('Patient Email:', req.patient.email);
+    
     const { familyMemberId, status } = req.query;
     
     // Build query
@@ -1474,6 +1950,8 @@ router.get('/appointments', authMiddleware, patientMiddleware, async (req, res) 
     if (status) {
       query.status = status;
     }
+    
+    console.log('Appointments query:', query);
 
     const appointments = await Token.find(query)
       .populate('doctor_id', 'name doctor_info')
@@ -1556,6 +2034,107 @@ router.get('/family-members-filter', authMiddleware, patientMiddleware, async (r
   }
 });
 
+// Get queue position and estimated wait time for an appointment
+router.get('/appointments/:appointmentId/queue-position', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    const { appointmentId } = req.params;
+    
+    // Find the appointment
+    const appointment = await Token.findById(appointmentId)
+      .populate('doctor_id', 'name')
+      .populate('patient_id', 'name patientId')
+      .populate('family_member_id', 'name patientId');
+    
+    if (!appointment) {
+      return res.status(404).json({ message: 'Appointment not found' });
+    }
+    
+    // Verify ownership
+    if (appointment.patient_id._id.toString() !== req.patient._id.toString()) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+    
+    // Only calculate queue position for active appointments
+    if (!['booked', 'in_queue'].includes(appointment.status)) {
+      return res.json({
+        appointmentId: appointment._id,
+        status: appointment.status,
+        queuePosition: null,
+        estimatedWaitTime: null,
+        message: 'Appointment is not in queue'
+      });
+    }
+    
+    // Get all appointments for the same doctor on the same date
+    const appointmentDate = new Date(appointment.booking_date);
+    const startOfDay = new Date(appointmentDate);
+    startOfDay.setHours(0, 0, 0, 0);
+    const endOfDay = new Date(appointmentDate);
+    endOfDay.setHours(23, 59, 59, 999);
+    
+    const queueAppointments = await Token.find({
+      doctor_id: appointment.doctor_id._id,
+      booking_date: { $gte: startOfDay, $lte: endOfDay },
+      status: { $in: ['booked', 'in_queue'] }
+    })
+    .sort({ 
+      booking_date: 1,
+      time_slot: 1,
+      createdAt: 1 
+    });
+    
+    // Find current appointment position in queue
+    const currentIndex = queueAppointments.findIndex(apt => apt._id.toString() === appointmentId);
+    const queuePosition = currentIndex + 1;
+    
+    // Calculate estimated wait time based on average consultation time (15 minutes)
+    const averageConsultationTime = 15; // minutes
+    const appointmentsAhead = currentIndex;
+    const estimatedWaitTimeMinutes = appointmentsAhead * averageConsultationTime;
+    
+    // Get current time and appointment time
+    const now = new Date();
+    const appointmentDateTime = new Date(appointment.booking_date);
+    const [hours, minutes] = appointment.time_slot.split(':');
+    appointmentDateTime.setHours(parseInt(hours), parseInt(minutes), 0, 0);
+    
+    // If appointment time has passed, reduce wait time accordingly
+    let adjustedWaitTime = estimatedWaitTimeMinutes;
+    if (now > appointmentDateTime) {
+      const minutesPastAppointment = Math.floor((now - appointmentDateTime) / (1000 * 60));
+      adjustedWaitTime = Math.max(0, estimatedWaitTimeMinutes - minutesPastAppointment);
+    }
+    
+    res.json({
+      appointmentId: appointment._id,
+      status: appointment.status,
+      queuePosition: queuePosition,
+      totalInQueue: queueAppointments.length,
+      estimatedWaitTime: adjustedWaitTime,
+      estimatedWaitTimeFormatted: formatWaitTime(adjustedWaitTime),
+      appointmentTime: appointment.time_slot,
+      doctorName: appointment.doctor_id.name,
+      department: appointment.department,
+      referredDoctor: appointment.referredDoctor || null,
+      lastUpdated: new Date()
+    });
+    
+  } catch (error) {
+    console.error('Get queue position error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Helper function to format wait time
+function formatWaitTime(minutes) {
+  if (minutes <= 0) return 'Your turn is next';
+  if (minutes < 60) return `About ${minutes} minutes`;
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  if (remainingMinutes === 0) return `About ${hours} hour${hours > 1 ? 's' : ''}`;
+  return `About ${hours}h ${remainingMinutes}m`;
+}
+
 // Get single appointment by id (for reschedule prefill)
 router.get('/appointments/:appointmentId', authMiddleware, patientMiddleware, async (req, res) => {
   try {
@@ -1593,7 +2172,7 @@ router.get('/appointments/:appointmentId', authMiddleware, patientMiddleware, as
 router.post('/appointments/:appointmentId/cancel', authMiddleware, patientMiddleware, async (req, res) => {
   try {
     const { appointmentId } = req.params;
-    const { reason, refundMethod = 'wallet' } = req.body;
+    const { reason } = req.body;
 
     // Find the appointment
     const appointment = await Token.findById(appointmentId)
@@ -1660,7 +2239,8 @@ router.post('/appointments/:appointmentId/cancel', authMiddleware, patientMiddle
     if (refundEligible && appointment.payment_status === 'paid') {
       updateData.refund_status = refundStatus;
       updateData.refund_amount = refundAmount;
-      updateData.refund_method = refundMethod;
+      // Lock to original payment method string
+      updateData.refund_method = appointment.paymentMethod || 'wallet';
       updateData.refund_reference = `REF${Date.now().toString().slice(-6)}`;
     }
 
@@ -1673,10 +2253,17 @@ router.post('/appointments/:appointmentId/cancel', authMiddleware, patientMiddle
     // Process refund if eligible
     let refundResult = null;
     if (refundEligible && appointment.payment_status === 'paid') {
+      // Normalize original method to concrete handler
+      const methodLower = String(appointment.paymentMethod || '').toLowerCase();
+      const effectiveMethod = methodLower.includes('upi') ? 'upi'
+        : (methodLower.includes('card') || methodLower.includes('credit') || methodLower.includes('debit')) ? 'card'
+        : methodLower.includes('wallet') ? 'wallet'
+        : methodLower.includes('cash') ? 'cash'
+        : 'upi';
       refundResult = await processRefund({
         appointmentId,
         amount: refundAmount,
-        method: refundMethod,
+        method: effectiveMethod,
         patientId: req.patient._id,
         reference: updateData.refund_reference
       });
@@ -1870,12 +2457,38 @@ router.get('/appointments/active-department-check', authMiddleware, patientMiddl
 // Get patient's family members
 router.get('/family-members', authMiddleware, patientMiddleware, async (req, res) => {
   try {
+    console.log('=== FAMILY MEMBERS API CALL ===');
+    console.log('Authenticated User ID:', req.user.userId);
+    console.log('Patient ID:', req.patient._id);
+    console.log('Patient Name:', req.patient.name);
+    console.log('Patient Email:', req.patient.email);
+    
     const familyMembers = await FamilyMember.find({ 
       patient_id: req.patient._id,
       isActive: true 
     }).sort({ createdAt: -1 });
 
-    const memberList = familyMembers.map(member => ({
+    console.log('Found family members:', familyMembers.length);
+    familyMembers.forEach(member => {
+      console.log(`- ${member.name} (${member.relation}) - Owner: ${member.patient_id}`);
+    });
+
+    // Additional security check: Verify that each family member actually belongs to this patient
+    const verifiedFamilyMembers = [];
+    for (const member of familyMembers) {
+      // Double-check that the patient_id matches the authenticated user
+      if (member.patient_id.toString() === req.patient._id.toString()) {
+        verifiedFamilyMembers.push(member);
+      } else {
+        console.error(`SECURITY ALERT: Family member ${member.name} (ID: ${member._id}) has incorrect patient_id association!`);
+        console.error(`Expected: ${req.patient._id}, Found: ${member.patient_id}`);
+        // Deactivate this family member to prevent data leak
+        await FamilyMember.findByIdAndUpdate(member._id, { isActive: false });
+        console.error(`Deactivated family member ${member.name} to prevent data leak`);
+      }
+    }
+
+    const memberList = verifiedFamilyMembers.map(member => ({
       id: member._id,
       patientId: member.patientId,
       name: member.name,
@@ -1887,6 +2500,7 @@ router.get('/family-members', authMiddleware, patientMiddleware, async (req, res
       medicalHistory: member.medical_history
     }));
 
+    console.log('Returning verified family members:', memberList.length);
     res.json({ familyMembers: memberList });
   } catch (error) {
     console.error('Get family members error:', error);
@@ -1900,11 +2514,39 @@ router.post('/family-members', authMiddleware, patientMiddleware, async (req, re
     console.log('Add family member request:', req.body);
     console.log('Patient ID:', req.patient._id);
     
-    const { name, age, gender, relation, phone, allergies, medicalHistory } = req.body;
+    const { 
+      name, 
+      age, 
+      gender, 
+      relation, 
+      phone, 
+      bloodGroup, 
+      allergies, 
+      chronicConditions,
+      medicalHistory 
+    } = req.body;
 
     // Validate required fields
     if (!name || !age || !gender || !relation) {
       return res.status(400).json({ message: 'Name, age, gender, and relation are required' });
+    }
+
+    // Validate age
+    const ageNum = parseInt(age);
+    if (isNaN(ageNum) || ageNum < 0 || ageNum > 150) {
+      return res.status(400).json({ message: 'Age must be a valid number between 0 and 150' });
+    }
+
+    // Validate gender
+    const validGenders = ['male', 'female', 'other'];
+    if (!validGenders.includes(gender.toLowerCase())) {
+      return res.status(400).json({ message: 'Gender must be male, female, or other' });
+    }
+
+    // Validate relation
+    const validRelations = ['spouse', 'child', 'parent', 'sibling', 'grandparent', 'grandchild', 'other'];
+    if (!validRelations.includes(relation.toLowerCase())) {
+      return res.status(400).json({ message: 'Invalid relationship type' });
     }
 
     // Check if family member with same name already exists for this patient
@@ -1921,11 +2563,13 @@ router.post('/family-members', authMiddleware, patientMiddleware, async (req, re
     const familyMember = new FamilyMember({
       patient_id: req.patient._id,
       name: name.trim(),
-      age: parseInt(age),
-      gender,
-      relation,
+      age: ageNum,
+      gender: gender.toLowerCase(),
+      relation: relation.toLowerCase(),
       phone: phone || '',
-      allergies: allergies || [],
+      bloodGroup: bloodGroup || '',
+      allergies: allergies || '',
+      chronicConditions: chronicConditions || '',
       medical_history: medicalHistory || []
     });
 
@@ -1940,7 +2584,10 @@ router.post('/family-members', authMiddleware, patientMiddleware, async (req, re
         age: familyMember.age,
         gender: familyMember.gender,
         relation: familyMember.relation,
-        phone: familyMember.phone
+        phone: familyMember.phone,
+        bloodGroup: familyMember.bloodGroup,
+        allergies: familyMember.allergies,
+        chronicConditions: familyMember.chronicConditions
       }
     });
   } catch (error) {
@@ -2341,84 +2988,8 @@ router.delete('/remove-photo', authMiddleware, patientMiddleware, async (req, re
   }
 });
 
-// Get family members
-router.get('/family-members', authMiddleware, patientMiddleware, async (req, res) => {
-  try {
-    const familyMembers = await FamilyMember.find({ patient_id: req.patient._id });
-    res.json({ familyMembers });
-  } catch (error) {
-    console.error('Get family members error:', error);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
 
-// Add family member
-router.post('/family-members', authMiddleware, patientMiddleware, async (req, res) => {
-  try {
-    const {
-      name,
-      age,
-      gender,
-      phone,
-      relation,
-      bloodGroup,
-      allergies,
-      chronicConditions
-    } = req.body;
 
-    // Generate unique patient ID for family member
-    const patientId = `FM${Date.now().toString().slice(-6)}`;
-
-    const familyMember = new FamilyMember({
-      patient_id: req.patient._id,
-      name,
-      age,
-      gender,
-      phone,
-      relation,
-      patientId,
-      bloodGroup,
-      allergies,
-      chronicConditions
-    });
-
-    await familyMember.save();
-    res.status(201).json({ message: 'Family member added successfully', familyMember });
-  } catch (error) {
-    console.error('Add family member error:', error);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// Update family member
-router.put('/family-members/:id', authMiddleware, patientMiddleware, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const updateData = req.body;
-
-    // Remove undefined values
-    Object.keys(updateData).forEach(key => {
-      if (updateData[key] === undefined) {
-        delete updateData[key];
-      }
-    });
-
-    const familyMember = await FamilyMember.findOneAndUpdate(
-      { _id: id, patient_id: req.patient._id },
-      { $set: updateData },
-      { new: true }
-    );
-
-    if (!familyMember) {
-      return res.status(404).json({ message: 'Family member not found' });
-    }
-
-    res.json({ message: 'Family member updated successfully', familyMember });
-  } catch (error) {
-    console.error('Update family member error:', error);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
 
 // Delete family member
 router.delete('/family-members/:id', authMiddleware, patientMiddleware, async (req, res) => {
@@ -2515,6 +3086,527 @@ router.put('/deactivate-account', authMiddleware, patientMiddleware, async (req,
     res.json({ message: 'Account deactivated successfully' });
   } catch (error) {
     console.error('Deactivate account error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get patient invoices
+router.get('/invoices', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    console.log('Fetching invoices for patient:', req.patient._id);
+    
+    // Get all appointments for the patient, regardless of payment status
+    const appointments = await Token.find({
+      patient_id: req.patient._id
+    })
+    .populate('doctor_id', 'name doctor_info')
+    .sort({ createdAt: -1 });
+
+    console.log('Found appointments:', appointments.length);
+
+    const invoices = appointments.map(apt => {
+      // Determine payment status based on appointment status
+      let paymentStatus = apt.payment_status || 'pending';
+      if (apt.status === 'cancelled') {
+        paymentStatus = 'cancelled';
+      } else if (apt.status === 'consulted' && apt.payment_status === 'paid') {
+        paymentStatus = 'paid';
+      } else if (apt.status === 'consulted' && apt.payment_status === 'pending') {
+        paymentStatus = 'paid'; // Assume paid if consultation completed
+      }
+
+      return {
+        id: apt._id,
+        invoice_number: `INV-${apt.token_number || apt._id.toString().slice(-6)}`,
+        amount: apt.consultation_fee || 500, // Default consultation fee
+        payment_status: paymentStatus,
+        created_at: apt.createdAt,
+        appointment: {
+          doctorName: apt.doctor_id?.name || 'Unknown Doctor',
+          department: apt.department,
+          appointmentDate: apt.booking_date,
+          timeSlot: apt.time_slot,
+          patientName: apt.patient_name,
+          status: apt.status
+        }
+      };
+    });
+
+    console.log('Generated invoices:', invoices.length);
+    res.json({ invoices });
+  } catch (error) {
+    console.error('Get invoices error:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Download invoice PDF
+router.get('/invoices/:invoiceId/download', authMiddleware, patientMiddleware, async (req, res) => {
+  let browser;
+  try {
+    const { invoiceId } = req.params;
+    
+    const appointment = await Token.findById(invoiceId)
+      .populate('doctor_id', 'name doctor_info')
+      .populate('patient_id', 'name email phone');
+
+    if (!appointment) {
+      return res.status(404).json({ message: 'Invoice not found' });
+    }
+
+    // Verify ownership
+    if (appointment.patient_id._id.toString() !== req.patient._id.toString()) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    const invoiceData = {
+      invoiceNumber: `INV-${appointment.token_number || appointment._id.toString().slice(-6)}`,
+      date: appointment.createdAt.toLocaleDateString('en-IN'),
+      patientName: appointment.patient_name,
+      patientEmail: appointment.patient_email,
+      doctorName: appointment.doctor_id?.name || 'Unknown Doctor',
+      department: appointment.department,
+      appointmentDate: appointment.booking_date.toLocaleDateString('en-IN'),
+      timeSlot: appointment.time_slot,
+      amount: appointment.consultation_fee || 500,
+      status: appointment.payment_status,
+      transactionId: appointment._id.toString().slice(-8).toUpperCase(),
+      currentDate: new Date().toLocaleDateString('en-IN'),
+      currentTime: new Date().toLocaleTimeString('en-IN')
+    };
+
+    // Generate professional HTML content for PDF
+    const htmlContent = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <title>Invoice ${invoiceData.invoiceNumber}</title>
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body { 
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+                line-height: 1.6; 
+                color: #333; 
+                background: #fff;
+                font-size: 14px;
+            }
+            .invoice-container { 
+                max-width: 800px; 
+                margin: 0 auto; 
+                background: white; 
+                padding: 40px;
+            }
+            .header { 
+                text-align: center; 
+                border-bottom: 3px solid #2563eb; 
+                padding-bottom: 30px; 
+                margin-bottom: 40px; 
+            }
+            .logo { 
+                font-size: 36px; 
+                font-weight: 900; 
+                color: #2563eb; 
+                margin-bottom: 10px; 
+                letter-spacing: 2px;
+            }
+            .company-tagline {
+                font-size: 12px;
+                color: #6b7280;
+                margin-bottom: 20px;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+            }
+            .invoice-title { 
+                font-size: 28px; 
+                color: #1f2937; 
+                margin-bottom: 10px; 
+                font-weight: 700;
+            }
+            .invoice-number { 
+                font-size: 20px; 
+                color: #6b7280; 
+                font-weight: 600;
+            }
+            .invoice-meta {
+                display: flex;
+                justify-content: space-between;
+                margin-bottom: 40px;
+                padding: 20px;
+                background: #f8fafc;
+                border-radius: 8px;
+            }
+            .meta-item {
+                text-align: center;
+            }
+            .meta-label {
+                font-size: 11px;
+                color: #6b7280;
+                text-transform: uppercase;
+                font-weight: 600;
+                letter-spacing: 0.5px;
+                margin-bottom: 5px;
+            }
+            .meta-value {
+                font-size: 14px;
+                color: #1f2937;
+                font-weight: 600;
+            }
+            .section { 
+                margin-bottom: 30px; 
+            }
+            .section-title { 
+                font-size: 18px; 
+                font-weight: 700; 
+                color: #1f2937; 
+                margin-bottom: 20px; 
+                border-bottom: 2px solid #e5e7eb; 
+                padding-bottom: 8px; 
+            }
+            .info-grid { 
+                display: grid; 
+                grid-template-columns: 1fr 1fr; 
+                gap: 30px; 
+                margin-bottom: 25px; 
+            }
+            .info-item { 
+                padding: 15px;
+                background: #f9fafb;
+                border-radius: 6px;
+                border-left: 4px solid #2563eb;
+            }
+            .info-label { 
+                font-size: 11px; 
+                color: #6b7280; 
+                text-transform: uppercase; 
+                font-weight: 700; 
+                margin-bottom: 8px; 
+                letter-spacing: 0.5px;
+            }
+            .info-value { 
+                font-size: 15px; 
+                color: #1f2937; 
+                font-weight: 600; 
+            }
+            .amount-section { 
+                background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%); 
+                padding: 30px; 
+                border-radius: 12px; 
+                margin-top: 30px; 
+                border: 1px solid #e2e8f0;
+            }
+            .amount-row { 
+                display: flex; 
+                justify-content: space-between; 
+                align-items: center; 
+                margin-bottom: 15px; 
+                padding: 8px 0;
+            }
+            .amount-label {
+                font-size: 14px;
+                color: #4b5563;
+                font-weight: 500;
+            }
+            .amount-value {
+                font-size: 16px;
+                color: #1f2937;
+                font-weight: 600;
+            }
+            .total-amount { 
+                font-size: 24px; 
+                font-weight: 800; 
+                color: #2563eb; 
+            }
+            .status-badge { 
+                display: inline-block; 
+                padding: 6px 16px; 
+                border-radius: 25px; 
+                font-size: 11px; 
+                font-weight: 700; 
+                text-transform: uppercase; 
+                letter-spacing: 0.5px;
+            }
+            .status-paid { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
+            .status-pending { background: #fef3c7; color: #92400e; border: 1px solid #fde68a; }
+            .status-cancelled { background: #fee2e2; color: #991b1b; border: 1px solid #fecaca; }
+            .footer { 
+                margin-top: 50px; 
+                padding-top: 30px; 
+                border-top: 2px solid #e5e7eb; 
+                text-align: center; 
+                color: #6b7280; 
+                font-size: 12px; 
+            }
+            .footer p {
+                margin-bottom: 8px;
+            }
+            .watermark {
+                position: fixed;
+                top: 50%;
+                left: 50%;
+                transform: translate(-50%, -50%) rotate(-45deg);
+                font-size: 120px;
+                color: rgba(37, 99, 235, 0.05);
+                font-weight: 900;
+                z-index: -1;
+                pointer-events: none;
+            }
+            @media print {
+                body { margin: 0; }
+                .invoice-container { padding: 20px; }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="watermark">MediQ</div>
+        <div class="invoice-container">
+            <div class="header">
+                <div class="logo">MediQ</div>
+                <div class="company-tagline">Healthcare Management System</div>
+                <div class="invoice-title">Medical Consultation Invoice</div>
+                <div class="invoice-number">Invoice #${invoiceData.invoiceNumber}</div>
+            </div>
+            
+            <div class="invoice-meta">
+                <div class="meta-item">
+                    <div class="meta-label">Invoice Date</div>
+                    <div class="meta-value">${invoiceData.date}</div>
+                </div>
+                <div class="meta-item">
+                    <div class="meta-label">Transaction ID</div>
+                    <div class="meta-value">TXN-${invoiceData.transactionId}</div>
+                </div>
+                <div class="meta-item">
+                    <div class="meta-label">Generated On</div>
+                    <div class="meta-value">${invoiceData.currentDate} at ${invoiceData.currentTime}</div>
+                </div>
+            </div>
+            
+            <div class="section">
+                <div class="section-title">Patient Information</div>
+                <div class="info-grid">
+                    <div class="info-item">
+                        <div class="info-label">Patient Name</div>
+                        <div class="info-value">${invoiceData.patientName}</div>
+                    </div>
+                    <div class="info-item">
+                        <div class="info-label">Email Address</div>
+                        <div class="info-value">${invoiceData.patientEmail}</div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="section">
+                <div class="section-title">Appointment Details</div>
+                <div class="info-grid">
+                    <div class="info-item">
+                        <div class="info-label">Consulting Doctor</div>
+                        <div class="info-value">Dr. ${invoiceData.doctorName}</div>
+                    </div>
+                    <div class="info-item">
+                        <div class="info-label">Department</div>
+                        <div class="info-value">${invoiceData.department}</div>
+                    </div>
+                    <div class="info-item">
+                        <div class="info-label">Appointment Date</div>
+                        <div class="info-value">${invoiceData.appointmentDate}</div>
+                    </div>
+                    <div class="info-item">
+                        <div class="info-label">Time Slot</div>
+                        <div class="info-value">${invoiceData.timeSlot}</div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="amount-section">
+                <div class="amount-row">
+                    <span class="amount-label">Consultation Fee:</span>
+                    <span class="amount-value">₹${invoiceData.amount}</span>
+                </div>
+                <div class="amount-row">
+                    <span class="amount-label">Payment Status:</span>
+                    <span class="status-badge status-${invoiceData.status}">${invoiceData.status.toUpperCase()}</span>
+                </div>
+                <div class="amount-row" style="border-top: 2px solid #cbd5e1; padding-top: 15px; margin-top: 15px;">
+                    <span class="total-amount">Total Amount:</span>
+                    <span class="total-amount">₹${invoiceData.amount}</span>
+                </div>
+            </div>
+            
+            <div class="footer">
+                <p><strong>Thank you for choosing MediQ for your healthcare needs.</strong></p>
+                <p>This is a computer-generated invoice and does not require a signature.</p>
+                <p>For any queries, please contact our support team.</p>
+                <p style="margin-top: 20px; font-size: 10px; color: #9ca3af;">
+                    Generated on ${invoiceData.currentDate} at ${invoiceData.currentTime} | Invoice #${invoiceData.invoiceNumber}
+                </p>
+            </div>
+        </div>
+    </body>
+    </html>`;
+
+    // Try html-pdf-node first (lighter and more reliable)
+    let pdfBuffer;
+    try {
+      const options = {
+        format: 'A4',
+        margin: {
+          top: '15mm',
+          right: '15mm',
+          bottom: '15mm',
+          left: '15mm'
+        },
+        printBackground: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox']
+      };
+      
+      const file = { content: htmlContent };
+      pdfBuffer = await htmlPdf.generatePdf(file, options);
+      
+    } catch (htmlPdfError) {
+      console.log('html-pdf-node failed, trying Puppeteer...', htmlPdfError.message);
+      
+      // Fallback to Puppeteer
+      browser = await puppeteer.launch({
+        headless: true,
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-accelerated-2d-canvas',
+          '--no-first-run',
+          '--no-zygote',
+          '--single-process',
+          '--disable-gpu'
+        ]
+      });
+      
+      const page = await browser.newPage();
+      await page.setViewport({ width: 1200, height: 800 });
+      await page.setContent(htmlContent, { 
+        waitUntil: 'networkidle0',
+        timeout: 30000 
+      });
+      
+      pdfBuffer = await page.pdf({
+        format: 'A4',
+        printBackground: true,
+        preferCSSPageSize: false,
+        margin: {
+          top: '15mm',
+          right: '15mm',
+          bottom: '15mm',
+          left: '15mm'
+        },
+        displayHeaderFooter: false,
+        timeout: 30000
+      });
+
+      await browser.close();
+    }
+
+    // Set response headers for PDF download
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="Invoice-${invoiceData.invoiceNumber}.pdf"`);
+    res.setHeader('Content-Length', pdfBuffer.length);
+    
+    res.send(pdfBuffer);
+    
+  } catch (error) {
+    if (browser) {
+      await browser.close();
+    }
+    console.error('Download invoice error:', error);
+    
+    // Fallback: Return HTML content if PDF generation fails
+    try {
+      console.log('PDF generation failed, falling back to HTML...');
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="Invoice-${invoiceData.invoiceNumber}.html"`);
+      res.send(htmlContent);
+    } catch (fallbackError) {
+      console.error('Fallback also failed:', fallbackError);
+      res.status(500).json({ 
+        message: 'PDF generation failed. Please try again or contact support.', 
+        error: error.message 
+      });
+    }
+  }
+});
+
+// Test PDF generation endpoint
+router.get('/test-pdf', async (req, res) => {
+  try {
+    const testHtml = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <title>Test PDF</title>
+        <style>
+            body { font-family: Arial, sans-serif; padding: 20px; }
+            .header { text-align: center; color: #2563eb; font-size: 24px; margin-bottom: 20px; }
+        </style>
+    </head>
+    <body>
+        <div class="header">MediQ PDF Test</div>
+        <p>This is a test PDF to verify the generation is working correctly.</p>
+        <p>Generated at: ${new Date().toLocaleString()}</p>
+    </body>
+    </html>`;
+
+    const options = {
+      format: 'A4',
+      margin: { top: '20mm', right: '20mm', bottom: '20mm', left: '20mm' },
+      printBackground: true
+    };
+    
+    const file = { content: testHtml };
+    const pdfBuffer = await htmlPdf.generatePdf(file, options);
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'attachment; filename="test.pdf"');
+    res.send(pdfBuffer);
+  } catch (error) {
+    console.error('Test PDF error:', error);
+    res.status(500).json({ message: 'Test PDF generation failed', error: error.message });
+  }
+});
+
+// Change password
+router.patch('/password', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ message: 'Current password and new password are required' });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({ message: 'New password must be at least 6 characters long' });
+    }
+
+    const patient = await User.findById(req.patient._id);
+    if (!patient) {
+      return res.status(404).json({ message: 'Patient not found' });
+    }
+
+    // Verify current password
+    const isCurrentPasswordValid = await bcrypt.compare(currentPassword, patient.password);
+    if (!isCurrentPasswordValid) {
+      return res.status(400).json({ message: 'Current password is incorrect' });
+    }
+
+    // Hash new password
+    const saltRounds = 10;
+    const hashedNewPassword = await bcrypt.hash(newPassword, saltRounds);
+
+    // Update password
+    await User.findByIdAndUpdate(req.patient._id, { password: hashedNewPassword });
+
+    res.json({ message: 'Password updated successfully' });
+  } catch (error) {
+    console.error('Change password error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 });

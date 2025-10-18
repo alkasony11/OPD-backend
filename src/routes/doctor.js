@@ -9,6 +9,7 @@ const LeaveRequest = require('../models/LeaveRequest');
 const DoctorStats = require('../models/DoctorStats');
 const DoctorStatsService = require('../services/doctorStatsService');
 const { authMiddleware } = require('../middleware/authMiddleware');
+const ConsultationRecord = require('../models/ConsultationRecord');
 
 // Helper: parse local date string in formats: YYYY-MM-DD or DD-MM-YYYY
 function parseLocalYMD(input) {
@@ -235,11 +236,48 @@ router.put('/leave-requests/:id/cancel', authMiddleware, doctorMiddleware, async
 
 // (middleware defined above)
 
+// Debug endpoint to check database contents
+router.get('/debug-appointments', authMiddleware, doctorMiddleware, async (req, res) => {
+  try {
+    const doctorId = req.doctor._id;
+    
+    // Get all tokens for this doctor
+    const allTokens = await Token.find({ doctor_id: doctorId }).limit(10);
+    
+    // Get all tokens in database
+    const allTokensInDB = await Token.find({}).limit(10);
+    
+    // Get doctor info
+    const doctor = await User.findById(doctorId);
+    
+    res.json({
+      doctorId,
+      doctorName: doctor?.name,
+      doctorEmail: doctor?.email,
+      tokensForThisDoctor: allTokens.length,
+      allTokensInDB: allTokensInDB.length,
+      sampleTokens: allTokensInDB.map(t => ({
+        id: t._id,
+        doctor_id: t.doctor_id,
+        patient_name: t.patient_name,
+        status: t.status,
+        date: t.booking_date
+      }))
+    });
+  } catch (error) {
+    console.error('Debug appointments error:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
 // Get doctor's appointments from tokens collection
 router.get('/appointments', authMiddleware, doctorMiddleware, async (req, res) => {
   try {
     const { filter = 'today', page = 1, limit = 10, date } = req.query;
     const doctorId = req.doctor._id;
+    
+    console.log('🔍 Fetching appointments for doctor:', doctorId);
+    console.log('🔍 Filter:', filter, 'Page:', page, 'Limit:', limit);
 
     let dateFilter = {};
     const today = new Date();
@@ -271,8 +309,10 @@ router.get('/appointments', authMiddleware, doctorMiddleware, async (req, res) =
           };
           break;
         case 'upcoming':
+          const upcomingStart = new Date(today);
+          upcomingStart.setDate(upcomingStart.getDate() + 1);
           dateFilter = {
-            booking_date: { $gte: today }
+            booking_date: { $gte: upcomingStart }
           };
           break;
         case 'past':
@@ -287,15 +327,39 @@ router.get('/appointments', authMiddleware, doctorMiddleware, async (req, res) =
       }
     }
 
-    const appointments = await Token.find({
+    const query = {
       doctor_id: doctorId,
       ...dateFilter
-    })
+    };
+
+    // Apply status filters based on the filter type
+    if (filter === 'today') {
+      // For 'today' filter, exclude cancelled, missed, and consulted appointments
+      query.status = { $nin: ['cancelled', 'missed', 'consulted'] };
+    } else if (filter === 'upcoming') {
+      // For 'upcoming' filter, exclude cancelled, missed, and consulted appointments
+      query.status = { $nin: ['cancelled', 'missed', 'consulted'] };
+    } else if (filter === 'completed') {
+      // For 'completed' filter, only show consulted appointments
+      query.status = 'consulted';
+    } else if (filter === 'cancelled') {
+      // For 'cancelled' filter, show cancelled and missed appointments
+      query.status = { $in: ['cancelled', 'missed'] };
+    } else if (filter === 'all') {
+      // For 'all' filter, exclude cancelled, missed, and consulted appointments
+      query.status = { $nin: ['cancelled', 'missed', 'consulted'] };
+    }
+    
+    console.log('🔍 Query:', JSON.stringify(query, null, 2));
+    
+    const appointments = await Token.find(query)
     .populate('patient_id', 'name email phone patient_info')
     .populate('family_member_id', 'name relation patientId')
     .sort({ booking_date: 1, time_slot: 1 })
     .limit(limit * 1)
     .skip((page - 1) * limit);
+    
+    console.log('🔍 Found appointments:', appointments.length);
 
     const totalAppointments = await Token.countDocuments({
       doctor_id: doctorId,
@@ -555,24 +619,43 @@ router.get('/appointments/:appointmentId', authMiddleware, doctorMiddleware, asy
 // Update appointment status in tokens collection
 router.patch('/appointments/:appointmentId/status', authMiddleware, doctorMiddleware, async (req, res) => {
   try {
-    const { status, notes } = req.body;
-    const validStatuses = ['booked', 'in_queue', 'consulted', 'cancelled', 'missed'];
+    const { status, notes, referredDoctor } = req.body;
+    const validStatuses = ['booked', 'in_queue', 'consulted', 'cancelled', 'missed', 'referred'];
 
     if (!validStatuses.includes(status)) {
       return res.status(400).json({ message: 'Invalid status' });
     }
+
+    const updateData = { status };
+    if (notes) updateData.notes = notes;
+    if (referredDoctor) updateData.referredDoctor = referredDoctor;
+    if (status === 'consulted') updateData.consultation_completed_at = new Date();
+    if (status === 'missed') updateData.no_show_at = new Date();
 
     const appointment = await Token.findOneAndUpdate(
       {
         _id: req.params.appointmentId,
         doctor_id: req.doctor._id
       },
-      { status },
+      updateData,
       { new: true }
     ).populate('patient_id', 'name email phone');
 
     if (!appointment) {
       return res.status(404).json({ message: 'Appointment not found' });
+    }
+
+    // Emit real-time appointment update event
+    if (global.realtimeSyncService) {
+      await global.realtimeSyncService.emitAppointmentUpdate(req.doctor._id, {
+        appointmentId: appointment._id,
+        status: appointment.status,
+        patientName: appointment.patient_id?.name,
+        bookingDate: appointment.booking_date,
+        timeSlot: appointment.time_slot,
+        referredDoctor: appointment.referredDoctor,
+        updatedAt: new Date()
+      });
     }
 
     res.json({ message: 'Appointment status updated successfully', appointment });
@@ -778,7 +861,7 @@ router.post('/schedules', authMiddleware, doctorMiddleware, async (req, res) => 
           end_time: '14:00'
         },
         slot_duration: slotDuration || 30,
-        max_patients_per_slot: maxPatientsPerSlot || 1,
+        max_patients_per_slot: maxPatientsPerSlot || 20, // Default to 20 patients
         leave_reason: leaveReason || '',
         notes: notes || ''
       });
@@ -1582,6 +1665,177 @@ router.get('/dashboard-stats', authMiddleware, doctorMiddleware, async (req, res
   } catch (error) {
     console.error('Get dashboard stats error:', error);
     res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Submit schedule request (cancel or reschedule)
+router.post('/schedule-requests', authMiddleware, async (req, res) => {
+  try {
+    console.log('📝 Schedule request received:', req.body);
+    console.log('📝 User from token:', req.user);
+    
+    const { type, scheduleId, reason, date, newSchedule } = req.body;
+    const doctorId = req.user.userId;
+
+    console.log('📝 Doctor ID:', doctorId);
+    console.log('📝 Request data:', { type, scheduleId, reason, date });
+
+    if (!type || !scheduleId || !reason) {
+      console.log('❌ Missing required fields:', { type, scheduleId, reason });
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Type, scheduleId, and reason are required' 
+      });
+    }
+
+    // Generate unique request ID
+    const requestId = Date.now().toString() + Math.random().toString(36).substr(2, 9);
+
+    const scheduleRequest = {
+      id: requestId,
+      doctorId,
+      type, // 'cancel' or 'reschedule'
+      scheduleId,
+      reason,
+      date,
+      newSchedule: newSchedule || null,
+      status: 'pending',
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    // Add to global schedule requests array (in production, this should be stored in database)
+    global.scheduleRequests = global.scheduleRequests || [];
+    global.scheduleRequests.push(scheduleRequest);
+
+    console.log('✅ Schedule request created:', scheduleRequest);
+    console.log('📊 Total requests now:', global.scheduleRequests.length);
+
+    res.json({ 
+      success: true, 
+      message: 'Schedule request submitted successfully',
+      requestId 
+    });
+  } catch (error) {
+    console.error('Error submitting schedule request:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to submit schedule request' 
+    });
+  }
+});
+
+// Save consultation record
+router.patch('/appointments/:appointmentId/consultation', authMiddleware, async (req, res) => {
+  try {
+    const { appointmentId } = req.params;
+    const { consultationData, status } = req.body;
+    const doctorId = req.user.userId;
+
+    // Find the appointment
+    const appointment = await Token.findById(appointmentId);
+    if (!appointment) {
+      return res.status(404).json({ message: 'Appointment not found' });
+    }
+
+    // Check if doctor is authorized for this appointment
+    if (appointment.doctor_id.toString() !== doctorId) {
+      return res.status(403).json({ message: 'Unauthorized to access this appointment' });
+    }
+
+    // Update appointment status
+    if (status) {
+      appointment.status = status;
+      appointment.consultation_completed_at = new Date();
+    }
+
+    // Save consultation data to appointment
+    appointment.consultationData = consultationData;
+    await appointment.save();
+
+    // Create or update consultation record
+    let consultationRecord = await ConsultationRecord.findOne({ appointment_id: appointmentId });
+    
+    if (consultationRecord) {
+      // Update existing record
+      consultationRecord.consultationData = consultationData;
+      consultationRecord.status = status === 'consulted' ? 'completed' : 'draft';
+      consultationRecord.updated_at = new Date();
+      await consultationRecord.save();
+    } else {
+      // Create new record
+      consultationRecord = new ConsultationRecord({
+        appointment_id: appointmentId,
+        doctor_id: doctorId,
+        patient_id: appointment.patient_id,
+        consultationData: consultationData,
+        status: status === 'consulted' ? 'completed' : 'draft',
+        consultation_date: new Date()
+      });
+      await consultationRecord.save();
+    }
+
+    console.log('✅ Consultation record saved:', {
+      appointmentId,
+      doctorId,
+      status: consultationRecord.status,
+      hasData: !!consultationData
+    });
+
+    res.json({
+      success: true,
+      message: 'Consultation record saved successfully',
+      consultationRecord: {
+        id: consultationRecord._id,
+        status: consultationRecord.status,
+        consultation_date: consultationRecord.consultation_date
+      }
+    });
+
+  } catch (error) {
+    console.error('Error saving consultation record:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to save consultation record' 
+    });
+  }
+});
+
+// Get consultation record
+router.get('/appointments/:appointmentId/consultation', authMiddleware, async (req, res) => {
+  try {
+    const { appointmentId } = req.params;
+    const doctorId = req.user.userId;
+
+    // Find the appointment
+    const appointment = await Token.findById(appointmentId);
+    if (!appointment) {
+      return res.status(404).json({ message: 'Appointment not found' });
+    }
+
+    // Check if doctor is authorized for this appointment
+    if (appointment.doctor_id.toString() !== doctorId) {
+      return res.status(403).json({ message: 'Unauthorized to access this appointment' });
+    }
+
+    // Find consultation record
+    const consultationRecord = await ConsultationRecord.findOne({ appointment_id: appointmentId });
+
+    res.json({
+      success: true,
+      consultationRecord: consultationRecord || null,
+      appointmentData: {
+        consultationData: appointment.consultationData || null,
+        status: appointment.status
+      }
+    });
+
+  } catch (error) {
+    console.error('Error fetching consultation record:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch consultation record' 
+    });
   }
 });
 

@@ -247,6 +247,9 @@ router.post('/register', async (req, res) => {
   }
 });
 
+// Check user authentication method - REMOVED
+// Users can now use either login method without restrictions
+
 // Login
 router.post('/login', async (req, res) => {
   try {
@@ -270,13 +273,20 @@ router.post('/login', async (req, res) => {
       return res.status(403).json({ message: 'Your account has been deactivated by the administrator. Please contact support.' });
     }
 
-    // Check password
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) {
-      if (process.env.NODE_ENV !== 'production') {
-        console.log('Password mismatch');
+    // Allow both Google and local authentication
+    // If user has a password, check it
+    if (user.password) {
+      const isMatch = await bcrypt.compare(password, user.password);
+      if (!isMatch) {
+        if (process.env.NODE_ENV !== 'production') {
+          console.log('Password mismatch');
+        }
+        return res.status(400).json({ message: 'Invalid credentials' });
       }
-      return res.status(400).json({ message: 'Invalid credentials' });
+    } else {
+      // User doesn't have a password (Google user) - allow them to set one
+      // For now, we'll allow them to login and they can set a password later
+      console.log('User has no password set, allowing login');
     }
     
     // Determine redirect URL based on role
@@ -336,15 +346,51 @@ router.post('/clerk-sync', async (req, res) => {
       return res.status(400).json({ message: 'Clerk ID and email are required' });
     }
 
-    let user = await User.findOne({
-      $or: [{ clerkId: clerkId }, { email: email }]
-    });
+    console.log('Clerk sync - Looking for user with:', { clerkId, email });
+    
+    // First check by Clerk ID (most specific)
+    let user = await User.findOne({ clerkId: clerkId });
+    console.log('Clerk sync - Found by Clerk ID:', user ? { id: user._id, email: user.email, patientId: user.patientId } : 'null');
+    
+    // If not found by Clerk ID, check by email ONLY if no Clerk ID exists for that email
+    if (!user) {
+      const existingUserWithEmail = await User.findOne({ email: email });
+      if (existingUserWithEmail && existingUserWithEmail.clerkId) {
+        // User exists with this email but different Clerk ID - this is a conflict
+        console.log('Clerk sync - Email conflict detected:', {
+          existingUserId: existingUserWithEmail._id,
+          existingClerkId: existingUserWithEmail.clerkId,
+          newClerkId: clerkId,
+          email: email
+        });
+        return res.status(400).json({ 
+          message: 'This email is already associated with a different Google account. Please use the original Google account or contact support.',
+          conflict: true
+        });
+      }
+      
+      // Only link to existing user if they have NO auth provider (local account without Google)
+      if (existingUserWithEmail && !existingUserWithEmail.authProvider) {
+        user = existingUserWithEmail;
+        console.log('Clerk sync - Linking to existing local account:', { id: user._id, email: user.email, patientId: user.patientId });
+      } else if (existingUserWithEmail && existingUserWithEmail.authProvider === 'local') {
+        // Local account exists - don't link, create new account
+        console.log('Clerk sync - Local account exists, creating new Google account:', { email: email, clerkId: clerkId });
+        user = null; // Force creation of new account
+      } else {
+        user = existingUserWithEmail;
+        console.log('Clerk sync - Found by email (no conflict):', user ? { id: user._id, email: user.email, patientId: user.patientId } : 'null');
+      }
+    }
 
     let isNewUser = false;
 
     if (user) {
       // Update existing user and check for admin role
-      user.clerkId = clerkId;
+      // Only update Clerk ID if it's not already set
+      if (!user.clerkId) {
+        user.clerkId = clerkId;
+      }
       user.name = name || user.name;
       user.phone = phone || user.phone;
       user.profileImage = profileImage || user.profileImage;
@@ -382,7 +428,23 @@ router.post('/clerk-sync', async (req, res) => {
           permissions: ['all']
         } : undefined
       });
+      
+      console.log('Clerk sync - Creating new user:', {
+        clerkId: user.clerkId,
+        email: user.email,
+        name: user.name,
+        role: user.role,
+        authProvider: user.authProvider
+      });
+      
       await user.save();
+      
+      console.log('Clerk sync - New user created successfully:', {
+        id: user._id,
+        email: user.email,
+        patientId: user.patientId,
+        clerkId: user.clerkId
+      });
     }
 
     // Use the role field directly

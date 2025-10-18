@@ -2,12 +2,26 @@ const { transporter } = require('../config/email');
 const smsService = require('./smsService');
 const whatsappBotService = require('./whatsappBotService');
 const { User, Token } = require('../models/User');
+const Notification = require('../models/Notification');
 
 class NotificationService {
   constructor() {
     this.emailEnabled = process.env.EMAIL_USER && process.env.EMAIL_PASS;
     this.smsEnabled = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN;
     this.whatsappEnabled = process.env.WHATSAPP_ACCESS_TOKEN && process.env.WHATSAPP_PHONE_NUMBER_ID;
+  }
+
+  // Create in-app notification
+  async createNotification(data) {
+    try {
+      console.log('🔔 Creating notification with data:', data);
+      const notification = await Notification.createNotification(data);
+      console.log('🔔 In-app notification created successfully:', notification._id);
+      return notification;
+    } catch (error) {
+      console.error('❌ Error creating notification:', error);
+      throw error;
+    }
   }
 
   // Send booking confirmation via all enabled channels
@@ -85,6 +99,29 @@ class NotificationService {
           console.error('WhatsApp sending error:', error);
           results.whatsapp = { success: false, message: error.message };
         }
+      }
+
+      // Create in-app notification for doctor
+      try {
+        await this.createNotification({
+          recipient_id: appointment.doctor_id._id,
+          recipient_type: 'doctor',
+          title: 'New Appointment Booked',
+          message: `${patientName} has booked an appointment for ${appointmentDate} at ${appointmentTime}`,
+          type: 'appointment',
+          priority: 'normal',
+          related_id: appointment._id,
+          related_type: 'appointment',
+          metadata: {
+            patientName,
+            appointmentDate,
+            appointmentTime,
+            tokenNumber,
+            department
+          }
+        });
+      } catch (notificationError) {
+        console.error('Error creating doctor notification:', notificationError);
       }
 
       console.log('📧📱💬 Booking confirmation sent:', results);
@@ -1003,6 +1040,90 @@ class NotificationService {
     } catch (error) {
       console.error('❌ Error sending admin message:', error);
       return { success: false, error: error.message, message: 'Failed to send admin message' };
+    }
+  }
+
+  // Create leave request approval notification
+  async createLeaveApprovalNotification(leaveRequest) {
+    try {
+      const notification = await this.createNotification({
+        recipient_id: leaveRequest.doctor_id,
+        recipient_type: 'doctor',
+        title: 'Leave Request Approved',
+        message: `Your leave request for ${new Date(leaveRequest.start_date).toLocaleDateString()} has been approved`,
+        type: 'leave_request',
+        priority: 'normal',
+        related_id: leaveRequest._id,
+        related_type: 'leave_request',
+        metadata: {
+          leaveType: leaveRequest.leave_type,
+          startDate: leaveRequest.start_date,
+          endDate: leaveRequest.end_date,
+          reason: leaveRequest.reason,
+          status: leaveRequest.status
+        }
+      });
+      return notification;
+    } catch (error) {
+      console.error('Error creating leave approval notification:', error);
+      throw error;
+    }
+  }
+
+  // Create leave request rejection notification
+  async createLeaveRejectionNotification(leaveRequest) {
+    try {
+      const notification = await this.createNotification({
+        recipient_id: leaveRequest.doctor_id,
+        recipient_type: 'doctor',
+        title: 'Leave Request Rejected',
+        message: `Your leave request for ${new Date(leaveRequest.start_date).toLocaleDateString()} has been rejected`,
+        type: 'leave_request',
+        priority: 'normal',
+        related_id: leaveRequest._id,
+        related_type: 'leave_request',
+        metadata: {
+          leaveType: leaveRequest.leave_type,
+          startDate: leaveRequest.start_date,
+          endDate: leaveRequest.end_date,
+          reason: leaveRequest.reason,
+          status: leaveRequest.status
+        }
+      });
+      return notification;
+    } catch (error) {
+      console.error('Error creating leave rejection notification:', error);
+      throw error;
+    }
+  }
+
+  // Create appointment cancellation notification for doctor
+  async createAppointmentCancellationNotification(appointment, cancellationReason) {
+    try {
+      const patientName = appointment.family_member_id ? 
+        appointment.family_member_id.name : 
+        appointment.patient_id.name;
+      
+      const notification = await this.createNotification({
+        recipient_id: appointment.doctor_id,
+        recipient_type: 'doctor',
+        title: 'Appointment Cancelled',
+        message: `Appointment with ${patientName} on ${new Date(appointment.booking_date).toLocaleDateString()} has been cancelled`,
+        type: 'cancellation',
+        priority: 'normal',
+        related_id: appointment._id,
+        related_type: 'appointment',
+        metadata: {
+          patientName,
+          appointmentDate: appointment.booking_date,
+          appointmentTime: appointment.time_slot,
+          cancellationReason
+        }
+      });
+      return notification;
+    } catch (error) {
+      console.error('Error creating appointment cancellation notification:', error);
+      throw error;
     }
   }
 }

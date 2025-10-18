@@ -418,6 +418,14 @@ const tokenSchema = new mongoose.Schema({
     ref: 'User',
     required: true
   },
+  patient_name: {
+    type: String,
+    required: true
+  },
+  patient_email: {
+    type: String,
+    required: true
+  },
   family_member_id: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'FamilyMember'
@@ -445,7 +453,7 @@ const tokenSchema = new mongoose.Schema({
   },
   status: {
     type: String,
-    enum: ['booked', 'in_queue', 'consulted', 'cancelled', 'missed'],
+    enum: ['booked', 'in_queue', 'consulted', 'cancelled', 'missed', 'referred'],
     default: 'booked'
   },
   estimated_wait_time: {
@@ -527,6 +535,14 @@ const tokenSchema = new mongoose.Schema({
     default: ''
   },
   diagnosis: {
+    type: String,
+    default: ''
+  },
+  referredDoctor: {
+    type: String,
+    default: ''
+  },
+  notes: {
     type: String,
     default: ''
   },

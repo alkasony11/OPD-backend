@@ -189,6 +189,26 @@ class RealtimeSyncService {
     }
   }
 
+  // Emit real-time appointment updates
+  async emitAppointmentUpdate(doctorId, appointmentData) {
+    try {
+      const eventData = {
+        doctorId,
+        appointmentData,
+        timestamp: new Date()
+      };
+
+      // Notify admin and doctor clients about appointment updates
+      this.io.to('admin').emit('appointment-status-changed', eventData);
+      this.io.to('doctor').emit('appointment-status-changed', eventData);
+      this.io.to(`doctor-${doctorId}`).emit('your-appointment-updated', eventData);
+
+      console.log(`📡 Appointment update broadcasted for doctor ${doctorId}:`, appointmentData);
+    } catch (error) {
+      console.error('Error emitting appointment update:', error);
+    }
+  }
+
   // Emit system alerts
   async emitSystemAlert(alertType, message, severity = 'info', data = {}) {
     try {

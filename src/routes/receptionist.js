@@ -4,6 +4,7 @@ const { User, Token, Appointment } = require('../models/User');
 const Department = require('../models/Department');
 const DoctorSchedule = require('../models/DoctorSchedule');
 const { authMiddleware } = require('../middleware/authMiddleware');
+const { getSessionInfo, parseTime, generateSequentialTokenNumber } = require('../utils/bookingUtils');
 
 // Middleware to check if user is a receptionist
 const receptionistMiddleware = async (req, res, next) => {
@@ -588,12 +589,19 @@ router.post('/appointments', authMiddleware, receptionistMiddleware, async (req,
       familyMemberObjectId = fm._id;
     }
 
-    // Generate token number
-    const tokenNumber = `T${Date.now().toString().slice(-4)}`;
+    // Determine session type based on appointment time
+    const appointmentMinutes = parseTime(appointmentTime);
+    const sessionInfo = getSessionInfo(appointmentTime);
+    const sessionType = sessionInfo.type;
+
+    // Generate sequential token number based on session type
+    const tokenNumber = await generateSequentialTokenNumber(doctorId, selectedDate, sessionType);
 
     // Create appointment
     const appointment = new Token({
       patient_id: patientId,
+      patient_name: familyMemberObjectId ? (await FamilyMember.findById(familyMemberObjectId)).name : patient.name,
+      patient_email: patient.email,
       family_member_id: familyMemberObjectId,
       doctor_id: doctorId,
       department: department.name,
@@ -605,7 +613,9 @@ router.post('/appointments', authMiddleware, receptionistMiddleware, async (req,
       payment_status: 'pending',
       created_by: 'receptionist',
       receptionist_notes: notes,
-      estimated_wait_time: Math.floor(Math.random() * 30) + 15
+      estimated_wait_time: Math.floor(Math.random() * 30) + 15,
+      session_type: sessionType,
+      session_time_range: sessionInfo.name
     });
 
     await appointment.save();

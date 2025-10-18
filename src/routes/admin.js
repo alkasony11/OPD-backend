@@ -8,8 +8,12 @@ const LeaveRequest = require('../models/LeaveRequest');
 const Department = require('../models/Department');
 const DoctorSchedule = require('../models/DoctorSchedule');
 const Feedback = require('../models/Feedback');
+
+// Schedule Request Schema (in-memory for now, can be moved to a separate model later)
+// Using global to share with doctor routes
 const { transporter } = require('../config/email');
 const { extractToken } = require('../middleware/authMiddleware');
+const cronService = require('../services/cronService');
 
 const router = express.Router();
 
@@ -25,7 +29,7 @@ async function findPatientByAnyId(patientIdParam) {
   if (isValidObjectId(patientIdParam)) {
     or.push({ _id: patientIdParam });
   }
-  return await User.findOne({ role: 'patient', $or: or });
+  return await User.findOne({ role: 'patient', $or: or }).select('-password');
 }
 
 // Admin middleware to check if user is admin
@@ -421,7 +425,10 @@ router.get('/appointments', adminMiddleware, async (req, res) => {
       status = '',
       doctorId = '',
       startDate = '',
-      endDate = ''
+      endDate = '',
+      search = '',
+      sortBy = 'date', // date|time|status|token
+      sortDir = 'desc' // asc|desc
     } = req.query;
 
     const pageNum = Math.max(1, parseInt(page));
@@ -434,12 +441,45 @@ router.get('/appointments', adminMiddleware, async (req, res) => {
       query.booking_date = { $gte: new Date(startDate), $lte: new Date(endDate) };
     }
 
+    // Basic server-side search across token, symptoms, and patient name/email/phone
+    if (search) {
+      const or = [
+        { token_number: { $regex: search, $options: 'i' } },
+        { symptoms: { $regex: search, $options: 'i' } }
+      ];
+      try {
+        const users = await User.find({
+          $or: [
+            { name: { $regex: search, $options: 'i' } },
+            { email: { $regex: search, $options: 'i' } },
+            { phone: { $regex: search, $options: 'i' } }
+          ]
+        }).select('_id');
+        const userIds = users.map(u => u._id);
+        if (userIds.length) {
+          or.push({ patient_id: { $in: userIds } });
+        }
+      } catch (_) {}
+      query.$or = or;
+    }
+
     const total = await Token.countDocuments(query);
+
+    // Sorting map
+    const sortMap = {
+      date: 'booking_date',
+      time: 'time_slot',
+      status: 'status',
+      token: 'token_number'
+    };
+    const sortField = sortMap[sortBy] || 'booking_date';
+    const sortOrder = String(sortDir).toLowerCase() === 'asc' ? 1 : -1;
+
     const appointments = await Token.find(query)
-      .sort({ booking_date: -1, createdAt: -1 })
+      .sort({ [sortField]: sortOrder, createdAt: -1 })
       .skip((pageNum - 1) * pageSize)
       .limit(pageSize)
-      .populate('patient_id', 'name patientId')
+      .populate('patient_id', 'name email phone patientId')
       .populate('family_member_id', 'name relation patientId')
       .populate({
         path: 'doctor_id',
@@ -451,17 +491,97 @@ router.get('/appointments', adminMiddleware, async (req, res) => {
       id: apt._id,
       patientId: apt.family_member_id?.patientId || apt.patient_id?.patientId || null,
       patientName: apt.family_member_id?.name || apt.patient_id?.name || 'Unknown',
+      patientEmail: apt.patient_id?.email || '',
+      patientPhone: apt.patient_id?.phone || '',
       linkedAccount: apt.family_member_id ? (apt.patient_id?.name || 'Main Account') : '',
       doctor: apt.doctor_id?.name || 'Unknown',
       department: apt.department || apt.doctor_id?.doctor_info?.department?.name || 'Unknown',
       date: apt.booking_date,
       time: apt.time_slot || '',
+      tokenNumber: apt.token_number || '',
       status: apt.status || 'booked'
     }));
 
-    res.json({ appointments: rows, total, page: pageNum, limit: pageSize });
+    res.json({ appointments: rows, total, page: pageNum, limit: pageSize, totalPages: Math.ceil(total / pageSize) });
   } catch (error) {
     console.error('Admin list appointments error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get full details for a specific appointment, including patient/family details
+router.get('/appointments/:id/details', adminMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    function buildFileUrl(path) {
+      if (!path) return '';
+      if (typeof path !== 'string') return '';
+      if (path.startsWith('http://') || path.startsWith('https://')) return path;
+      const base = process.env.PUBLIC_BASE_URL || `http://localhost:5001`;
+      if (path.startsWith('/')) return `${base}${path}`;
+      return `${base}/${path}`;
+    }
+
+  const apt = await Token.findById(id)
+      .populate('patient_id', 'name email phone gender age patientId address dob bloodGroup profile_photo profileImage')
+      .populate('family_member_id', 'name relation age gender bloodGroup phone patientId')
+      .populate({
+        path: 'doctor_id',
+        select: 'name doctor_info',
+        populate: { path: 'doctor_info.department', select: 'name' }
+      });
+
+    if (!apt) return res.status(404).json({ message: 'Appointment not found' });
+
+    const appointment = {
+      id: apt._id,
+      date: apt.booking_date,
+      time: apt.time_slot || '',
+      status: apt.status,
+      tokenNumber: apt.token_number || '',
+      department: apt.department || apt.doctor_id?.doctor_info?.department?.name || 'Unknown',
+      doctor: apt.doctor_id?.name || 'Unknown',
+      symptoms: apt.symptoms || ''
+    };
+
+    const isFamily = !!apt.family_member_id;
+    const patient = isFamily ? {
+      type: 'family_member',
+      name: apt.family_member_id?.name || '',
+      relation: apt.family_member_id?.relation || '',
+      phone: apt.family_member_id?.phone || apt.patient_id?.phone || '',
+      email: apt.patient_id?.email || '',
+      gender: apt.family_member_id?.gender || '',
+      age: typeof apt.family_member_id?.age === 'number' ? apt.family_member_id.age : '',
+      bloodGroup: apt.family_member_id?.bloodGroup || '',
+      patientCode: apt.family_member_id?.patientId || null,
+      profilePhoto: apt.patient_id?.profile_photo || apt.patient_id?.profileImage || '',
+      profilePhotoUrl: buildFileUrl(apt.patient_id?.profile_photo || apt.patient_id?.profileImage || ''),
+      primaryAccount: {
+        name: apt.patient_id?.name || '',
+        email: apt.patient_id?.email || '',
+        phone: apt.patient_id?.phone || '',
+        patientCode: apt.patient_id?.patientId || null
+      }
+    } : {
+      type: 'patient',
+      name: apt.patient_id?.name || '',
+      email: apt.patient_id?.email || '',
+      phone: apt.patient_id?.phone || '',
+      gender: apt.patient_id?.gender || '',
+      age: typeof apt.patient_id?.age === 'number' ? apt.patient_id.age : '',
+      dob: apt.patient_id?.dob || null,
+      bloodGroup: apt.patient_id?.bloodGroup || '',
+      address: apt.patient_id?.address || '',
+      patientCode: apt.patient_id?.patientId || null,
+      profilePhoto: apt.patient_id?.profile_photo || apt.patient_id?.profileImage || '',
+      profilePhotoUrl: buildFileUrl(apt.patient_id?.profile_photo || apt.patient_id?.profileImage || '')
+    };
+
+    return res.json({ appointment, patient });
+  } catch (error) {
+    console.error('Get appointment details error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -784,10 +904,27 @@ router.get('/registered-patients', adminMiddleware, async (req, res) => {
 router.get('/patients/:patientId', adminMiddleware, async (req, res) => {
   try {
     const { patientId } = req.params;
+    console.log('🔍 Admin API - Fetching patient with ID:', patientId);
     
-    const patient = await findPatientByAnyId(patientId).select('-password');
+    // Fix: Call select on the query, not the result
+    const or = [{ patientId: patientId }];
+    if (mongoose.Types.ObjectId.isValid(patientId)) {
+      or.push({ _id: patientId });
+    }
+    const patient = await User.findOne({ role: 'patient', $or: or }).select('-password');
+    
+    console.log('📊 Admin API - Patient found:', patient ? 'Yes' : 'No');
+    if (patient) {
+      console.log('📊 Admin API - Patient details:', {
+        _id: patient._id,
+        patientId: patient.patientId,
+        name: patient.name,
+        email: patient.email
+      });
+    }
     
     if (!patient) {
+      console.log('❌ Admin API - Patient not found for ID:', patientId);
       return res.status(404).json({ message: 'Patient not found' });
     }
     
@@ -1030,13 +1167,49 @@ router.put('/patients/:patientId/appointments/:appointmentId/cancel', adminMiddl
     }
 
     // Update status
-    appointment.status = 'cancelled';
+    appointment.status = 'cancelled_by_hospital';
     appointment.cancellation_reason = reason || 'Cancelled by admin';
     appointment.cancelled_by = 'admin';
     appointment.cancelled_at = new Date();
+
+    // Auto-refund if payment made online/cashless
+    if (appointment.payment_status === 'paid') {
+      appointment.payment_status = 'refunded';
+      appointment.refund_reason = `Auto-refund: ${appointment.cancellation_reason}`;
+      appointment.refunded_at = new Date();
+      appointment.refund_amount = appointment.fee || 500;
+      // Preserve original method when present; fall back to 'original'
+      appointment.refund_method = appointment.paymentMethod || 'original';
+      try {
+        const notificationService = require('../services/notificationService');
+        await notificationService.sendRefundNotification({
+          patientName: appointment.patient_id?.name || 'Patient',
+          patientEmail: appointment.patient_id?.email,
+          amount: appointment.refund_amount,
+          reason: appointment.refund_reason,
+          appointmentDate: appointment.booking_date,
+          doctorName: appointment.doctor_id?.name || 'Doctor'
+        });
+      } catch (e) {
+        console.error('Failed to send auto-refund notification:', e);
+      }
+    }
+
     await appointment.save();
 
-    res.json({ message: 'Appointment cancelled successfully' });
+    // Realtime sync
+    try {
+      const io = req.app.get('io');
+      if (io) {
+        io.to('admin').emit('appointment-status-changed', { id: appointment._id, status: appointment.status, payment_status: appointment.payment_status });
+        io.to('patient').emit('your-appointment-updated', { id: appointment._id, status: appointment.status, payment_status: appointment.payment_status });
+        io.to('doctor').emit('appointment-status-changed', { id: appointment._id, status: appointment.status, payment_status: appointment.payment_status });
+      }
+    } catch (e) {
+      console.error('Realtime emit error (admin cancel):', e);
+    }
+
+    res.json({ message: 'Appointment cancelled and synced successfully' });
   } catch (error) {
     console.error('Admin cancel appointment error:', error);
     res.status(500).json({ message: 'Server error' });
@@ -1520,7 +1693,7 @@ const createInitialDoctorSchedule = async (doctorId) => {
           end_time: '14:00'
         },
         slot_duration: 30,
-        max_patients_per_slot: 1,
+        max_patients_per_slot: 20, // Default to 20 patients
         leave_reason: '',
         notes: 'Default schedule created by admin'
       });
@@ -1875,7 +2048,7 @@ router.post('/doctor-schedules/:doctorId', adminMiddleware, async (req, res) => 
           end_time: '14:00'
         },
         slot_duration: slotDuration || 30,
-        max_patients_per_slot: maxPatientsPerSlot || 1,
+        max_patients_per_slot: maxPatientsPerSlot || 20, // Default to 20 patients
         leave_reason: leaveReason || '',
         notes: notes || '',
         // Session-based scheduling
@@ -2178,6 +2351,29 @@ router.post('/leave-requests/:id/approve', adminMiddleware, async (req, res) => 
         appointment.cancellation_reason = `Doctor on leave: ${leave.reason || 'No reason provided'}`;
         appointment.cancelled_at = new Date();
         appointment.cancelled_by = 'system';
+
+        // Auto-refund for paid appointments
+        if (appointment.payment_status === 'paid') {
+          appointment.payment_status = 'refunded';
+          appointment.refund_reason = 'Auto-refund: Doctor on leave';
+          appointment.refunded_at = new Date();
+          appointment.refund_amount = appointment.fee || 500;
+          appointment.refund_method = appointment.paymentMethod || 'original';
+          try {
+            const notificationService = require('../services/notificationService');
+            await notificationService.sendRefundNotification({
+              patientName: appointment.patient_id?.name || 'Patient',
+              patientEmail: appointment.patient_id?.email,
+              amount: appointment.refund_amount,
+              reason: appointment.refund_reason,
+              appointmentDate: appointment.booking_date,
+              doctorName: appointment.doctor_id?.name || 'Doctor'
+            });
+          } catch (e) {
+            console.error('Failed to send auto-refund notification:', e);
+          }
+        }
+
         await appointment.save();
         cancelledAppointmentsCount += 1;
         
@@ -2211,6 +2407,27 @@ router.post('/leave-requests/:id/approve', adminMiddleware, async (req, res) => 
       }
     }
 
+    // Create notification for doctor about leave approval
+    try {
+      const notificationService = require('../services/notificationService');
+      await notificationService.createLeaveApprovalNotification(leave);
+      console.log('🔔 Leave approval notification created for doctor');
+    } catch (notificationError) {
+      console.error('Failed to create leave approval notification:', notificationError);
+    }
+
+    // Realtime sync summary to all roles
+    try {
+      const io = req.app.get('io');
+      if (io) {
+        io.to('admin').emit('appointments-cancelled', { doctorId: leave.doctor_id, date: scheduleDate, count: cancelledAppointmentsCount });
+        io.to('patient').emit('appointments-cancelled', { doctorId: leave.doctor_id, date: scheduleDate, count: cancelledAppointmentsCount });
+        io.to('doctor').emit('appointments-cancelled', { doctorId: leave.doctor_id, date: scheduleDate, count: cancelledAppointmentsCount });
+      }
+    } catch (e) {
+      console.error('Realtime emit error (leave approve):', e);
+    }
+
     res.json({ 
       message: 'Leave request approved successfully',
       leave: leave,
@@ -2237,6 +2454,15 @@ router.post('/leave-requests/:id/reject', adminMiddleware, async (req, res) => {
     leave.status = 'rejected';
     if (admin_comment) leave.admin_comment = admin_comment;
     await leave.save();
+
+    // Create notification for doctor about leave rejection
+    try {
+      const notificationService = require('../services/notificationService');
+      await notificationService.createLeaveRejectionNotification(leave);
+      console.log('🔔 Leave rejection notification created for doctor');
+    } catch (notificationError) {
+      console.error('Failed to create leave rejection notification:', notificationError);
+    }
 
     res.json({ 
       message: 'Leave request rejected successfully',
@@ -2376,9 +2602,13 @@ router.post('/feedback', async (req, res) => {
 
 router.get('/feedback', adminMiddleware, async (req, res) => {
   try {
-    const { status } = req.query;
+    const { status, patientId } = req.query;
     const query = {};
     if (status) query.status = status;
+    if (patientId) {
+      const user = await User.findOne({ patientId }).select('_id');
+      if (user) query.patient_id = user._id;
+    }
     const items = await Feedback.find(query).populate('patient_id', 'name email phone').populate('doctor_id', 'name').sort({ createdAt: -1 });
     res.json({ items });
   } catch (error) {
@@ -2445,7 +2675,7 @@ router.post('/doctor-schedules/:doctorId/bulk', adminMiddleware, async (req, res
             end_time: '14:00'
           },
           slot_duration: scheduleTemplate.slotDuration || 30,
-          max_patients_per_slot: scheduleTemplate.maxPatientsPerSlot || 1,
+          max_patients_per_slot: scheduleTemplate.maxPatientsPerSlot || 20, // Default to 20 patients
           // Session-based scheduling
           morning_session: scheduleTemplate.morningSession || {
             available: true,
@@ -2753,7 +2983,8 @@ router.get('/payments', adminMiddleware, async (req, res) => {
       limit = 20,
       status = '',
       method = '',
-      date = ''
+      date = '',
+      patientId = ''
     } = req.query;
 
     const pageNum = Math.max(1, parseInt(page));
@@ -2762,12 +2993,25 @@ router.get('/payments', adminMiddleware, async (req, res) => {
     const query = {};
     if (status) query.payment_status = status;
     if (method) query.paymentMethod = method;
+    if (patientId) {
+      // match either main account or family member code
+      const users = await User.find({ patientId }).select('_id');
+      const FamilyMember = mongoose.model('FamilyMember');
+      const fam = await FamilyMember.findOne({ patientId }).select('_id');
+      if (users.length) query.patient_id = users[0]._id;
+      if (fam) query.family_member_id = fam._id;
+    }
     if (date) {
       const startDate = new Date(date);
       startDate.setHours(0, 0, 0, 0);
       const endDate = new Date(date);
       endDate.setHours(23, 59, 59, 999);
-      query.createdAt = { $gte: startDate, $lte: endDate };
+      // Filter by payment date if available, otherwise by appointment/creation date
+      query.$or = [
+        { paid_at: { $gte: startDate, $lte: endDate } },
+        { booking_date: { $gte: startDate, $lte: endDate } },
+        { createdAt: { $gte: startDate, $lte: endDate } }
+      ];
     }
 
     const total = await Token.countDocuments(query);
@@ -3077,6 +3321,256 @@ router.get('/messages/stats', adminMiddleware, async (req, res) => {
   } catch (error) {
     console.error('Get message stats error:', error);
     res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get all schedule requests
+router.get('/schedule-requests', adminMiddleware, async (req, res) => {
+  try {
+    // Get doctor names for each request
+    const scheduleRequests = global.scheduleRequests || [];
+    const requestsWithDoctorNames = await Promise.all(
+      scheduleRequests.map(async (request) => {
+        const doctor = await User.findById(request.doctorId);
+        return {
+          ...request,
+          doctorName: doctor ? doctor.name : 'Unknown Doctor',
+          doctorEmail: doctor ? doctor.email : 'Unknown Email'
+        };
+      })
+    );
+
+    res.json({
+      success: true,
+      requests: requestsWithDoctorNames
+    });
+  } catch (error) {
+    console.error('Error fetching schedule requests:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch schedule requests' });
+  }
+});
+
+// Approve schedule request
+router.post('/schedule-requests/:requestId/approve', adminMiddleware, async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    const scheduleRequests = global.scheduleRequests || [];
+    const request = scheduleRequests.find(r => r.id === requestId);
+    
+    if (!request) {
+      return res.status(404).json({ success: false, message: 'Request not found' });
+    }
+
+    console.log('📝 Approving schedule request:', request.type, 'for doctor:', request.doctorId);
+    console.log('📝 Request data:', JSON.stringify(request, null, 2));
+
+    if (request.type === 'cancel') {
+      // Delete the schedule
+      const deletedSchedule = await DoctorSchedule.findByIdAndDelete(request.scheduleId);
+      console.log('✅ Deleted schedule:', deletedSchedule?._id);
+    } else if (request.type === 'reschedule') {
+      try {
+        // For reschedule, we need to update the original schedule (the one being rescheduled)
+        // The newSchedule.date contains the date the doctor wants to reschedule TO
+        // The request.date contains the original date being rescheduled
+        
+        console.log('🔄 Processing reschedule request...');
+        
+        // First, get the original schedule to understand what we're rescheduling
+        const originalSchedule = await DoctorSchedule.findById(request.scheduleId);
+        if (!originalSchedule) {
+          console.log('❌ Original schedule not found:', request.scheduleId);
+          return res.status(404).json({ success: false, message: 'Original schedule not found' });
+        }
+      
+      console.log('📅 Original schedule date:', originalSchedule.date);
+      console.log('📅 Request original date:', request.date);
+      console.log('📅 New schedule date requested:', request.newSchedule.date);
+      
+      // Cancel/remove the original schedule (the date being rescheduled FROM)
+      const originalDate = new Date(request.date || originalSchedule.date);
+      originalDate.setHours(0, 0, 0, 0);
+      
+      // Delete the original schedule since it's being rescheduled
+      const deletedSchedule = await DoctorSchedule.findByIdAndDelete(request.scheduleId);
+      console.log('✅ Deleted original schedule:', deletedSchedule?._id, 'from date', originalDate);
+      
+      // Create/update the new schedule for the rescheduled date
+      const newScheduleDate = new Date(request.newSchedule.date);
+      newScheduleDate.setHours(0, 0, 0, 0);
+      
+      // Check if schedule already exists for the new date
+      let newSchedule = await DoctorSchedule.findOne({
+        doctor_id: originalSchedule.doctor_id,
+        date: newScheduleDate
+      });
+      
+      if (newSchedule) {
+        // Update existing schedule
+        newSchedule = await DoctorSchedule.findByIdAndUpdate(newSchedule._id, {
+        is_available: request.newSchedule.isAvailable,
+        working_hours: request.newSchedule.workingHours,
+        break_time: request.newSchedule.breakTime,
+        slot_duration: request.newSchedule.slotDuration,
+          max_patients_per_slot: 20,
+        leave_reason: request.newSchedule.leaveReason,
+          notes: `Rescheduled from ${originalSchedule.date.toISOString().split('T')[0]} to ${request.newSchedule.date}`,
+        updated_at: new Date()
+      }, { new: true });
+        console.log('✅ Updated existing schedule:', newSchedule?._id, 'for date', newScheduleDate);
+      } else {
+        // Create new schedule for the new date
+        newSchedule = new DoctorSchedule({
+          doctor_id: originalSchedule.doctor_id,
+          date: newScheduleDate,
+          is_available: request.newSchedule.isAvailable,
+          working_hours: request.newSchedule.workingHours,
+          break_time: request.newSchedule.breakTime,
+          slot_duration: request.newSchedule.slotDuration,
+          max_patients_per_slot: 20,
+          leave_reason: request.newSchedule.leaveReason,
+          notes: `Rescheduled from ${originalSchedule.date.toISOString().split('T')[0]} to ${request.newSchedule.date}`,
+          created_at: new Date(),
+          updated_at: new Date()
+        });
+        await newSchedule.save();
+        console.log('✅ Created new schedule:', newSchedule?._id, 'for date', newScheduleDate);
+      }
+      } catch (rescheduleError) {
+        console.error('❌ Error processing reschedule request:', rescheduleError);
+        return res.status(500).json({ success: false, message: 'Failed to process reschedule request: ' + rescheduleError.message });
+      }
+    }
+
+    // Remove the request from the array
+    global.scheduleRequests = global.scheduleRequests.filter(r => r.id !== requestId);
+
+    // Notify real-time updates
+    if (global.realtimeSyncService) {
+      global.realtimeSyncService.notifyScheduleUpdate(request.doctorId, {
+        type: 'schedule_updated',
+        requestType: request.type,
+        doctorId: request.doctorId
+      });
+    }
+
+    res.json({ success: true, message: 'Schedule request approved successfully' });
+  } catch (error) {
+    console.error('Error approving schedule request:', error);
+    res.status(500).json({ success: false, message: 'Failed to approve schedule request' });
+  }
+});
+
+// Reject schedule request
+router.post('/schedule-requests/:requestId/reject', adminMiddleware, async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    const scheduleRequests = global.scheduleRequests || [];
+    const request = scheduleRequests.find(r => r.id === requestId);
+    
+    if (!request) {
+      return res.status(404).json({ success: false, message: 'Request not found' });
+    }
+
+    // Remove the request from the array
+    global.scheduleRequests = global.scheduleRequests.filter(r => r.id !== requestId);
+
+    res.json({ success: true, message: 'Schedule request rejected successfully' });
+  } catch (error) {
+    console.error('Error rejecting schedule request:', error);
+    res.status(500).json({ success: false, message: 'Failed to reject schedule request' });
+  }
+});
+
+// ==================== AUTOMATIC APPOINTMENT CANCELLATION ENDPOINTS ====================
+
+// Get cron service status
+router.get('/cron/status', extractToken, async (req, res) => {
+  try {
+    const status = cronService.getStatus();
+    res.json({
+      success: true,
+      status
+    });
+  } catch (error) {
+    console.error('Error getting cron status:', error);
+    res.status(500).json({ success: false, message: 'Failed to get cron status' });
+  }
+});
+
+// Manually trigger cancellation check
+router.post('/cron/trigger-cancellation', extractToken, async (req, res) => {
+  try {
+    console.log('🔧 Admin manually triggered cancellation check');
+    await cronService.triggerCancellationCheck();
+    
+    res.json({
+      success: true,
+      message: 'Cancellation check triggered successfully'
+    });
+  } catch (error) {
+    console.error('Error triggering cancellation check:', error);
+    res.status(500).json({ success: false, message: 'Failed to trigger cancellation check' });
+  }
+});
+
+// Manually cancel all past appointments
+router.post('/cron/cancel-past-appointments', extractToken, async (req, res) => {
+  try {
+    console.log('🔧 Admin manually triggered past appointments cancellation');
+    const appointmentCancellationService = require('../services/appointmentCancellationService');
+    const cancelledCount = await appointmentCancellationService.cancelPreviousDaysAppointments();
+    
+    res.json({
+      success: true,
+      message: `Successfully cancelled ${cancelledCount} past appointments`,
+      cancelledCount
+    });
+  } catch (error) {
+    console.error('Error cancelling past appointments:', error);
+    res.status(500).json({ success: false, message: 'Failed to cancel past appointments' });
+  }
+});
+
+// Get cancellation statistics
+router.get('/cron/cancellation-stats', extractToken, async (req, res) => {
+  try {
+    const stats = await cronService.getCancellationStats();
+    res.json({
+      success: true,
+      stats
+    });
+  } catch (error) {
+    console.error('Error getting cancellation stats:', error);
+    res.status(500).json({ success: false, message: 'Failed to get cancellation stats' });
+  }
+});
+
+// Start cron service
+router.post('/cron/start', extractToken, async (req, res) => {
+  try {
+    cronService.start();
+    res.json({
+      success: true,
+      message: 'Cron service started successfully'
+    });
+  } catch (error) {
+    console.error('Error starting cron service:', error);
+    res.status(500).json({ success: false, message: 'Failed to start cron service' });
+  }
+});
+
+// Stop cron service
+router.post('/cron/stop', extractToken, async (req, res) => {
+  try {
+    cronService.stop();
+    res.json({
+      success: true,
+      message: 'Cron service stopped successfully'
+    });
+  } catch (error) {
+    console.error('Error stopping cron service:', error);
+    res.status(500).json({ success: false, message: 'Failed to stop cron service' });
   }
 });
 

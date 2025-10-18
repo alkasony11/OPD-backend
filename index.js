@@ -2,9 +2,19 @@ require('dotenv').config();
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
+const http = require("http");
+const { Server } = require("socket.io");
 // Seed file removed - use admin panel to create doctors instead
 
 const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: ['http://localhost:5173', 'http://localhost:5174', 'http://localhost:5175', 'http://localhost:5176', 'http://localhost:5177', 'http://127.0.0.1:5173', 'http://127.0.0.1:5174', 'http://127.0.0.1:5175', 'http://127.0.0.1:5176', 'http://127.0.0.1:5177'],
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    credentials: true
+  }
+});
 const PORT = 5001;
 
 // Middleware
@@ -37,6 +47,46 @@ console.log(`Connecting to MongoDB at ${mongoUri.includes('mongodb+srv') ? 'Atla
 mongoose.connect(mongoUri).then(() => {
     console.log("Connected to MongoDB");
 }).catch(err => console.error("Database connection error:", err));
+
+// Initialize Socket.IO and realtime sync service
+const RealtimeSyncService = require('./src/services/realtimeSyncService');
+const realtimeSyncService = new RealtimeSyncService(io);
+global.realtimeSyncService = realtimeSyncService;
+
+// Socket.IO connection handling
+io.on('connection', (socket) => {
+  console.log('🔌 Client connected:', socket.id);
+
+  // Handle room joining
+  socket.on('join-admin', () => {
+    socket.join('admin');
+    console.log('👤 Admin joined:', socket.id);
+  });
+
+  socket.on('join-doctor', () => {
+    socket.join('doctor');
+    console.log('👤 Doctor joined:', socket.id);
+  });
+
+  socket.on('join-patient', () => {
+    socket.join('patient');
+    console.log('👤 Patient joined:', socket.id);
+  });
+
+  socket.on('join-doctor-room', (doctorId) => {
+    socket.join(`doctor-${doctorId}`);
+    console.log(`👤 Doctor ${doctorId} joined their room:`, socket.id);
+  });
+
+  socket.on('join-patient-room', (patientId) => {
+    socket.join(`patient-${patientId}`);
+    console.log(`👤 Patient ${patientId} joined their room:`, socket.id);
+  });
+
+  socket.on('disconnect', () => {
+    console.log('🔌 Client disconnected:', socket.id);
+  });
+});
 
 // Import routes
 console.log("Loading auth routes...");
@@ -81,10 +131,29 @@ console.log("WhatsApp routes loaded, registering...");
 app.use("/api/whatsapp", whatsappRoutes);
 console.log("WhatsApp routes registered successfully");
 
+console.log("Loading notification routes...");
+const notificationRoutes = require("./src/routes/notifications.js");
+console.log("Notification routes loaded, registering...");
+app.use("/api/notifications", notificationRoutes);
+console.log("Notification routes registered successfully");
+
+console.log("Loading diagnosis routes...");
+const diagnosisRoutes = require("./src/routes/diagnosis.js");
+console.log("Diagnosis routes loaded, registering...");
+app.use("/api/diagnosis", diagnosisRoutes);
+console.log("Diagnosis routes registered successfully");
+
+console.log("Loading debug routes...");
+const debugRoutes = require("./src/routes/debug.js");
+console.log("Debug routes loaded, registering...");
+app.use("/api/debug", debugRoutes);
+console.log("Debug routes registered successfully");
+
 
 // Start server
-app.listen(PORT, async () => {
+server.listen(PORT, async () => {
     console.log(`Server running at http://localhost:${PORT}`);
+    console.log(`Socket.IO server ready for real-time connections`);
 
     // Test email configuration
     const { testEmailConfig } = require('./src/config/email');
@@ -98,6 +167,11 @@ app.listen(PORT, async () => {
     }
 
     console.log('✅ Server ready! Use admin panel to create doctors and manage users.');
+    
+    // Start cron service for automatic appointment cancellations
+    const cronService = require('./src/services/cronService');
+    cronService.start();
+    console.log('⏰ Automatic appointment cancellation service started');
 });
 
 
