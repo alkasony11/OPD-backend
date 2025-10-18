@@ -42,7 +42,7 @@ app.get('/test', (req, res) => {
 });
 
 // Connect to MongoDB
-const mongoUri = process.env.MONGODB_URI || 'mongodb://localhost:27017/opd';
+const mongoUri = process.env.MONGODB_URI ;
 console.log(`Connecting to MongoDB at ${mongoUri.includes('mongodb+srv') ? 'Atlas cluster (from env)' : mongoUri}`);
 mongoose.connect(mongoUri).then(() => {
     console.log("Connected to MongoDB");
