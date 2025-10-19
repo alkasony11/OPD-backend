@@ -253,7 +253,7 @@ router.post('/register', async (req, res) => {
 // Login
 router.post('/login', async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { email, password, rememberMe } = req.body;
     
     if (process.env.NODE_ENV !== 'production') {
       console.log('Login attempt for:', email);
@@ -309,10 +309,12 @@ router.post('/login', async (req, res) => {
     }
 
     // Create token with role information
+    // Set expiration based on remember me flag
+    const tokenExpiration = rememberMe ? '30d' : '1d';
     const token = jwt.sign({
       userId: user._id,
       role: user.role
-    }, process.env.JWT_SECRET || 'your_jwt_secret', { expiresIn: '1d' });
+    }, process.env.JWT_SECRET || 'your_jwt_secret', { expiresIn: tokenExpiration });
 
     if (process.env.NODE_ENV !== 'production') {
       console.log('Login successful');
