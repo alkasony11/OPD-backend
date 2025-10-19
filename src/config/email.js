@@ -1,7 +1,7 @@
-const nodemailer = require('nodemailer');
+const emailService = require('../services/emailService');
 require('dotenv').config();
 
-// Simple Gmail SMTP configuration
+// Legacy support - maintain backward compatibility
 const emailConfig = {
   service: 'gmail',
   auth: {
@@ -10,26 +10,42 @@ const emailConfig = {
   }
 };
 
-// Create transporter
-const transporter = nodemailer.createTransport(emailConfig);
-
 // Test email configuration
 const testEmailConfig = async () => {
-  try {
-    await transporter.verify();
-    console.log('✅ Email configuration is valid');
+  const status = await emailService.getStatus();
+  
+  if (status.available) {
+    console.log('✅ Email service is available');
+    console.log(`   SMTP: ${status.smtp ? '✅' : '❌'}`);
+    console.log(`   SendGrid: ${status.sendgrid ? '✅' : '❌'}`);
     return true;
-  } catch (error) {
-    console.error('❌ Email configuration error:', error.message);
+  } else {
+    console.error('❌ No email service available');
     console.log('📧 To set up email, create a .env file with:');
-    console.log('   EMAIL_USER=your-gmail@gmail.com');
-    console.log('   EMAIL_PASS=your-app-password');
+    console.log('   For SMTP:');
+    console.log('     EMAIL_USER=your-gmail@gmail.com');
+    console.log('     EMAIL_PASS=your-app-password');
+    console.log('   For SendGrid:');
+    console.log('     SENDGRID_API_KEY=your-sendgrid-api-key');
+    console.log('     SENDGRID_FROM_EMAIL=your-verified-email@domain.com');
     return false;
+  }
+};
+
+// Legacy transporter for backward compatibility
+const transporter = {
+  sendMail: async (mailOptions) => {
+    const result = await emailService.sendEmail(mailOptions);
+    if (!result.success) {
+      throw new Error(result.error);
+    }
+    return result.result;
   }
 };
 
 module.exports = {
   transporter,
   testEmailConfig,
-  emailConfig
+  emailConfig,
+  emailService
 };

@@ -8,6 +8,7 @@ const DoctorSchedule = require('../models/DoctorSchedule');
 const LeaveRequest = require('../models/LeaveRequest');
 const DoctorStats = require('../models/DoctorStats');
 const DoctorStatsService = require('../services/doctorStatsService');
+const CloudinaryService = require('../services/cloudinaryService');
 const { authMiddleware } = require('../middleware/authMiddleware');
 const ConsultationRecord = require('../models/ConsultationRecord');
 
@@ -59,6 +60,25 @@ const docUpload = multer({
   fileFilter: function (req, file, cb) {
     const allowed = ['application/pdf', 'image/jpeg', 'image/jpg', 'image/png'];
     if (allowed.includes(file.mimetype)) cb(null, true); else cb(new Error('Only PDF/JPG/PNG allowed'));
+  }
+});
+
+// Multer configuration for doctor profile photos (memory storage for Cloudinary)
+const profilePhotoStorage = multer.memoryStorage();
+
+const profilePhotoUpload = multer({
+  storage: profilePhotoStorage,
+  limits: {
+    fileSize: 5 * 1024 * 1024 // 5MB limit
+  },
+  fileFilter: function (req, file, cb) {
+    // Only allow JPG and PNG files
+    const allowedTypes = ['image/jpeg', 'image/jpg', 'image/png'];
+    if (allowedTypes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only JPG and PNG files are allowed'), false);
+    }
   }
 });
 
@@ -1836,6 +1856,98 @@ router.get('/appointments/:appointmentId/consultation', authMiddleware, async (r
       success: false, 
       message: 'Failed to fetch consultation record' 
     });
+  }
+});
+
+// Upload doctor profile photo
+router.post('/upload-photo', authMiddleware, doctorMiddleware, profilePhotoUpload.single('profilePhoto'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: 'No photo uploaded' });
+    }
+
+    // Get current doctor to check for existing photo
+    const doctor = await User.findById(req.doctor._id);
+    
+    // Delete old photo from Cloudinary if exists
+    if (doctor.profile_photo && doctor.profile_photo.includes('cloudinary.com')) {
+      const publicId = CloudinaryService.extractPublicId(doctor.profile_photo);
+      if (publicId) {
+        await CloudinaryService.deleteImage(publicId);
+      }
+    }
+    
+    // Upload new photo to Cloudinary
+    const tempFilePath = path.join(__dirname, '../../temp', `temp-${Date.now()}-${req.file.originalname}`);
+    
+    // Ensure temp directory exists
+    const tempDir = path.dirname(tempFilePath);
+    if (!fs.existsSync(tempDir)) {
+      fs.mkdirSync(tempDir, { recursive: true });
+    }
+    
+    // Write buffer to temporary file
+    fs.writeFileSync(tempFilePath, req.file.buffer);
+    
+    // Upload to Cloudinary
+    const publicId = `doctor-profile-${req.doctor._id}-${Date.now()}`;
+    const uploadResult = await CloudinaryService.uploadImage(tempFilePath, 'opd-profiles', publicId);
+    
+    if (!uploadResult.success) {
+      return res.status(500).json({ message: 'Failed to upload photo to cloud storage' });
+    }
+    
+    // Update doctor with new photo URL
+    await User.findByIdAndUpdate(req.doctor._id, {
+      $set: { 
+        profile_photo: uploadResult.url,
+        profileImage: uploadResult.url // Also set profileImage for compatibility
+      }
+    });
+
+    res.json({ 
+      message: 'Photo uploaded successfully', 
+      photoUrl: uploadResult.url 
+    });
+  } catch (error) {
+    console.error('Upload photo error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Remove doctor profile photo
+router.delete('/remove-photo', authMiddleware, doctorMiddleware, async (req, res) => {
+  try {
+    const doctor = await User.findById(req.doctor._id);
+    
+    if (doctor.profile_photo) {
+      // Delete from Cloudinary if it's a Cloudinary URL
+      if (doctor.profile_photo.includes('cloudinary.com')) {
+        const publicId = CloudinaryService.extractPublicId(doctor.profile_photo);
+        if (publicId) {
+          await CloudinaryService.deleteImage(publicId);
+        }
+      } else {
+        // Remove old local file if it exists
+        const photoPath = path.join(__dirname, '../../', doctor.profile_photo);
+        if (fs.existsSync(photoPath)) {
+          fs.unlinkSync(photoPath);
+        }
+      }
+      
+      // Remove photo reference from database
+      await User.findByIdAndUpdate(req.doctor._id, {
+        $unset: { 
+          profile_photo: 1,
+          profileImage: 1 
+        }
+      });
+    }
+
+    res.json({ message: 'Photo removed successfully' });
+  } catch (error) {
+    console.error('Remove photo error:', error);
+    res.status(500).json({ message: 'Server error' });
   }
 });
 

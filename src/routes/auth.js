@@ -3,6 +3,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { User, OTP, PasswordResetToken } = require('../models/User');
 const { transporter } = require('../config/email');
+const CloudinaryService = require('../services/cloudinaryService');
 const crypto = require('crypto');
 
 const router = express.Router();
@@ -395,7 +396,24 @@ router.post('/clerk-sync', async (req, res) => {
       }
       user.name = name || user.name;
       user.phone = phone || user.phone;
-      user.profileImage = profileImage || user.profileImage;
+      
+      // Handle profile image upload to Cloudinary
+      if (profileImage && profileImage !== user.profileImage) {
+        try {
+          const uploadResult = await CloudinaryService.uploadGoogleProfileImage(profileImage, user._id.toString());
+          if (uploadResult.success) {
+            user.profileImage = uploadResult.url;
+            user.profile_photo = uploadResult.url; // Also set profile_photo for compatibility
+          } else {
+            console.error('Failed to upload Google profile image:', uploadResult.error);
+            user.profileImage = profileImage; // Fallback to original URL
+          }
+        } catch (error) {
+          console.error('Error uploading Google profile image:', error);
+          user.profileImage = profileImage; // Fallback to original URL
+        }
+      }
+      
       user.isVerified = true;
       user.authProvider = 'clerk';
 
@@ -413,12 +431,30 @@ router.post('/clerk-sync', async (req, res) => {
       isNewUser = true;
       const userRole = email === process.env.ADMIN_EMAIL ? 'admin' : 'patient';
 
+      // Handle profile image upload to Cloudinary for new users
+      let finalProfileImage = '';
+      if (profileImage) {
+        try {
+          const uploadResult = await CloudinaryService.uploadGoogleProfileImage(profileImage, 'temp-' + Date.now());
+          if (uploadResult.success) {
+            finalProfileImage = uploadResult.url;
+          } else {
+            console.error('Failed to upload Google profile image for new user:', uploadResult.error);
+            finalProfileImage = profileImage; // Fallback to original URL
+          }
+        } catch (error) {
+          console.error('Error uploading Google profile image for new user:', error);
+          finalProfileImage = profileImage; // Fallback to original URL
+        }
+      }
+
       user = new User({
         clerkId,
         email,
         name: name || 'User',
         phone: phone || '',
-        profileImage: profileImage || '',
+        profileImage: finalProfileImage,
+        profile_photo: finalProfileImage, // Also set profile_photo for compatibility
         isVerified: true,
         authProvider: 'clerk',
         role: userRole,

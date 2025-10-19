@@ -227,52 +227,6 @@ router.post('/send-hospital-info', async (req, res) => {
   }
 });
 
-// Send interactive message with quick reply buttons
-router.post('/send-interactive', async (req, res) => {
-  try {
-    const { phoneNumber, message, buttons } = req.body;
-    
-    if (!phoneNumber || !message) {
-      return res.status(400).json({ error: 'Phone number and message are required' });
-    }
-
-    const result = await whatsappBotService.sendInteractiveMessage(phoneNumber, message, buttons);
-    
-    res.json({
-      success: true,
-      message: 'Interactive message sent successfully',
-      result
-    });
-  } catch (error) {
-    console.error('Send interactive message error:', error);
-    res.status(500).json({ 
-      success: false,
-      error: 'Failed to send interactive message'
-    });
-  }
-});
-
-// Send welcome message with quick actions
-router.post('/send-welcome/:phoneNumber', async (req, res) => {
-  try {
-    const { phoneNumber } = req.params;
-    
-    const result = await whatsappBotService.sendWelcomeMessage(phoneNumber);
-    
-    res.json({
-      success: true,
-      message: 'Welcome message sent successfully',
-      result
-    });
-  } catch (error) {
-    console.error('Send welcome message error:', error);
-    res.status(500).json({ 
-      success: false,
-      error: 'Failed to send welcome message'
-    });
-  }
-});
-
 // Get WhatsApp bot status
 router.get('/status', (req, res) => {
   res.json({
@@ -286,11 +240,7 @@ router.get('/status', (req, res) => {
       'Send cancellation confirmations',
       'Send queue updates',
       'Send emergency information',
-      'Send hospital information',
-      'Send interactive messages',
-      'Send welcome messages',
-      'Handle quick replies',
-      'Handle list selections'
+      'Send hospital information'
     ]
   });
 });

@@ -96,6 +96,20 @@ const userSchema = new mongoose.Schema({
       language: { type: String, default: 'en' }
     }
   },
+  settings: {
+    notifications: {
+      emailNotifications: { type: Boolean, default: true },
+      smsNotifications: { type: Boolean, default: true },
+      appointmentReminders: { type: Boolean, default: true },
+      prescriptionReady: { type: Boolean, default: true },
+      paymentReminders: { type: Boolean, default: true }
+    },
+    privacy: {
+      profileVisibility: { type: String, enum: ['public', 'private'], default: 'private' },
+      shareMedicalData: { type: Boolean, default: false },
+      allowDataCollection: { type: Boolean, default: true }
+    }
+  },
   isActive: { type: Boolean, default: true },
   deactivatedAt: { type: Date },
   clerkId: { type: String },

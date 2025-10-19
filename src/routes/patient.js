@@ -13,6 +13,7 @@ const SymptomAnalysisService = require('../services/symptomAnalysisService');
 const whatsappBotService = require('../services/whatsappBotService');
 const notificationService = require('../services/notificationService');
 const meetingLinkService = require('../services/meetingLinkService');
+const CloudinaryService = require('../services/cloudinaryService');
 const { isSessionBookable, getSessionInfo, parseTime, formatTime, getBookingCutoffMessage, generateSequentialTokenNumber } = require('../utils/bookingUtils');
 const crypto = require('crypto');
 const multer = require('multer');
@@ -20,25 +21,13 @@ const path = require('path');
 const fs = require('fs');
 let Razorpay; try { Razorpay = require('razorpay'); } catch { Razorpay = null; }
 
-// Configure multer for file uploads
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    const uploadPath = path.join(__dirname, '../../uploads/profile-photos');
-    if (!fs.existsSync(uploadPath)) {
-      fs.mkdirSync(uploadPath, { recursive: true });
-    }
-    cb(null, uploadPath);
-  },
-  filename: function (req, file, cb) {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, 'profile-' + uniqueSuffix + path.extname(file.originalname));
-  }
-});
+// Configure multer for file uploads (memory storage for Cloudinary)
+const storage = multer.memoryStorage();
 
 const upload = multer({
   storage: storage,
   limits: {
-    fileSize: 2 * 1024 * 1024 // 2MB limit as per requirements
+    fileSize: 5 * 1024 * 1024 // 5MB limit
   },
   fileFilter: function (req, file, cb) {
     // Only allow JPG and PNG files
@@ -2941,22 +2930,46 @@ router.post('/upload-photo', authMiddleware, patientMiddleware, upload.single('p
       return res.status(400).json({ message: 'No photo uploaded' });
     }
 
-    const profilePhoto = `/uploads/profile-photos/${req.file.filename}`;
-    
-    // Remove old photo if exists
+    // Get current user to check for existing photo
     const user = await User.findById(req.patient._id);
-    if (user.profile_photo) {
-      const oldPhotoPath = path.join(__dirname, '../../', user.profile_photo);
-      if (fs.existsSync(oldPhotoPath)) {
-        fs.unlinkSync(oldPhotoPath);
+    
+    // Delete old photo from Cloudinary if exists
+    if (user.profile_photo && user.profile_photo.includes('cloudinary.com')) {
+      const publicId = CloudinaryService.extractPublicId(user.profile_photo);
+      if (publicId) {
+        await CloudinaryService.deleteImage(publicId);
       }
     }
     
+    // Upload new photo to Cloudinary
+    const tempFilePath = path.join(__dirname, '../../temp', `temp-${Date.now()}-${req.file.originalname}`);
+    
+    // Ensure temp directory exists
+    const tempDir = path.dirname(tempFilePath);
+    if (!fs.existsSync(tempDir)) {
+      fs.mkdirSync(tempDir, { recursive: true });
+    }
+    
+    // Write buffer to temporary file
+    fs.writeFileSync(tempFilePath, req.file.buffer);
+    
+    // Upload to Cloudinary
+    const publicId = `patient-profile-${req.patient._id}-${Date.now()}`;
+    const uploadResult = await CloudinaryService.uploadImage(tempFilePath, 'opd-profiles', publicId);
+    
+    if (!uploadResult.success) {
+      return res.status(500).json({ message: 'Failed to upload photo to cloud storage' });
+    }
+    
+    // Update user with new photo URL
     await User.findByIdAndUpdate(req.patient._id, {
-      $set: { profile_photo: profilePhoto }
+      $set: { profile_photo: uploadResult.url }
     });
 
-    res.json({ message: 'Photo uploaded successfully', profilePhoto });
+    res.json({ 
+      message: 'Photo uploaded successfully', 
+      profilePhoto: uploadResult.url 
+    });
   } catch (error) {
     console.error('Upload photo error:', error);
     res.status(500).json({ message: 'Server error' });
@@ -2969,10 +2982,18 @@ router.delete('/remove-photo', authMiddleware, patientMiddleware, async (req, re
     const user = await User.findById(req.patient._id);
     
     if (user.profile_photo) {
-      // Remove file from filesystem
-      const photoPath = path.join(__dirname, '../../', user.profile_photo);
-      if (fs.existsSync(photoPath)) {
-        fs.unlinkSync(photoPath);
+      // Delete from Cloudinary if it's a Cloudinary URL
+      if (user.profile_photo.includes('cloudinary.com')) {
+        const publicId = CloudinaryService.extractPublicId(user.profile_photo);
+        if (publicId) {
+          await CloudinaryService.deleteImage(publicId);
+        }
+      } else {
+        // Remove old local file if it exists
+        const photoPath = path.join(__dirname, '../../', user.profile_photo);
+        if (fs.existsSync(photoPath)) {
+          fs.unlinkSync(photoPath);
+        }
       }
       
       // Remove photo reference from database
@@ -3608,6 +3629,263 @@ router.patch('/password', authMiddleware, patientMiddleware, async (req, res) =>
   } catch (error) {
     console.error('Change password error:', error);
     res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ===== SETTINGS API ENDPOINTS =====
+
+// Get patient settings
+router.get('/settings', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    const user = await User.findById(req.patient._id).select('settings');
+    
+    const defaultSettings = {
+      notifications: {
+        emailNotifications: true,
+        smsNotifications: true,
+        appointmentReminders: true,
+        prescriptionReady: true,
+        paymentReminders: true
+      },
+      privacy: {
+        profileVisibility: 'private',
+        shareMedicalData: false,
+        allowDataCollection: true
+      }
+    };
+
+    const settings = user.settings || defaultSettings;
+    
+    res.json({
+      success: true,
+      settings: settings
+    });
+  } catch (error) {
+    console.error('Error fetching settings:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch settings'
+    });
+  }
+});
+
+// Update patient settings
+router.put('/settings', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    const { notifications, privacy } = req.body;
+    
+    const updateData = {};
+    if (notifications) {
+      updateData['settings.notifications'] = notifications;
+    }
+    if (privacy) {
+      updateData['settings.privacy'] = privacy;
+    }
+
+    const user = await User.findByIdAndUpdate(
+      req.patient._id,
+      { $set: updateData },
+      { new: true, upsert: true }
+    );
+
+    res.json({
+      success: true,
+      message: 'Settings updated successfully',
+      settings: user.settings
+    });
+  } catch (error) {
+    console.error('Error updating settings:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to update settings'
+    });
+  }
+});
+
+// Get patient invoices for settings page
+router.get('/settings/invoices', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    const invoices = await Appointment.find({
+      patient_id: req.patient._id,
+      paymentStatus: { $in: ['paid', 'pending'] }
+    })
+    .populate('doctor_id', 'name email')
+    .populate('department_id', 'name')
+    .sort({ createdAt: -1 })
+    .select('_id appointmentDate appointmentTime paymentStatus amount doctor_id department_id createdAt');
+
+    const formattedInvoices = invoices.map(appointment => ({
+      id: appointment._id,
+      invoice_number: `INV-${appointment._id.toString().slice(-8).toUpperCase()}`,
+      amount: appointment.amount || 500,
+      payment_status: appointment.paymentStatus,
+      created_at: appointment.createdAt,
+      appointment: {
+        appointmentDate: appointment.appointmentDate,
+        doctorName: appointment.doctor_id?.name || 'Unknown Doctor',
+        departmentName: appointment.department_id?.name || 'Unknown Department'
+      }
+    }));
+
+    res.json({
+      success: true,
+      invoices: formattedInvoices
+    });
+  } catch (error) {
+    console.error('Error fetching invoices for settings:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch invoices'
+    });
+  }
+});
+
+// Get patient appointments for settings page
+router.get('/settings/appointments', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    const appointments = await Appointment.find({
+      patient_id: req.patient._id,
+      status: { $in: ['confirmed', 'pending'] }
+    })
+    .populate('doctor_id', 'name email')
+    .populate('department_id', 'name')
+    .sort({ appointmentDate: 1, appointmentTime: 1 })
+    .select('_id appointmentDate appointmentTime status doctor_id department_id');
+
+    const formattedAppointments = appointments.map(appointment => ({
+      id: appointment._id,
+      appointmentDate: appointment.appointmentDate,
+      appointmentTime: appointment.appointmentTime,
+      status: appointment.status,
+      doctorName: appointment.doctor_id?.name || 'Unknown Doctor',
+      departmentName: appointment.department_id?.name || 'Unknown Department'
+    }));
+
+    res.json({
+      success: true,
+      appointments: formattedAppointments
+    });
+  } catch (error) {
+    console.error('Error fetching appointments for settings:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch appointments'
+    });
+  }
+});
+
+// Get consulted appointments for settings page
+router.get('/settings/consulted-appointments', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    const appointments = await Appointment.find({
+      patient_id: req.patient._id,
+      status: 'consulted'
+    })
+    .populate('doctor_id', 'name email')
+    .populate('department_id', 'name')
+    .sort({ appointmentDate: -1 })
+    .select('_id appointmentDate appointmentTime status doctor_id department_id diagnosis');
+
+    const formattedAppointments = appointments.map(appointment => ({
+      id: appointment._id,
+      appointmentDate: appointment.appointmentDate,
+      appointmentTime: appointment.appointmentTime,
+      status: appointment.status,
+      doctorName: appointment.doctor_id?.name || 'Unknown Doctor',
+      departmentName: appointment.department_id?.name || 'Unknown Department',
+      diagnosis: appointment.diagnosis || null
+    }));
+
+    res.json({
+      success: true,
+      appointments: formattedAppointments
+    });
+  } catch (error) {
+    console.error('Error fetching consulted appointments for settings:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch consulted appointments'
+    });
+  }
+});
+
+// Get cancelled appointments for settings page
+router.get('/settings/cancelled-appointments', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    const appointments = await Appointment.find({
+      patient_id: req.patient._id,
+      status: 'cancelled'
+    })
+    .populate('doctor_id', 'name email')
+    .populate('department_id', 'name')
+    .sort({ appointmentDate: -1 })
+    .select('_id appointmentDate appointmentTime status doctor_id department_id cancellationReason');
+
+    const formattedAppointments = appointments.map(appointment => ({
+      id: appointment._id,
+      appointmentDate: appointment.appointmentDate,
+      appointmentTime: appointment.appointmentTime,
+      status: appointment.status,
+      doctorName: appointment.doctor_id?.name || 'Unknown Doctor',
+      departmentName: appointment.department_id?.name || 'Unknown Department',
+      cancellationReason: appointment.cancellationReason || null
+    }));
+
+    res.json({
+      success: true,
+      appointments: formattedAppointments
+    });
+  } catch (error) {
+    console.error('Error fetching cancelled appointments for settings:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch cancelled appointments'
+    });
+  }
+});
+
+// Delete patient account
+router.delete('/account', authMiddleware, patientMiddleware, async (req, res) => {
+  try {
+    const { password } = req.body;
+    
+    // Verify password before deletion
+    const user = await User.findById(req.patient._id);
+    if (!user || !user.password) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid user or no password set'
+      });
+    }
+
+    const isPasswordValid = await bcrypt.compare(password, user.password);
+    if (!isPasswordValid) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid password'
+      });
+    }
+
+    // Delete all related data
+    await Promise.all([
+      // Delete appointments
+      Appointment.deleteMany({ patient_id: req.patient._id }),
+      // Delete family members
+      FamilyMember.deleteMany({ patient_id: req.patient._id }),
+      // Delete user account
+      User.findByIdAndDelete(req.patient._id)
+    ]);
+
+    res.json({
+      success: true,
+      message: 'Account deleted successfully'
+    });
+  } catch (error) {
+    console.error('Error deleting account:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to delete account'
+    });
   }
 });
 
