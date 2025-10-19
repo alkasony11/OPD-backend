@@ -62,3 +62,4 @@ async function testRegistration() {
 // Load environment variables
 require('dotenv').config();
 testRegistration();
+

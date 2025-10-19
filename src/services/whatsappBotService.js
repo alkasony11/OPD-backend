@@ -21,29 +21,18 @@ class WhatsAppBotService {
     try {
       const { from, text, type } = messageData;
       
-      if (type !== 'text') {
-        return this.sendMessage(from, "I can only process text messages. Please send a text message.");
-      }
-
-      // Find user by phone number
-      const user = await User.findOne({ 
-        phone: from.replace('whatsapp:', ''),
-        role: 'patient'
-      });
-
-      if (!user) {
+      // Handle different message types
+      if (type === 'text') {
+        return await this.handleTextMessage(from, text.body);
+      } else if (type === 'button') {
+        return await this.handleButtonMessage(from, text);
+      } else if (type === 'interactive') {
+        return await this.handleInteractiveMessage(from, text);
+      } else {
         return this.sendMessage(from, 
-          "Welcome to MediQ Hospital! I couldn't find your account. " +
-          "Please register on our website or contact our reception for assistance. " +
-          "Visit: http://localhost:5173/register"
+          "I can process text messages and quick replies. Please send a text message or use the quick reply buttons."
         );
       }
-
-      // Process message through chatbot service
-      const response = await chatbotService.processMessage(user._id, text.body);
-      
-      // Send response back to WhatsApp
-      return this.sendMessage(from, response.message);
     } catch (error) {
       console.error('WhatsApp bot error:', error);
       return this.sendMessage(messageData.from, 
@@ -52,36 +41,176 @@ class WhatsAppBotService {
     }
   }
 
+  // Handle text messages
+  async handleTextMessage(from, messageText) {
+    // Clean phone number
+    const cleanPhone = from.replace('whatsapp:', '');
+    
+    // Find user by phone number
+    const user = await User.findOne({ 
+      phone: cleanPhone,
+      role: 'patient'
+    });
+
+    if (!user) {
+      return this.sendMessage(from, 
+        "🏥 *Welcome to MediQ Hospital!*\n\n" +
+        "I couldn't find your account with this phone number.\n\n" +
+        "To get started:\n" +
+        "• Register: http://localhost:5173/register\n" +
+        "• Call Reception: +91-9876543210\n" +
+        "• Visit: 123 Medical Street, Health City\n\n" +
+        "Once registered, I can help you with:\n" +
+        "• Booking appointments\n" +
+        "• Managing your visits\n" +
+        "• Hospital information\n" +
+        "• Emergency contacts\n\n" +
+        "Type *Help* anytime for assistance! 😊"
+      );
+    }
+
+    // Process message through chatbot service
+    const response = await chatbotService.processMessage(user._id, messageText);
+    
+    // Send response back to WhatsApp
+    return this.sendMessage(from, response.message);
+  }
+
+  // Handle button messages (quick replies)
+  async handleButtonMessage(from, buttonData) {
+    const cleanPhone = from.replace('whatsapp:', '');
+    const user = await User.findOne({ phone: cleanPhone, role: 'patient' });
+    
+    if (!user) {
+      return this.sendMessage(from, "Please register first to use quick actions.");
+    }
+
+    const buttonText = buttonData.payload || buttonData.text;
+    
+    switch (buttonText) {
+      case 'BOOK_APPOINTMENT':
+        return this.sendMessage(from, 
+          "📅 *Book Appointment*\n\n" +
+          "To book a new appointment:\n" +
+          "1. Visit: http://localhost:5173/booking\n" +
+          "2. Call: +91-9876543210\n" +
+          "3. Reply with: *Book* for guided booking\n\n" +
+          "What department do you need?"
+        );
+      
+      case 'MY_APPOINTMENTS':
+        return await this.handleTextMessage(from, "my appointments");
+      
+      case 'HOSPITAL_INFO':
+        return await this.handleTextMessage(from, "hospital information");
+      
+      case 'EMERGENCY':
+        return await this.handleTextMessage(from, "emergency");
+      
+      case 'HELP':
+        return await this.handleTextMessage(from, "help");
+      
+      default:
+        return this.sendMessage(from, "I didn't understand that option. Please try again or type *Help*.");
+    }
+  }
+
+  // Handle interactive messages (list selections, etc.)
+  async handleInteractiveMessage(from, interactiveData) {
+    // Handle list selections, quick replies, etc.
+    const cleanPhone = from.replace('whatsapp:', '');
+    const user = await User.findOne({ phone: cleanPhone, role: 'patient' });
+    
+    if (!user) {
+      return this.sendMessage(from, "Please register first to use interactive features.");
+    }
+
+    // Process based on interactive type
+    if (interactiveData.list_reply) {
+      return this.handleListSelection(from, interactiveData.list_reply);
+    } else if (interactiveData.button_reply) {
+      return this.handleButtonMessage(from, interactiveData.button_reply);
+    }
+
+    return this.sendMessage(from, "I didn't understand that selection. Please try again.");
+  }
+
+  // Handle list selections
+  async handleListSelection(from, listData) {
+    const selection = listData.title;
+    
+    // Handle department selection for booking
+    if (selection.includes('Cardiology') || selection.includes('Neurology') || 
+        selection.includes('Orthopedics') || selection.includes('General Medicine')) {
+      return this.sendMessage(from, 
+        `Great choice! You selected *${selection}*.\n\n` +
+        "To book an appointment:\n" +
+        "1. Visit: http://localhost:5173/booking\n" +
+        "2. Select this department\n" +
+        "3. Choose your preferred doctor and time\n\n" +
+        "Or call +91-9876543210 for assistance."
+      );
+    }
+
+    return this.sendMessage(from, `You selected: ${selection}. How can I help you with this?`);
+  }
+
   // Send message to WhatsApp
   async sendMessage(to, message) {
     try {
-      // In a real implementation, you would send this to WhatsApp Business API
-      // For now, we'll just log it
       console.log(`WhatsApp message to ${to}: ${message}`);
       
-      // Simulate API call to WhatsApp
+      // Check if we have WhatsApp API credentials
+      if (!process.env.WHATSAPP_ACCESS_TOKEN || !process.env.WHATSAPP_PHONE_NUMBER_ID) {
+        console.log('WhatsApp API not configured - message logged only');
+        return {
+          messaging_product: "whatsapp",
+          to: to,
+          type: "text",
+          text: { body: message },
+          status: 'logged_only'
+        };
+      }
+
+      // Clean phone number (remove whatsapp: prefix if present)
+      const cleanPhoneNumber = to.replace('whatsapp:', '');
+      
       const response = {
         messaging_product: "whatsapp",
-        to: to,
+        to: cleanPhoneNumber,
         type: "text",
         text: {
           body: message
         }
       };
 
-      // In production, make actual API call:
-      // const result = await fetch(`https://graph.facebook.com/v17.0/${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`, {
-      //   method: 'POST',
-      //   headers: {
-      //     'Authorization': `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}`,
-      //     'Content-Type': 'application/json'
-      //   },
-      //   body: JSON.stringify(response)
-      // });
+      // Make actual API call to WhatsApp Cloud API
+      const result = await fetch(`https://graph.facebook.com/v18.0/${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(response)
+      });
 
-      return response;
+      const responseData = await result.json();
+      
+      if (!result.ok) {
+        console.error('WhatsApp API Error:', responseData);
+        throw new Error(`WhatsApp API Error: ${responseData.error?.message || 'Unknown error'}`);
+      }
+
+      console.log('WhatsApp message sent successfully:', responseData);
+      return responseData;
     } catch (error) {
       console.error('Error sending WhatsApp message:', error);
+      
+      // Fallback: log the message for manual sending
+      console.log('FALLBACK - Message to be sent manually:');
+      console.log(`To: ${to}`);
+      console.log(`Message: ${message}`);
+      
       throw error;
     }
   }
@@ -289,6 +418,108 @@ class WhatsAppBotService {
       `Need more specific information? Just ask!`;
 
     return await this.sendMessage(`whatsapp:${phoneNumber}`, message);
+  }
+
+  // Send interactive message with buttons
+  async sendInteractiveMessage(phoneNumber, message, buttons = []) {
+    try {
+      // Default quick reply buttons if none provided
+      const defaultButtons = [
+        { id: 'BOOK_APPOINTMENT', title: '📅 Book Appointment' },
+        { id: 'MY_APPOINTMENTS', title: '📋 My Appointments' },
+        { id: 'HOSPITAL_INFO', title: '🏥 Hospital Info' },
+        { id: 'EMERGENCY', title: '🚨 Emergency' },
+        { id: 'HELP', title: '❓ Help' }
+      ];
+
+      const quickReplyButtons = buttons.length > 0 ? buttons : defaultButtons;
+
+      const response = {
+        messaging_product: "whatsapp",
+        to: phoneNumber.replace('whatsapp:', ''),
+        type: "interactive",
+        interactive: {
+          type: "button",
+          body: {
+            text: message
+          },
+          action: {
+            buttons: quickReplyButtons.map(button => ({
+              type: "reply",
+              reply: {
+                id: button.id,
+                title: button.title
+              }
+            }))
+          }
+        }
+      };
+
+      // Check if we have WhatsApp API credentials
+      if (!process.env.WHATSAPP_ACCESS_TOKEN || !process.env.WHATSAPP_PHONE_NUMBER_ID) {
+        console.log('WhatsApp API not configured - interactive message logged only');
+        return {
+          ...response,
+          status: 'logged_only'
+        };
+      }
+
+      // Make actual API call to WhatsApp Cloud API
+      const result = await fetch(`https://graph.facebook.com/v18.0/${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(response)
+      });
+
+      const responseData = await result.json();
+      
+      if (!result.ok) {
+        console.error('WhatsApp Interactive API Error:', responseData);
+        throw new Error(`WhatsApp API Error: ${responseData.error?.message || 'Unknown error'}`);
+      }
+
+      console.log('WhatsApp interactive message sent successfully:', responseData);
+      return responseData;
+    } catch (error) {
+      console.error('Error sending interactive WhatsApp message:', error);
+      throw error;
+    }
+  }
+
+  // Send welcome message with quick actions
+  async sendWelcomeMessage(phoneNumber) {
+    const message = `🏥 *Welcome to MediQ Hospital!*\n\n` +
+      `I'm your personal healthcare assistant. I can help you with:\n\n` +
+      `• Booking and managing appointments\n` +
+      `• Checking your queue status\n` +
+      `• Hospital information and timings\n` +
+      `• Emergency contacts\n` +
+      `• And much more!\n\n` +
+      `How can I assist you today?`;
+
+    return await this.sendInteractiveMessage(phoneNumber, message);
+  }
+
+  // Send department list for booking
+  async sendDepartmentList(phoneNumber) {
+    const message = `🏥 *Choose a Department*\n\n` +
+      `Select the department you need to book an appointment for:`;
+
+    const departments = [
+      { id: 'CARDIOLOGY', title: '🫀 Cardiology' },
+      { id: 'NEUROLOGY', title: '🧠 Neurology' },
+      { id: 'ORTHOPEDICS', title: '🦴 Orthopedics' },
+      { id: 'PEDIATRICS', title: '👶 Pediatrics' },
+      { id: 'GYNECOLOGY', title: '👩 Gynecology' },
+      { id: 'DERMATOLOGY', title: '🧴 Dermatology' },
+      { id: 'GENERAL_MEDICINE', title: '🩺 General Medicine' },
+      { id: 'EMERGENCY', title: '🚨 Emergency' }
+    ];
+
+    return await this.sendInteractiveMessage(phoneNumber, message, departments);
   }
 }
 
