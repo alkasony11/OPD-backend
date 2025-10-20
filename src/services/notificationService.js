@@ -467,13 +467,13 @@ class NotificationService {
             <h4>📞 Contact Information</h4>
             <p><strong>Reception:</strong> +91-9876543210</p>
             <p><strong>Emergency:</strong> +91-8589062432 or +91-9061493022</p>
-            <p><strong>Website:</strong> <a href="http://localhost:5173">http://localhost:5173</a></p>
+            <p><strong>Website:</strong> <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}">${process.env.FRONTEND_URL || 'http://localhost:5173'}</a></p>
             <p><strong>Address:</strong> 123 Medical Street, Health City, PIN - 123456</p>
           </div>
           
           <div style="text-align: center; margin: 30px 0;">
-            <a href="http://localhost:5173/appointments" class="button">View My Appointments</a>
-            <a href="http://localhost:5173/chatbot" class="button">Get Help</a>
+            <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}/appointments" class="button">View My Appointments</a>
+            <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}/chatbot" class="button">Get Help</a>
           </div>
           
           <p>Thank you for choosing MediQ Hospital for your healthcare needs. We look forward to serving you!</p>
@@ -509,7 +509,7 @@ class NotificationService {
       Contact Information:
       Reception: +91-9876543210
       Emergency: +91-8589062432 or +91-9061493022
-      Website: http://localhost:5173
+      Website: ${process.env.FRONTEND_URL || 'http://localhost:5173'}
       
       Thank you for choosing MediQ Hospital!
     `;
@@ -672,14 +672,14 @@ class NotificationService {
           </div>
           
           <div style="text-align: center; margin: 30px 0;">
-            <a href="http://localhost:5173/booking" class="button">Book New Appointment</a>
-            <a href="http://localhost:5173/contact" class="button">Contact Us</a>
+            <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}/booking" class="button">Book New Appointment</a>
+            <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}/contact" class="button">Contact Us</a>
           </div>
           
           <p>We sincerely apologize for this inconvenience and appreciate your understanding.</p>
           
           <div class="footer">
-            <p>Contact us: +91-9876543210 | <a href="http://localhost:5173">http://localhost:5173</a></p>
+            <p>Contact us: +91-9876543210 | <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}">${process.env.FRONTEND_URL || 'http://localhost:5173'}</a></p>
             <p>&copy; 2024 MediQ Hospital. All rights reserved.</p>
           </div>
         </div>
@@ -768,7 +768,7 @@ class NotificationService {
           <p>Thank you for choosing MediQ Hospital!</p>
           
           <div class="footer">
-            <p>Contact us: +91-9876543210 | <a href="http://localhost:5173">http://localhost:5173</a></p>
+            <p>Contact us: +91-9876543210 | <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}">${process.env.FRONTEND_URL || 'http://localhost:5173'}</a></p>
           </div>
         </div>
       </body>
@@ -911,14 +911,14 @@ class NotificationService {
             </div>
             
             <div style="text-align: center; margin: 30px 0;">
-              <a href="http://localhost:5173/appointments" class="button">View My Appointments</a>
-              <a href="http://localhost:5173/contact" class="button">Contact Support</a>
+              <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}/appointments" class="button">View My Appointments</a>
+              <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}/contact" class="button">Contact Support</a>
             </div>
             
             <p>We apologize for any inconvenience caused and appreciate your understanding.</p>
             
             <div class="footer">
-              <p>Contact us: +91-9876543210 | <a href="http://localhost:5173">http://localhost:5173</a></p>
+              <p>Contact us: +91-9876543210 | <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}">${process.env.FRONTEND_URL || 'http://localhost:5173'}</a></p>
               <p>&copy; 2024 MediQ Hospital. All rights reserved.</p>
             </div>
           </div>
@@ -1010,14 +1010,14 @@ class NotificationService {
             </div>
             
             <div style="text-align: center; margin: 30px 0;">
-              <a href="http://localhost:5173/appointments" class="button">View My Appointments</a>
-              <a href="http://localhost:5173/contact" class="button">Contact Support</a>
+              <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}/appointments" class="button">View My Appointments</a>
+              <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}/contact" class="button">Contact Support</a>
             </div>
             
             <p>Thank you for choosing MediQ Hospital for your healthcare needs.</p>
             
             <div class="footer">
-              <p>Contact us: +91-9876543210 | <a href="http://localhost:5173">http://localhost:5173</a></p>
+              <p>Contact us: +91-9876543210 | <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}">${process.env.FRONTEND_URL || 'http://localhost:5173'}</a></p>
               <p>&copy; 2024 MediQ Hospital. All rights reserved.</p>
             </div>
           </div>

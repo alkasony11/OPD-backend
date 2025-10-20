@@ -2867,7 +2867,14 @@ router.get('/profile', authMiddleware, patientMiddleware, async (req, res) => {
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
     }
-    res.json({ user });
+    
+    // Add profilePhoto field for frontend compatibility
+    const userWithCompatibility = user.toObject();
+    if (userWithCompatibility.profile_photo && !userWithCompatibility.profilePhoto) {
+      userWithCompatibility.profilePhoto = userWithCompatibility.profile_photo;
+    }
+    
+    res.json({ user: userWithCompatibility });
   } catch (error) {
     console.error('Get profile error:', error);
     res.status(500).json({ message: 'Server error' });
@@ -2958,7 +2965,15 @@ router.post('/upload-photo', authMiddleware, patientMiddleware, upload.single('p
     const uploadResult = await CloudinaryService.uploadImage(tempFilePath, 'opd-profiles', publicId);
     
     if (!uploadResult.success) {
-      return res.status(500).json({ message: 'Failed to upload photo to cloud storage' });
+      // Clean up temp file
+      if (fs.existsSync(tempFilePath)) {
+        fs.unlinkSync(tempFilePath);
+      }
+      
+      return res.status(500).json({ 
+        message: uploadResult.error || 'Failed to upload photo to cloud storage',
+        error: uploadResult.error
+      });
     }
     
     // Update user with new photo URL
@@ -2968,7 +2983,8 @@ router.post('/upload-photo', authMiddleware, patientMiddleware, upload.single('p
 
     res.json({ 
       message: 'Photo uploaded successfully', 
-      profilePhoto: uploadResult.url 
+      profilePhoto: uploadResult.url,
+      profile_photo: uploadResult.url
     });
   } catch (error) {
     console.error('Upload photo error:', error);

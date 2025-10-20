@@ -45,7 +45,7 @@ class WhatsAppBotService {
         return this.sendMessage(from, 
           "Welcome to MediQ Hospital! I couldn't find your account. " +
           "Please register on our website or contact our reception for assistance. " +
-          "Visit: http://localhost:5173/register"
+          `Visit: ${process.env.FRONTEND_URL || 'http://localhost:5173'}/register`
         );
       }
 
@@ -330,7 +330,7 @@ class WhatsAppBotService {
       `**Contact:**\n` +
       `• Reception: +91-9876543210\n` +
       `• Emergency: +91-8589062432 or +91-9061493022\n` +
-      `• Website: http://localhost:5173\n\n` +
+      `• Website: ${process.env.FRONTEND_URL || 'http://localhost:5173'}\n\n` +
       `Need more specific information? Just ask!`;
 
     return await this.sendMessage(`whatsapp:${phoneNumber}`, message);

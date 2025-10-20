@@ -1894,7 +1894,15 @@ router.post('/upload-photo', authMiddleware, doctorMiddleware, profilePhotoUploa
     const uploadResult = await CloudinaryService.uploadImage(tempFilePath, 'opd-profiles', publicId);
     
     if (!uploadResult.success) {
-      return res.status(500).json({ message: 'Failed to upload photo to cloud storage' });
+      // Clean up temp file
+      if (fs.existsSync(tempFilePath)) {
+        fs.unlinkSync(tempFilePath);
+      }
+      
+      return res.status(500).json({ 
+        message: uploadResult.error || 'Failed to upload photo to cloud storage',
+        error: uploadResult.error
+      });
     }
     
     // Update doctor with new photo URL

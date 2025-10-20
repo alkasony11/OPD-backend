@@ -3,11 +3,24 @@ const fs = require('fs');
 const path = require('path');
 
 // Configure Cloudinary
-cloudinary.config({
+const cloudinaryConfig = {
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
   api_secret: process.env.CLOUDINARY_API_SECRET
-});
+};
+
+// Check if Cloudinary is properly configured
+const isCloudinaryConfigured = cloudinaryConfig.cloud_name && 
+  cloudinaryConfig.api_key && 
+  cloudinaryConfig.api_secret &&
+  cloudinaryConfig.cloud_name !== 'your_cloudinary_cloud_name';
+
+if (isCloudinaryConfigured) {
+  cloudinary.config(cloudinaryConfig);
+} else {
+  console.warn('⚠️  Cloudinary not configured. Photo uploads will be disabled.');
+  console.warn('   Please set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET environment variables.');
+}
 
 class CloudinaryService {
   /**
@@ -19,6 +32,14 @@ class CloudinaryService {
    */
   static async uploadImage(filePath, folder = 'opd-profiles', publicId = null) {
     try {
+      // Check if Cloudinary is configured
+      if (!isCloudinaryConfigured) {
+        return {
+          success: false,
+          error: 'Cloudinary not configured. Please set up Cloudinary environment variables.'
+        };
+      }
+
       const options = {
         folder: folder,
         resource_type: 'image',
@@ -61,6 +82,14 @@ class CloudinaryService {
    */
   static async uploadImageFromBuffer(buffer, folder = 'opd-profiles', publicId = null) {
     try {
+      // Check if Cloudinary is configured
+      if (!isCloudinaryConfigured) {
+        return {
+          success: false,
+          error: 'Cloudinary not configured. Please set up Cloudinary environment variables.'
+        };
+      }
+
       const options = {
         folder: folder,
         resource_type: 'image',
@@ -114,6 +143,14 @@ class CloudinaryService {
    */
   static async deleteImage(publicId) {
     try {
+      // Check if Cloudinary is configured
+      if (!isCloudinaryConfigured) {
+        return {
+          success: false,
+          error: 'Cloudinary not configured. Please set up Cloudinary environment variables.'
+        };
+      }
+
       if (!publicId) {
         return { success: false, error: 'Public ID is required' };
       }
