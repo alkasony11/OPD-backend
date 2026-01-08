@@ -11,6 +11,10 @@ const DoctorStatsService = require('../services/doctorStatsService');
 const CloudinaryService = require('../services/cloudinaryService');
 const { authMiddleware } = require('../middleware/authMiddleware');
 const ConsultationRecord = require('../models/ConsultationRecord');
+const notificationService = require('../services/notificationService');
+const RealtimeSyncService = require('../services/realtimeSyncService');
+const Notification = require('../models/Notification');
+const emailService = require('../services/emailService');
 
 // Helper: parse local date string in formats: YYYY-MM-DD or DD-MM-YYYY
 function parseLocalYMD(input) {
@@ -87,8 +91,11 @@ const doctorMiddleware = async (req, res, next) => {
   try {
     console.log('🔍 Doctor middleware - req.user:', req.user);
     console.log('🔍 Doctor middleware - req.user.userId:', req.user?.userId);
+    console.log('🔍 Doctor middleware - req.path:', req.path);
+    console.log('🔍 Doctor middleware - req.method:', req.method);
     
     if (!req.user || !req.user.userId) {
+      console.log('❌ Doctor middleware - No user or userId');
       return res.status(401).json({ message: 'Authentication required' });
     }
     
@@ -96,10 +103,13 @@ const doctorMiddleware = async (req, res, next) => {
     console.log('🔍 Doctor middleware - found user:', user);
     
     if (!user) {
+      console.log('❌ Doctor middleware - User not found in database');
       return res.status(404).json({ message: 'User not found' });
     }
     
+    console.log('🔍 Doctor middleware - User role:', user.role);
     if (user.role !== 'doctor') {
+      console.log('❌ Doctor middleware - User role is not doctor:', user.role);
       return res.status(403).json({ message: 'Access denied. Doctor role required.' });
     }
     
@@ -365,9 +375,12 @@ router.get('/appointments', authMiddleware, doctorMiddleware, async (req, res) =
     } else if (filter === 'cancelled') {
       // For 'cancelled' filter, show cancelled and missed appointments
       query.status = { $in: ['cancelled', 'missed'] };
+    } else if (filter === 'referred') {
+      // For 'referred' filter, show referred appointments
+      query.status = 'referred';
     } else if (filter === 'all') {
-      // For 'all' filter, exclude cancelled, missed, and consulted appointments
-      query.status = { $nin: ['cancelled', 'missed', 'consulted'] };
+      // For 'all' filter, exclude only cancelled and missed appointments
+      query.status = { $nin: ['cancelled', 'missed'] };
     }
     
     console.log('🔍 Query:', JSON.stringify(query, null, 2));
@@ -401,8 +414,8 @@ router.get('/appointments', authMiddleware, doctorMiddleware, async (req, res) =
       appointmentType: apt.appointment_type || 'consultation',
       status: apt.status,
       symptoms: apt.symptoms,
-      doctorNotes: '', // Not in tokens collection
-      diagnosis: '', // Not in tokens collection
+      doctorNotes: apt.doctorNotes || '', // Include doctor notes if available
+      diagnosis: apt.diagnosis || '', // Include diagnosis if available
       token_number: apt.token_number,
       tokenNumber: apt.token_number,
       department: apt.department,
@@ -411,7 +424,10 @@ router.get('/appointments', authMiddleware, doctorMiddleware, async (req, res) =
       estimated_wait_time: apt.estimated_wait_time,
       estimatedWaitTime: apt.estimated_wait_time,
       // Surface meeting link for video consultations
-      meeting_link: apt.meeting_link || null
+      meeting_link: apt.meeting_link || null,
+      // Include consultation data for completed appointments
+      consultationData: apt.consultationData || null,
+      consultation_completed_at: apt.consultation_completed_at || null
     }));
 
     res.json({
@@ -665,17 +681,22 @@ router.patch('/appointments/:appointmentId/status', authMiddleware, doctorMiddle
       return res.status(404).json({ message: 'Appointment not found' });
     }
 
-    // Emit real-time appointment update event
-    if (global.realtimeSyncService) {
-      await global.realtimeSyncService.emitAppointmentUpdate(req.doctor._id, {
-        appointmentId: appointment._id,
-        status: appointment.status,
-        patientName: appointment.patient_id?.name,
-        bookingDate: appointment.booking_date,
-        timeSlot: appointment.time_slot,
-        referredDoctor: appointment.referredDoctor,
-        updatedAt: new Date()
-      });
+    // Emit real-time appointment update event (non-blocking)
+    try {
+      if (global.realtimeSyncService) {
+        await global.realtimeSyncService.emitAppointmentUpdate(req.doctor._id, {
+          appointmentId: appointment._id,
+          status: appointment.status,
+          patientName: appointment.patient_id?.name,
+          bookingDate: appointment.booking_date,
+          timeSlot: appointment.time_slot,
+          referredDoctor: appointment.referredDoctor,
+          updatedAt: new Date()
+        });
+      }
+    } catch (realtimeError) {
+      console.warn('Realtime sync error (non-critical):', realtimeError);
+      // Don't fail the request if realtime sync fails
     }
 
     res.json({ message: 'Appointment status updated successfully', appointment });
@@ -1746,11 +1767,23 @@ router.post('/schedule-requests', authMiddleware, async (req, res) => {
 });
 
 // Save consultation record
-router.patch('/appointments/:appointmentId/consultation', authMiddleware, async (req, res) => {
+router.patch('/appointments/:appointmentId/consultation', authMiddleware, doctorMiddleware, async (req, res) => {
   try {
     const { appointmentId } = req.params;
     const { consultationData, status } = req.body;
-    const doctorId = req.user.userId;
+    const doctorId = req.doctor._id;
+    
+    console.log('🔍 Save consultation - Request received:', {
+      appointmentId,
+      doctorId,
+      hasConsultationData: !!consultationData,
+      consultationDataKeys: consultationData ? Object.keys(consultationData) : [],
+      medications: consultationData?.medications,
+      hasMedications: !!consultationData?.medications,
+      medicationsLength: consultationData?.medications?.length,
+      status,
+      userRole: req.user?.role
+    });
 
     // Find the appointment
     const appointment = await Token.findById(appointmentId);
@@ -1758,31 +1791,56 @@ router.patch('/appointments/:appointmentId/consultation', authMiddleware, async 
       return res.status(404).json({ message: 'Appointment not found' });
     }
 
+    console.log('🔍 Save consultation - Found appointment:', {
+      appointmentId,
+      appointmentDoctorId: appointment.doctor_id.toString(),
+      requestDoctorId: doctorId.toString(),
+      match: appointment.doctor_id.toString() === doctorId.toString()
+    });
+
     // Check if doctor is authorized for this appointment
-    if (appointment.doctor_id.toString() !== doctorId) {
+    if (appointment.doctor_id.toString() !== doctorId.toString()) {
+      console.log('❌ Save consultation - Unauthorized access attempt');
       return res.status(403).json({ message: 'Unauthorized to access this appointment' });
     }
 
     // Update appointment status
     if (status) {
+      console.log('🔍 Save consultation - Updating status:', { oldStatus: appointment.status, newStatus: status });
       appointment.status = status;
       appointment.consultation_completed_at = new Date();
     }
 
     // Save consultation data to appointment
+    console.log('🔍 Save consultation - Saving consultation data:', consultationData);
     appointment.consultationData = consultationData;
     await appointment.save();
+    console.log('✅ Save consultation - Appointment saved successfully');
+    
+    // Verify what was actually saved
+    const savedAppointment = await Token.findById(appointmentId);
+    console.log('🔍 Save consultation - Verification - Saved consultationData:', {
+      hasConsultationData: !!savedAppointment.consultationData,
+      consultationDataKeys: savedAppointment.consultationData ? Object.keys(savedAppointment.consultationData) : [],
+      medications: savedAppointment.consultationData?.medications,
+      hasMedications: !!savedAppointment.consultationData?.medications,
+      medicationsLength: savedAppointment.consultationData?.medications?.length
+    });
 
     // Create or update consultation record
+    console.log('🔍 Save consultation - Looking for existing consultation record...');
     let consultationRecord = await ConsultationRecord.findOne({ appointment_id: appointmentId });
     
     if (consultationRecord) {
+      console.log('🔍 Save consultation - Updating existing consultation record');
       // Update existing record
       consultationRecord.consultationData = consultationData;
       consultationRecord.status = status === 'consulted' ? 'completed' : 'draft';
       consultationRecord.updated_at = new Date();
       await consultationRecord.save();
+      console.log('✅ Save consultation - Consultation record updated');
     } else {
+      console.log('🔍 Save consultation - Creating new consultation record');
       // Create new record
       consultationRecord = new ConsultationRecord({
         appointment_id: appointmentId,
@@ -1793,6 +1851,7 @@ router.patch('/appointments/:appointmentId/consultation', authMiddleware, async 
         consultation_date: new Date()
       });
       await consultationRecord.save();
+      console.log('✅ Save consultation - New consultation record created');
     }
 
     console.log('✅ Consultation record saved:', {
@@ -1802,7 +1861,7 @@ router.patch('/appointments/:appointmentId/consultation', authMiddleware, async 
       hasData: !!consultationData
     });
 
-    res.json({
+    const response = {
       success: true,
       message: 'Consultation record saved successfully',
       consultationRecord: {
@@ -1810,22 +1869,27 @@ router.patch('/appointments/:appointmentId/consultation', authMiddleware, async 
         status: consultationRecord.status,
         consultation_date: consultationRecord.consultation_date
       }
-    });
+    };
+
+    console.log('🔍 Save consultation - Sending response:', response);
+    res.json(response);
 
   } catch (error) {
-    console.error('Error saving consultation record:', error);
+    console.error('❌ Error saving consultation record:', error);
+    console.error('❌ Error stack:', error.stack);
     res.status(500).json({ 
       success: false, 
-      message: 'Failed to save consultation record' 
+      message: 'Failed to save consultation record',
+      error: error.message
     });
   }
 });
 
 // Get consultation record
-router.get('/appointments/:appointmentId/consultation', authMiddleware, async (req, res) => {
+router.get('/appointments/:appointmentId/consultation', authMiddleware, doctorMiddleware, async (req, res) => {
   try {
     const { appointmentId } = req.params;
-    const doctorId = req.user.userId;
+    const doctorId = req.doctor._id;
 
     // Find the appointment
     const appointment = await Token.findById(appointmentId);
@@ -1855,6 +1919,107 @@ router.get('/appointments/:appointmentId/consultation', authMiddleware, async (r
     res.status(500).json({ 
       success: false, 
       message: 'Failed to fetch consultation record' 
+    });
+  }
+});
+
+// Get doctor's medical records (consultation records)
+router.get('/medical-records', authMiddleware, doctorMiddleware, async (req, res) => {
+  try {
+    const doctorId = req.doctor._id;
+    const { status, page = 1, limit = 10 } = req.query;
+    
+    console.log('🔍 Fetching medical records for doctor:', doctorId);
+    
+    // Build query
+    const query = { doctor_id: doctorId };
+    if (status && status !== 'all') {
+      query.status = status;
+    }
+    
+    // First try to get consultation records
+    let consultationRecords = await ConsultationRecord.find(query)
+      .populate('patient_id', 'name email phone')
+      .populate('appointment_id', 'booking_date time_slot status')
+      .sort({ consultation_date: -1 })
+      .limit(parseInt(limit) * 1)
+      .skip((parseInt(page) - 1) * parseInt(limit));
+    
+    let totalRecords = await ConsultationRecord.countDocuments(query);
+    
+    // If no consultation records found, fallback to completed appointments with consultation data
+    if (consultationRecords.length === 0) {
+      console.log('🔍 No consultation records found, checking completed appointments...');
+      
+      const appointmentQuery = { 
+        doctor_id: doctorId, 
+        status: 'consulted',
+        consultationData: { $exists: true, $ne: null }
+      };
+      
+      const completedAppointments = await Token.find(appointmentQuery)
+        .populate('patient_id', 'name email phone')
+        .sort({ consultation_completed_at: -1 })
+        .limit(parseInt(limit) * 1)
+        .skip((parseInt(page) - 1) * parseInt(limit));
+      
+      // Transform appointments to match consultation record format
+      consultationRecords = completedAppointments.map(appointment => ({
+        _id: appointment._id,
+        patient_id: appointment.patient_id,
+        appointment_id: appointment,
+        consultationData: appointment.consultationData,
+        status: 'completed',
+        consultation_date: appointment.consultation_completed_at || appointment.updatedAt,
+        createdAt: appointment.createdAt,
+        updatedAt: appointment.updatedAt
+      }));
+      
+      totalRecords = await Token.countDocuments(appointmentQuery);
+    }
+    
+    // Transform data for frontend
+    const records = consultationRecords.map(record => ({
+      id: record._id,
+      patient_name: record.patient_id?.name || 'Unknown Patient',
+      patient_email: record.patient_id?.email || '',
+      patient_phone: record.patient_id?.phone || '',
+      appointment_date: record.appointment_id?.booking_date || record.consultation_date,
+      appointment_time: record.appointment_id?.time_slot || '',
+      status: record.status,
+      diagnosis: record.consultationData?.diagnosis || '',
+      chief_complaint: record.consultationData?.chiefComplaint || '',
+      history_of_present_illness: record.consultationData?.historyOfPresentIllness || '',
+      physical_examination: record.consultationData?.physicalExamination || '',
+      vital_signs: record.consultationData?.vitalSigns || {},
+      medications: record.consultationData?.medications || [],
+      notes: record.consultationData?.notes || '',
+      follow_up_required: record.consultationData?.followUpRequired || false,
+      follow_up_date: record.consultationData?.followUpDate || null,
+      created_at: record.createdAt,
+      updated_at: record.updatedAt
+    }));
+    
+    console.log('✅ Found', records.length, 'medical records');
+    
+    res.json({
+      success: true,
+      records,
+      pagination: {
+        currentPage: parseInt(page),
+        totalPages: Math.ceil(totalRecords / parseInt(limit)),
+        totalRecords,
+        hasNextPage: parseInt(page) < Math.ceil(totalRecords / parseInt(limit)),
+        hasPrevPage: parseInt(page) > 1
+      }
+    });
+    
+  } catch (error) {
+    console.error('❌ Error fetching medical records:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch medical records',
+      error: error.message
     });
   }
 });
@@ -1947,7 +2112,7 @@ router.delete('/remove-photo', authMiddleware, doctorMiddleware, async (req, res
       await User.findByIdAndUpdate(req.doctor._id, {
         $unset: { 
           profile_photo: 1,
-          profileImage: 1 
+          profileImage: 1 // Also remove profileImage for compatibility
         }
       });
     }
@@ -1955,6 +2120,411 @@ router.delete('/remove-photo', authMiddleware, doctorMiddleware, async (req, res
     res.json({ message: 'Photo removed successfully' });
   } catch (error) {
     console.error('Remove photo error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Doctor joins video consultation
+router.post('/join-video-consultation/:appointmentId', authMiddleware, doctorMiddleware, async (req, res) => {
+  try {
+    const { appointmentId } = req.params;
+    const doctorId = req.doctor._id;
+
+    // Find the appointment
+    const appointment = await Token.findById(appointmentId)
+      .populate('patient_id', 'name email phone')
+      .populate('family_member_id', 'name');
+
+    if (!appointment) {
+      return res.status(404).json({ message: 'Appointment not found' });
+    }
+
+    // Verify this appointment belongs to the doctor
+    if (appointment.doctor_id.toString() !== doctorId.toString()) {
+      return res.status(403).json({ message: 'Unauthorized: This appointment does not belong to you' });
+    }
+
+    // Check if it's a video consultation
+    if (appointment.appointment_type !== 'video') {
+      return res.status(400).json({ message: 'This is not a video consultation appointment' });
+    }
+
+    // Check if meeting link exists
+    if (!appointment.meeting_link || !appointment.meeting_link.meetingUrl) {
+      return res.status(400).json({ message: 'Meeting link not found for this appointment' });
+    }
+
+    // Check if doctor has already joined
+    if (appointment.meeting_link.doctorJoined) {
+      return res.status(400).json({ message: 'You have already joined this meeting' });
+    }
+
+    // Update appointment to mark doctor as joined
+    const updatedAppointment = await Token.findByIdAndUpdate(
+      appointmentId,
+      {
+        $set: {
+          'meeting_link.doctorJoined': true,
+          'meeting_link.doctorJoinedAt': new Date()
+        }
+      },
+      { new: true }
+    ).populate('patient_id', 'name email phone')
+     .populate('family_member_id', 'name');
+
+    // Get patient details
+    const patientName = appointment.family_member_id ? 
+      appointment.family_member_id.name : 
+      appointment.patient_id.name;
+    
+    const patientEmail = appointment.patient_id.email;
+    const patientPhone = appointment.patient_id.phone;
+
+    // Create professional notification for patient
+    try {
+      await notificationService.createNotification({
+        recipient_id: appointment.patient_id._id,
+        recipient_type: 'patient',
+        title: 'Doctor Ready for Video Consultation',
+        message: `Dr. ${req.doctor.name} has joined the video consultation room and is ready to see you. Please join the meeting now.`,
+        type: 'video_consultation',
+        priority: 'high',
+        related_id: appointment._id,
+        related_type: 'appointment',
+        metadata: {
+          doctorName: req.doctor.name,
+          appointmentDate: appointment.booking_date,
+          appointmentTime: appointment.time_slot,
+          meetingUrl: appointment.meeting_link.meetingUrl,
+          patientName
+        }
+      });
+    } catch (notificationError) {
+      console.error('Error creating patient notification:', notificationError);
+    }
+
+    // Send email notification to patient
+    if (patientEmail) {
+      try {
+        const appointmentDate = new Date(appointment.booking_date).toLocaleDateString('en-US', {
+          weekday: 'long',
+          year: 'numeric',
+          month: 'long',
+          day: 'numeric'
+        });
+        const appointmentTime = appointment.time_slot;
+
+        const subject = `Doctor Ready - Video Consultation with Dr. ${req.doctor.name}`;
+        const htmlContent = `
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Doctor Ready for Video Consultation</title>
+            <style>
+              body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px; }
+              .header { background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: white; padding: 30px; text-align: center; border-radius: 10px 10px 0 0; }
+              .content { background: #f9f9f9; padding: 30px; border-radius: 0 0 10px 10px; }
+              .alert-box { background: #ecfdf5; border: 2px solid #10b981; padding: 20px; border-radius: 8px; margin: 20px 0; }
+              .meeting-details { background: white; padding: 20px; border-radius: 8px; margin: 20px 0; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+              .join-button { display: inline-block; background: #10b981; color: white; padding: 15px 30px; text-decoration: none; border-radius: 8px; font-weight: bold; margin: 20px 0; }
+              .join-button:hover { background: #059669; }
+              .instructions { background: #f0f9ff; padding: 15px; border-left: 4px solid #0ea5e9; margin: 20px 0; }
+            </style>
+          </head>
+          <body>
+            <div class="header">
+              <h1>🏥 MediQ Hospital</h1>
+              <h2>Doctor Ready for Video Consultation</h2>
+            </div>
+            
+            <div class="content">
+              <p>Dear <strong>${patientName}</strong>,</p>
+              
+              <div class="alert-box">
+                <h3>✅ Great News!</h3>
+                <p><strong>Dr. ${req.doctor.name}</strong> has joined the video consultation room and is ready to see you.</p>
+              </div>
+              
+              <div class="meeting-details">
+                <h3>📅 Consultation Details</h3>
+                <p><strong>Date:</strong> ${appointmentDate}</p>
+                <p><strong>Time:</strong> ${appointmentTime}</p>
+                <p><strong>Doctor:</strong> Dr. ${req.doctor.name}</p>
+                <p><strong>Department:</strong> ${appointment.department}</p>
+              </div>
+              
+              <div style="text-align: center;">
+                <a href="${appointment.meeting_link.meetingUrl}" class="join-button" target="_blank">
+                  🎥 Join Video Consultation Now
+                </a>
+              </div>
+              
+              <div class="instructions">
+                <h4>📋 Quick Instructions:</h4>
+                <ul>
+                  <li>Click the "Join Video Consultation Now" button above</li>
+                  <li>Allow camera and microphone permissions when prompted</li>
+                  <li>Ensure you have a stable internet connection</li>
+                  <li>Find a quiet, well-lit space for the consultation</li>
+                  <li>Have your ID and any medical documents ready</li>
+                </ul>
+              </div>
+              
+              <p><strong>Meeting ID:</strong> ${appointment.meeting_link.meetingId}</p>
+              ${appointment.meeting_link.meetingPassword ? `<p><strong>Password:</strong> ${appointment.meeting_link.meetingPassword}</p>` : ''}
+              
+              <p>If you experience any technical difficulties, please contact our support team immediately.</p>
+              
+              <p>Thank you for choosing MediQ Hospital!</p>
+            </div>
+          </body>
+          </html>
+        `;
+
+        const mailOptions = {
+          from: `"MediQ Hospital" <${process.env.EMAIL_USER}>`,
+          to: patientEmail,
+          subject: subject,
+          html: htmlContent
+        };
+
+        const { transporter } = require('../config/email');
+        await transporter.sendMail(mailOptions);
+        console.log('📧 Doctor join notification email sent to patient');
+      } catch (emailError) {
+        console.error('Error sending email notification:', emailError);
+      }
+    }
+
+    // Send real-time notification to patient
+    try {
+      const realtimeService = global.realtimeSyncService;
+      if (realtimeService) {
+        await realtimeService.emitAppointmentUpdate(doctorId, {
+          appointmentId: appointment._id,
+          type: 'doctor_joined_video',
+          message: `Dr. ${req.doctor.name} has joined the video consultation`,
+          meetingUrl: appointment.meeting_link.meetingUrl,
+          patientId: appointment.patient_id._id
+        });
+      }
+    } catch (realtimeError) {
+      console.error('Error sending real-time notification:', realtimeError);
+    }
+
+    res.json({
+      message: 'Successfully joined video consultation',
+      appointment: {
+        id: updatedAppointment._id,
+        patientName,
+        appointmentDate: appointment.booking_date,
+        appointmentTime: appointment.time_slot,
+        meetingUrl: appointment.meeting_link.meetingUrl,
+        doctorJoined: true,
+        doctorJoinedAt: updatedAppointment.meeting_link.doctorJoinedAt
+      }
+    });
+
+  } catch (error) {
+    console.error('Join video consultation error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Doctor closes video consultation
+router.post('/close-video-consultation/:appointmentId', authMiddleware, doctorMiddleware, async (req, res) => {
+  try {
+    const { appointmentId } = req.params;
+    const doctorId = req.doctor._id;
+    
+    console.log('🔍 Close video consultation - Request received:', { appointmentId, doctorId });
+
+    // Find the appointment
+    const appointment = await Token.findById(appointmentId)
+      .populate('patient_id', 'name email phone')
+      .populate('family_member_id', 'name');
+
+    console.log('🔍 Close video consultation - Found appointment:', appointment ? 'Yes' : 'No');
+    
+    if (!appointment) {
+      console.log('🔍 Close video consultation - Appointment not found');
+      return res.status(404).json({ message: 'Appointment not found' });
+    }
+
+    // Verify this appointment belongs to the doctor
+    console.log('🔍 Close video consultation - Checking doctor ownership:', { 
+      appointmentDoctorId: appointment.doctor_id.toString(), 
+      requestDoctorId: doctorId.toString() 
+    });
+    
+    if (appointment.doctor_id.toString() !== doctorId.toString()) {
+      console.log('🔍 Close video consultation - Unauthorized access attempt');
+      return res.status(403).json({ message: 'Unauthorized: This appointment does not belong to you' });
+    }
+
+    // Check if it's a video consultation
+    console.log('🔍 Close video consultation - Appointment type:', appointment.appointment_type);
+    if (appointment.appointment_type !== 'video') {
+      console.log('🔍 Close video consultation - Not a video consultation');
+      return res.status(400).json({ message: 'This is not a video consultation appointment' });
+    }
+
+    // Check if doctor has joined the meeting
+    console.log('🔍 Close video consultation - Doctor joined status:', appointment.meeting_link?.doctorJoined);
+    if (!appointment.meeting_link?.doctorJoined) {
+      console.log('🔍 Close video consultation - Doctor has not joined yet');
+      return res.status(400).json({ message: 'You have not joined this meeting yet' });
+    }
+
+    // Update the appointment to mark doctor as left and consultation as completed
+    console.log('🔍 Close video consultation - Updating appointment status to consulted');
+    const updatedAppointment = await Token.findByIdAndUpdate(
+      appointmentId,
+      {
+        $set: {
+          'meeting_link.doctorJoined': false,
+          'meeting_link.doctorLeftAt': new Date(),
+          'meeting_link.meetingEnded': true,
+          'meeting_link.meetingEndedAt': new Date(),
+          status: 'consulted',
+          consultation_completed_at: new Date()
+        }
+      },
+      { new: true }
+    );
+    
+    console.log('✅ Close video consultation - Appointment updated:', {
+      appointmentId,
+      newStatus: updatedAppointment.status,
+      consultationCompletedAt: updatedAppointment.consultation_completed_at
+    });
+
+    // Get patient information for notification
+    const patientName = appointment.family_member_id?.name || appointment.patient_id?.name || 'Patient';
+    const patientEmail = appointment.patient_id?.email;
+
+    // Create notification for patient
+    try {
+      await Notification.create({
+        recipient_id: appointment.patient_id._id,
+        recipient_type: 'patient',
+        title: 'Video Consultation Ended',
+        message: `Dr. ${req.doctor.name} has ended the video consultation. The meeting has been closed.`,
+        type: 'video_consultation_ended',
+        priority: 'medium',
+        related_id: appointment._id,
+        related_type: 'appointment',
+        metadata: {
+          doctorName: req.doctor.name,
+          appointmentDate: appointment.booking_date,
+          appointmentTime: appointment.time_slot,
+          patientName
+        }
+      });
+    } catch (notificationError) {
+      console.error('Error creating patient notification:', notificationError);
+    }
+
+    // Send email notification to patient
+    if (patientEmail) {
+      try {
+        const appointmentDate = new Date(appointment.booking_date).toLocaleDateString('en-US', {
+          weekday: 'long',
+          year: 'numeric',
+          month: 'long',
+          day: 'numeric'
+        });
+        const appointmentTime = appointment.time_slot || '09:00';
+
+        await emailService.sendEmail({
+          to: patientEmail,
+          subject: 'Video Consultation Ended - MediQ',
+          html: `
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+              <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 10px 10px 0 0; text-align: center;">
+                <h1 style="margin: 0; font-size: 24px;">Video Consultation Ended</h1>
+                <p style="margin: 10px 0 0 0; opacity: 0.9;">Your consultation with Dr. ${req.doctor.name} has been completed</p>
+              </div>
+              
+              <div style="background: white; padding: 30px; border-radius: 0 0 10px 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+                <div style="text-align: center; margin-bottom: 30px;">
+                  <div style="width: 80px; height: 80px; background: #f3f4f6; border-radius: 50%; margin: 0 auto 20px; display: flex; align-items: center; justify-content: center;">
+                    <span style="font-size: 32px;">✅</span>
+                  </div>
+                  <h2 style="color: #1f2937; margin: 0 0 10px 0;">Consultation Completed</h2>
+                  <p style="color: #6b7280; margin: 0;"><strong>Dr. ${req.doctor.name}</strong> has ended the video consultation.</p>
+                </div>
+                
+                <div class="meeting-details" style="background: #f9fafb; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
+                  <h3 style="color: #1f2937; margin: 0 0 15px 0;">📅 Consultation Details</h3>
+                  <p style="margin: 5px 0; color: #374151;"><strong>Date:</strong> ${appointmentDate}</p>
+                  <p style="margin: 5px 0; color: #374151;"><strong>Time:</strong> ${appointmentTime}</p>
+                  <p style="margin: 5px 0; color: #374151;"><strong>Doctor:</strong> Dr. ${req.doctor.name}</p>
+                  <p style="margin: 5px 0; color: #374151;"><strong>Department:</strong> ${appointment.department}</p>
+                </div>
+                
+                <div style="background: #fef3c7; border: 1px solid #f59e0b; border-radius: 8px; padding: 15px; margin-bottom: 20px;">
+                  <h4 style="color: #92400e; margin: 0 0 10px 0;">📋 Next Steps</h4>
+                  <ul style="color: #92400e; margin: 0; padding-left: 20px;">
+                    <li>Check your email for any prescriptions or medical records</li>
+                    <li>Contact the clinic if you have any follow-up questions</li>
+                    <li>Schedule a follow-up appointment if recommended by your doctor</li>
+                  </ul>
+                </div>
+                
+                <div style="text-align: center; margin-top: 30px;">
+                  <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}/appointments" style="background: #3b82f6; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block; font-weight: 500;">
+                    View Your Appointments
+                  </a>
+                </div>
+              </div>
+              
+              <div style="text-align: center; margin-top: 20px; color: #6b7280; font-size: 14px;">
+                <p>Thank you for using MediQ for your healthcare needs.</p>
+                <p>If you have any questions, please contact our support team.</p>
+              </div>
+            </div>
+          `
+        });
+      } catch (emailError) {
+        console.error('Error sending email notification:', emailError);
+      }
+    }
+
+    // Send real-time notification to patient
+    try {
+      const realtimeSyncService = require('../services/realtimeSyncService');
+      if (realtimeSyncService && global.io) {
+        const realtimeService = new realtimeSyncService(global.io);
+        realtimeService.emitAppointmentUpdate(appointment.doctor_id, {
+          type: 'doctor_left_video',
+          message: `Dr. ${req.doctor.name} has ended the video consultation`,
+          appointmentId: appointment._id,
+          patientId: appointment.patient_id._id
+        });
+      }
+    } catch (realtimeError) {
+      console.error('Error sending real-time notification:', realtimeError);
+    }
+
+    res.json({
+      message: 'Successfully closed video consultation',
+      appointment: {
+        id: updatedAppointment._id,
+        patientName,
+        appointmentDate: appointment.booking_date,
+        appointmentTime: appointment.time_slot,
+        doctorLeft: true,
+        doctorLeftAt: updatedAppointment.meeting_link.doctorLeftAt,
+        meetingEnded: true,
+        meetingEndedAt: updatedAppointment.meeting_link.meetingEndedAt
+      }
+    });
+
+  } catch (error) {
+    console.error('Close video consultation error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 });

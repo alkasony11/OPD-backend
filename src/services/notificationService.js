@@ -101,6 +101,30 @@ class NotificationService {
         }
       }
 
+      // Create in-app notification for patient
+      try {
+        await this.createNotification({
+          recipient_id: appointment.patient_id._id,
+          recipient_type: 'patient',
+          title: 'Appointment Booked Successfully',
+          message: `Your appointment with Dr. ${doctorName} has been confirmed for ${appointmentDate} at ${appointmentTime}. Token: ${tokenNumber}`,
+          type: 'appointment',
+          priority: 'normal',
+          related_id: appointment._id,
+          related_type: 'appointment',
+          metadata: {
+            doctorName,
+            appointmentDate,
+            appointmentTime,
+            tokenNumber,
+            department,
+            patientName
+          }
+        });
+      } catch (notificationError) {
+        console.error('Error creating patient notification:', notificationError);
+      }
+
       // Create in-app notification for doctor
       try {
         await this.createNotification({
@@ -372,6 +396,49 @@ class NotificationService {
           console.error('WhatsApp cancellation error:', error);
           results.whatsapp = { success: false, message: error.message };
         }
+      }
+
+      // Create in-app notification for patient
+      try {
+        await this.createNotification({
+          recipient_id: appointment.patient_id._id,
+          recipient_type: 'patient',
+          title: 'Appointment Cancelled',
+          message: `Your appointment with Dr. ${doctorName} on ${appointmentDate} at ${appointmentTime} has been cancelled.${refundInfo && refundInfo.eligible ? ` Refund of ₹${refundInfo.amount} will be processed.` : ''}`,
+          type: 'cancellation',
+          priority: 'normal',
+          related_id: appointment._id,
+          related_type: 'appointment',
+          metadata: {
+            doctorName,
+            appointmentDate,
+            appointmentTime,
+            refundInfo
+          }
+        });
+      } catch (notificationError) {
+        console.error('Error creating patient cancellation notification:', notificationError);
+      }
+
+      // Create in-app notification for doctor
+      try {
+        await this.createNotification({
+          recipient_id: appointment.doctor_id._id,
+          recipient_type: 'doctor',
+          title: 'Appointment Cancelled',
+          message: `Appointment with ${patientName} on ${appointmentDate} at ${appointmentTime} has been cancelled`,
+          type: 'cancellation',
+          priority: 'normal',
+          related_id: appointment._id,
+          related_type: 'appointment',
+          metadata: {
+            patientName,
+            appointmentDate,
+            appointmentTime
+          }
+        });
+      } catch (notificationError) {
+        console.error('Error creating doctor cancellation notification:', notificationError);
       }
 
       console.log('📧📱💬 Cancellation confirmation sent:', results);

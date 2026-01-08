@@ -54,10 +54,13 @@ const passwordResetTokenSchema = new mongoose.Schema({
 // Auto-delete expired tokens
 passwordResetTokenSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 
-// Counter schema for generating sequential IDs (e.g., Patient IDs)
+// Counter schema for generating sequential IDs (e.g., Patient IDs, Token numbers)
 const counterSchema = new mongoose.Schema({
-  key: { type: String, required: true, unique: true },
-  seq: { type: Number, default: 0 }
+  key: { type: String, required: true, unique: true }, // Use key field for the counter identifier
+  count: { type: Number, default: 0 },
+  seq: { type: Number, default: 0 } // Additional sequence field for compatibility
+}, {
+  timestamps: true
 });
 
 const userSchema = new mongoose.Schema({
@@ -261,12 +264,12 @@ userSchema.pre('save', async function(next) {
 
     const Counter = mongoose.model('Counter', counterSchema);
     const updated = await Counter.findOneAndUpdate(
-      { key: 'patient' },
-      { $inc: { seq: 1 } },
+      { _id: 'patient' },
+      { $inc: { count: 1 } },
       { new: true, upsert: true, setDefaultsOnInsert: true }
     );
 
-    const nextSeq = updated.seq;
+    const nextSeq = updated.count;
     this.patientId = `P${padNumberWithZeros(nextSeq, 3)}`;
     return next();
   } catch (error) {
@@ -542,6 +545,13 @@ const tokenSchema = new mongoose.Schema({
     isActive: {
       type: Boolean,
       default: true
+    },
+    doctorJoinedAt: {
+      type: Date
+    },
+    doctorJoined: {
+      type: Boolean,
+      default: false
     }
   },
   consultation_notes: {
@@ -626,7 +636,7 @@ const tokenSchema = new mongoose.Schema({
 tokenSchema.index({ doctor_id: 1, booking_date: 1 });
 tokenSchema.index({ patient_id: 1, booking_date: 1 });
 tokenSchema.index({ status: 1 });
-tokenSchema.index({ token_number: 1 });
+tokenSchema.index({ token_number: 1 }, { unique: true });
 
 const User = mongoose.model('User', userSchema);
 const Counter = mongoose.model('Counter', counterSchema);

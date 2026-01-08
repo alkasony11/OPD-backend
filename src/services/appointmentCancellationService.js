@@ -148,6 +148,14 @@ class AppointmentCancellationService {
 
         // Send email notification to patient
         await this.sendCancellationEmail(appointment, 'patient');
+
+        // Send WhatsApp cancellation notification
+        const whatsappBotService = require('./whatsappBotService');
+        whatsappBotService.sendCancellationConfirmation(appointment._id).then(() => {
+          console.log('✅ WhatsApp cancellation notification sent successfully');
+        }).catch((error) => {
+          console.error('❌ Error sending WhatsApp cancellation notification:', error);
+        });
       }
 
       // Create notification for the doctor

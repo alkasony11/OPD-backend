@@ -14,6 +14,7 @@ const whatsappBotService = require('../services/whatsappBotService');
 const notificationService = require('../services/notificationService');
 const meetingLinkService = require('../services/meetingLinkService');
 const CloudinaryService = require('../services/cloudinaryService');
+const emailService = require('../services/emailService');
 const { isSessionBookable, getSessionInfo, parseTime, formatTime, getBookingCutoffMessage, generateSequentialTokenNumber } = require('../utils/bookingUtils');
 const crypto = require('crypto');
 const multer = require('multer');
@@ -1030,16 +1031,377 @@ router.post('/payment/mark-paid', authMiddleware, patientMiddleware, async (req,
       return res.status(404).json({ message: 'Appointment not found' });
     }
 
-    await Token.findByIdAndUpdate(appointmentId, {
+    const updatedAppointment = await Token.findByIdAndUpdate(appointmentId, {
       $set: {
         payment_status: 'paid',
         paid_amount: amount || appointment.paid_amount || (appointment.doctor_id?.doctor_info?.consultation_fee || 500),
         payment_method: method,
         payment_reference: reference || `PAY${Date.now().toString().slice(-8)}`
       }
-    });
+    }, { new: true }).populate('doctor_id', 'name doctor_info').populate('patient_id', 'name email phone');
 
-    return res.json({ message: 'Payment marked as paid', status: 'paid' });
+    // Send automatic invoice email after successful payment
+    try {
+      console.log('🔍 Payment success - Sending automatic invoice email for appointment:', appointmentId);
+      
+      const invoiceData = {
+        invoiceNumber: `INV-${updatedAppointment.token_number || updatedAppointment._id.toString().slice(-6)}`,
+        date: updatedAppointment.createdAt.toLocaleDateString('en-IN'),
+        patientName: updatedAppointment.patient_name,
+        patientEmail: updatedAppointment.patient_id?.email,
+        doctorName: updatedAppointment.doctor_id?.name || 'Unknown Doctor',
+        department: updatedAppointment.department,
+        appointmentDate: updatedAppointment.booking_date.toLocaleDateString('en-IN'),
+        timeSlot: updatedAppointment.time_slot,
+        amount: updatedAppointment.paid_amount || 500,
+        status: 'paid',
+        transactionId: updatedAppointment.payment_reference,
+        currentDate: new Date().toLocaleDateString('en-IN'),
+        currentTime: new Date().toLocaleTimeString('en-IN')
+      };
+
+      // Generate professional HTML content for PDF
+      const htmlContent = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+          <meta charset="utf-8">
+          <title>Invoice ${invoiceData.invoiceNumber}</title>
+          <style>
+              * { margin: 0; padding: 0; box-sizing: border-box; }
+              body { 
+                  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+                  line-height: 1.6; 
+                  color: #333; 
+                  background: #fff;
+                  font-size: 14px;
+                  padding: 20px;
+              }
+              .invoice-container { 
+                  max-width: 800px; 
+                  margin: 0 auto; 
+                  background: white; 
+                  box-shadow: 0 0 20px rgba(0,0,0,0.1); 
+                  border-radius: 8px; 
+                  overflow: hidden;
+              }
+              .header { 
+                  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+                  color: white; 
+                  padding: 30px; 
+                  text-align: center; 
+              }
+              .header h1 { 
+                  font-size: 28px; 
+                  margin-bottom: 10px; 
+                  font-weight: 700; 
+              }
+              .header p { 
+                  font-size: 16px; 
+                  opacity: 0.9; 
+              }
+              .invoice-details { 
+                  padding: 30px; 
+                  background: #f8fafc; 
+                  border-bottom: 1px solid #e2e8f0; 
+              }
+              .invoice-number { 
+                  font-size: 24px; 
+                  font-weight: 700; 
+                  color: #1f2937; 
+                  margin-bottom: 20px; 
+              }
+              .invoice-meta { 
+                  display: grid; 
+                  grid-template-columns: 1fr 1fr; 
+                  gap: 20px; 
+                  margin-bottom: 20px; 
+              }
+              .meta-item { 
+                  background: white; 
+                  padding: 15px; 
+                  border-radius: 6px; 
+                  border-left: 4px solid #3b82f6; 
+              }
+              .meta-label { 
+                  font-size: 12px; 
+                  color: #6b7280; 
+                  text-transform: uppercase; 
+                  font-weight: 600; 
+                  margin-bottom: 5px; 
+              }
+              .meta-value { 
+                  font-size: 16px; 
+                  color: #1f2937; 
+                  font-weight: 600; 
+              }
+              .content { 
+                  padding: 30px; 
+              }
+              .section { 
+                  margin-bottom: 30px; 
+              }
+              .section-title { 
+                  font-size: 18px; 
+                  font-weight: 700; 
+                  color: #1f2937; 
+                  margin-bottom: 20px; 
+                  border-bottom: 2px solid #e5e7eb; 
+                  padding-bottom: 8px; 
+              }
+              .info-grid { 
+                  display: grid; 
+                  grid-template-columns: 1fr 1fr; 
+                  gap: 30px; 
+                  margin-bottom: 25px; 
+              }
+              .info-item { 
+                  padding: 15px;
+                  background: #f9fafb;
+                  border-radius: 6px;
+                  border-left: 4px solid #2563eb;
+              }
+              .info-label { 
+                  font-size: 11px; 
+                  color: #6b7280; 
+                  text-transform: uppercase; 
+                  font-weight: 600; 
+                  margin-bottom: 5px; 
+              }
+              .info-value { 
+                  font-size: 14px; 
+                  color: #1f2937; 
+                  font-weight: 600; 
+              }
+              .amount-section { 
+                  background: #f0f9ff; 
+                  padding: 25px; 
+                  border-radius: 8px; 
+                  border: 2px solid #0ea5e9; 
+                  text-align: center; 
+                  margin: 30px 0; 
+              }
+              .amount-label { 
+                  font-size: 14px; 
+                  color: #0369a1; 
+                  margin-bottom: 10px; 
+                  font-weight: 600; 
+              }
+              .amount-value { 
+                  font-size: 32px; 
+                  color: #0c4a6e; 
+                  font-weight: 800; 
+                  margin-bottom: 5px; 
+              }
+              .amount-currency { 
+                  font-size: 16px; 
+                  color: #0369a1; 
+                  font-weight: 600; 
+              }
+              .status-badge { 
+                  display: inline-block; 
+                  padding: 8px 16px; 
+                  border-radius: 20px; 
+                  font-size: 12px; 
+                  font-weight: 600; 
+                  text-transform: uppercase; 
+                  margin-top: 10px; 
+              }
+              .status-paid { 
+                  background: #dcfce7; 
+                  color: #166534; 
+              }
+              .footer { 
+                  background: #1f2937; 
+                  color: white; 
+                  padding: 25px; 
+                  text-align: center; 
+              }
+              .footer p { 
+                  margin-bottom: 10px; 
+                  opacity: 0.8; 
+              }
+              .footer .highlight { 
+                  color: #60a5fa; 
+                  font-weight: 600; 
+              }
+          </style>
+      </head>
+      <body>
+          <div class="invoice-container">
+              <div class="header">
+                  <h1>Medical Invoice</h1>
+                  <p>Professional Healthcare Services</p>
+              </div>
+              
+              <div class="invoice-details">
+                  <div class="invoice-number">Invoice #${invoiceData.invoiceNumber}</div>
+                  <div class="invoice-meta">
+                      <div class="meta-item">
+                          <div class="meta-label">Invoice Date</div>
+                          <div class="meta-value">${invoiceData.currentDate}</div>
+                      </div>
+                      <div class="meta-item">
+                          <div class="meta-label">Transaction ID</div>
+                          <div class="meta-value">${invoiceData.transactionId}</div>
+                      </div>
+                  </div>
+              </div>
+              
+              <div class="content">
+                  <div class="section">
+                      <div class="section-title">Patient Information</div>
+                      <div class="info-grid">
+                          <div class="info-item">
+                              <div class="info-label">Patient Name</div>
+                              <div class="info-value">${invoiceData.patientName}</div>
+                          </div>
+                          <div class="info-item">
+                              <div class="info-label">Email Address</div>
+                              <div class="info-value">${invoiceData.patientEmail}</div>
+                          </div>
+                      </div>
+                  </div>
+                  
+                  <div class="section">
+                      <div class="section-title">Appointment Details</div>
+                      <div class="info-grid">
+                          <div class="info-item">
+                              <div class="info-label">Doctor</div>
+                              <div class="info-value">Dr. ${invoiceData.doctorName}</div>
+                          </div>
+                          <div class="info-item">
+                              <div class="info-label">Department</div>
+                              <div class="info-value">${invoiceData.department}</div>
+                          </div>
+                          <div class="info-item">
+                              <div class="info-label">Appointment Date</div>
+                              <div class="info-value">${invoiceData.appointmentDate}</div>
+                          </div>
+                          <div class="info-item">
+                              <div class="info-label">Time Slot</div>
+                              <div class="info-value">${invoiceData.timeSlot}</div>
+                          </div>
+                      </div>
+                  </div>
+                  
+                  <div class="amount-section">
+                      <div class="amount-label">Total Amount</div>
+                      <div class="amount-value">₹${invoiceData.amount}</div>
+                      <div class="amount-currency">Indian Rupees</div>
+                      <div class="status-badge status-paid">PAID</div>
+                  </div>
+              </div>
+              
+              <div class="footer">
+                  <p>Thank you for choosing our healthcare services!</p>
+                  <p>For any queries, please contact our support team.</p>
+                  <p>Generated on <span class="highlight">${invoiceData.currentDate}</span> at <span class="highlight">${invoiceData.currentTime}</span></p>
+              </div>
+          </div>
+      </body>
+      </html>
+      `;
+
+      // Generate PDF using Puppeteer
+      const puppeteer = require('puppeteer');
+      let browser = await puppeteer.launch({
+        headless: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox']
+      });
+      
+      const page = await browser.newPage();
+      await page.setContent(htmlContent, { waitUntil: 'networkidle0' });
+      
+      const pdfBuffer = await page.pdf({
+        format: 'A4',
+        printBackground: true,
+        margin: {
+          top: '20px',
+          right: '20px',
+          bottom: '20px',
+          left: '20px'
+        }
+      });
+
+      await browser.close();
+
+      // Send email with PDF attachment
+      await emailService.sendEmail({
+        to: updatedAppointment.patient_id.email,
+        subject: `Payment Confirmation & Invoice ${invoiceData.invoiceNumber} - MediQ Healthcare Services`,
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+            <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 10px 10px 0 0; text-align: center;">
+              <h1 style="margin: 0; font-size: 24px;">Payment Successful! 🎉</h1>
+              <p style="margin: 10px 0 0 0; opacity: 0.9;">Your payment has been processed successfully</p>
+            </div>
+            
+            <div style="background: white; padding: 30px; border-radius: 0 0 10px 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+              <div style="text-align: center; margin-bottom: 30px;">
+                <div style="width: 80px; height: 80px; background: #dcfce7; border-radius: 50%; margin: 0 auto 20px; display: flex; align-items: center; justify-content: center;">
+                  <span style="font-size: 32px;">✅</span>
+                </div>
+                <h2 style="color: #1f2937; margin: 0 0 10px 0;">Payment Confirmed</h2>
+                <p style="color: #6b7280; margin: 0;">Your payment of ₹${invoiceData.amount} has been successfully processed.</p>
+              </div>
+              
+              <div class="invoice-details" style="background: #f9fafb; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
+                <h3 style="color: #1f2937; margin: 0 0 15px 0;">📋 Payment Details</h3>
+                <p style="margin: 5px 0; color: #374151;"><strong>Invoice Number:</strong> ${invoiceData.invoiceNumber}</p>
+                <p style="margin: 5px 0; color: #374151;"><strong>Patient:</strong> ${invoiceData.patientName}</p>
+                <p style="margin: 5px 0; color: #374151;"><strong>Doctor:</strong> Dr. ${invoiceData.doctorName}</p>
+                <p style="margin: 5px 0; color: #374151;"><strong>Department:</strong> ${invoiceData.department}</p>
+                <p style="margin: 5px 0; color: #374151;"><strong>Date:</strong> ${invoiceData.appointmentDate}</p>
+                <p style="margin: 5px 0; color: #374151;"><strong>Time:</strong> ${invoiceData.timeSlot}</p>
+                <p style="margin: 5px 0; color: #374151;"><strong>Amount Paid:</strong> ₹${invoiceData.amount}</p>
+                <p style="margin: 5px 0; color: #374151;"><strong>Transaction ID:</strong> ${invoiceData.transactionId}</p>
+                <p style="margin: 5px 0; color: #374151;"><strong>Status:</strong> <span style="color: #16a34a;">PAID</span></p>
+              </div>
+              
+              <div style="background: #dbeafe; border: 1px solid #3b82f6; border-radius: 8px; padding: 15px; margin-bottom: 20px;">
+                <h4 style="color: #1e40af; margin: 0 0 10px 0;">📄 Invoice Attached</h4>
+                <p style="color: #1e40af; margin: 0;">Your detailed invoice has been attached to this email as a PDF document.</p>
+                <p style="color: #1e40af; margin: 5px 0 0 0; font-size: 14px;">You can download and save it for your records.</p>
+              </div>
+              
+              <div style="background: #fef3c7; border: 1px solid #f59e0b; border-radius: 8px; padding: 15px; margin-bottom: 20px;">
+                <h4 style="color: #92400e; margin: 0 0 10px 0;">📅 Next Steps</h4>
+                <ul style="color: #92400e; margin: 0; padding-left: 20px;">
+                  <li>Your appointment is confirmed for ${invoiceData.appointmentDate} at ${invoiceData.timeSlot}</li>
+                  <li>Please arrive 15 minutes before your scheduled time</li>
+                  <li>Bring a valid ID and any relevant medical documents</li>
+                  <li>Contact us if you need to reschedule or have any questions</li>
+                </ul>
+              </div>
+              
+              <div style="text-align: center; margin-top: 30px;">
+                <p style="color: #6b7280; font-size: 14px;">Thank you for choosing MediQ for your healthcare needs.</p>
+                <p style="color: #6b7280; font-size: 14px;">If you have any questions, please contact our support team.</p>
+              </div>
+            </div>
+          </div>
+        `,
+        attachments: [
+          {
+            filename: `Invoice-${invoiceData.invoiceNumber}.pdf`,
+            content: pdfBuffer,
+            contentType: 'application/pdf'
+          }
+        ]
+      });
+
+      console.log('✅ Payment success - Invoice email sent successfully to:', updatedAppointment.patient_id.email);
+    } catch (emailError) {
+      console.error('❌ Payment success - Failed to send automatic invoice email:', emailError);
+      // Don't fail the payment process if email fails
+    }
+
+    return res.json({ 
+      message: 'Payment marked as paid and invoice sent to email', 
+      status: 'paid',
+      invoiceSent: true
+    });
   } catch (error) {
     console.error('Mark paid error:', error);
     res.status(500).json({ message: 'Server error' });
@@ -1609,16 +1971,24 @@ router.post('/book-appointment', authMiddleware, patientMiddleware, async (req, 
     
     // Check if the same patient (or family member) already has an appointment at this exact time slot
     // This prevents duplicate bookings by the same patient/family member
-    const existingAppointment = await Token.findOne({
+    let conflictQuery = {
       doctor_id: doctorId,
       booking_date: { $gte: selectedDate, $lt: nextDay },
       time_slot: appointmentTime,
-      status: { $nin: ['cancelled', 'missed', 'consulted'] },
-      $or: [
-        { patient_id: req.patient._id },
-        { family_member_id: familyMemberId }
-      ]
-    });
+      status: { $nin: ['cancelled', 'missed', 'consulted'] }
+    };
+
+    // Build the conflict check based on whether it's for a family member or the patient themselves
+    if (familyMemberId && familyMemberId !== 'self' && familyMemberId !== 'undefined' && familyMemberId !== 'null') {
+      // Booking for a family member - check if this specific family member already has an appointment
+      conflictQuery.family_member_id = familyMemberId;
+    } else {
+      // Booking for the patient themselves - check if the patient already has an appointment (family_member_id should be null)
+      conflictQuery.patient_id = req.patient._id;
+      conflictQuery.family_member_id = null;
+    }
+
+    const existingAppointment = await Token.findOne(conflictQuery);
 
     if (existingAppointment) {
       console.log('🚨 CONFLICT DETECTED - Same patient/family member slot conflict found:', {
@@ -1712,15 +2082,21 @@ router.post('/book-appointment', authMiddleware, patientMiddleware, async (req, 
       }
     }
 
-    // Block multiple active appointments in the same department (for self or same family member)
+    // Block multiple active appointments in the same department on the same date (for self or same family member)
+    // This should only block if the SAME person (patient or specific family member) already has an appointment
     const activeSameDepartmentQuery = {
       patient_id: req.patient._id,
       department: department.name,
+      booking_date: { $gte: selectedDate, $lt: endOfDay }, // Add date check
       status: { $in: ['booked', 'in_queue'] }
     };
+    
+    // Only check for the specific person being booked
     if (familyMember) {
+      // Booking for a family member - check if THIS specific family member already has an appointment
       activeSameDepartmentQuery.family_member_id = familyMember._id;
     } else {
+      // Booking for the patient themselves - check if the patient already has an appointment (family_member_id should be null)
       activeSameDepartmentQuery.family_member_id = null;
     }
 
@@ -1728,7 +2104,7 @@ router.post('/book-appointment', authMiddleware, patientMiddleware, async (req, 
     if (existingActiveSameDept) {
       const forWhom = familyMember ? familyMember.name : 'you';
       return res.status(400).json({
-        message: `Cannot book another appointment in the same department until the current one for ${forWhom} is completed or cancelled`
+        message: `Cannot book another appointment in the same department on the same date until the current one for ${forWhom} is completed or cancelled`
       });
     }
 
@@ -1795,7 +2171,21 @@ router.post('/book-appointment', authMiddleware, patientMiddleware, async (req, 
     }
 
     // Generate sequential token number based on session type
-    const tokenNumber = await generateSequentialTokenNumber(doctorId, selectedDate, sessionType);
+    let tokenNumber;
+    try {
+      console.log('🔍 Starting token generation for appointment booking...');
+      tokenNumber = await generateSequentialTokenNumber(doctorId, selectedDate, sessionType, req.patient._id, familyMember ? familyMember._id : null);
+      console.log('✅ Token generation successful:', tokenNumber);
+    } catch (error) {
+      console.error('❌ Token generation error:', error);
+      return res.status(400).json({ 
+        message: error.message || 'Failed to generate token number. Please try again.' 
+      });
+    }
+
+    // Calculate sequential time slot based on token number and slot duration
+    const sequentialTimeSlot = calculateSequentialTimeSlot(tokenNumber, sessionType, slotDuration);
+    console.log(`[BOOK] Token: ${tokenNumber}, Original time: ${appointmentTime}, Sequential time: ${sequentialTimeSlot}`);
 
     // Generate meeting link for video consultations
     let meetingLinkData = null;
@@ -1827,7 +2217,7 @@ router.post('/book-appointment', authMiddleware, patientMiddleware, async (req, 
       department: department.name,
       symptoms: symptoms && String(symptoms).trim().length > 0 ? symptoms : 'Not provided',
       booking_date: selectedDate,
-      time_slot: appointmentTime,
+      time_slot: sequentialTimeSlot,
       session_type: sessionType,
       session_time_range: sessionTimeRange,
       appointment_type: appointmentType, // Add appointment type
@@ -1837,7 +2227,9 @@ router.post('/book-appointment', authMiddleware, patientMiddleware, async (req, 
         meetingPassword: meetingLinkData.meetingPassword,
         provider: meetingLinkData.provider,
         expiresAt: meetingLinkData.expiresAt,
-        isActive: meetingLinkData.isActive
+        isActive: meetingLinkData.isActive,
+        doctorJoined: false,
+        doctorJoinedAt: null
       } : undefined,
       status: 'booked',
       token_number: tokenNumber,
@@ -1846,7 +2238,17 @@ router.post('/book-appointment', authMiddleware, patientMiddleware, async (req, 
       estimated_wait_time: Math.floor(Math.random() * 30) + 15
     });
 
-    await appointmentToken.save();
+    try {
+      await appointmentToken.save();
+    } catch (error) {
+      console.error('Appointment creation error:', error);
+      if (error.code === 11000 && error.keyPattern?.token_number) {
+        return res.status(400).json({ 
+          message: 'Token number conflict. Please try booking again.' 
+        });
+      }
+      throw error; // Re-throw other errors to be caught by the main catch block
+    }
 
     // Update patient's booking history
     await User.findByIdAndUpdate(
@@ -1893,6 +2295,8 @@ router.post('/book-appointment', authMiddleware, patientMiddleware, async (req, 
         meetingPassword: meetingLinkData.meetingPassword,
         provider: meetingLinkData.provider,
         expiresAt: meetingLinkData.expiresAt,
+        doctorJoined: false,
+        doctorJoinedAt: null,
         instructions: meetingLinkService.generateMeetingInstructions(
           meetingLinkData,
           familyMember ? familyMember.name : req.patient.name,
@@ -2054,8 +2458,39 @@ router.get('/appointments/:appointmentId/queue-position', authMiddleware, patien
       });
     }
     
-    // Get all appointments for the same doctor on the same date
+    // Check if appointment is today
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    
     const appointmentDate = new Date(appointment.booking_date);
+    appointmentDate.setHours(0, 0, 0, 0);
+    
+    // Only show queue position for TODAY's appointments
+    if (appointmentDate < today) {
+      return res.json({
+        appointmentId: appointment._id,
+        status: appointment.status,
+        queuePosition: null,
+        estimatedWaitTime: null,
+        message: 'Appointment date has passed'
+      });
+    }
+    
+    if (appointmentDate >= tomorrow) {
+      return res.json({
+        appointmentId: appointment._id,
+        status: appointment.status,
+        queuePosition: null,
+        estimatedWaitTime: null,
+        message: 'Appointment is scheduled for a future date',
+        appointmentDate: appointment.booking_date,
+        appointmentTime: appointment.time_slot
+      });
+    }
+    
+    // Get all appointments for the same doctor on the same date (TODAY)
     const startOfDay = new Date(appointmentDate);
     startOfDay.setHours(0, 0, 0, 0);
     const endOfDay = new Date(appointmentDate);
@@ -2122,6 +2557,45 @@ function formatWaitTime(minutes) {
   const remainingMinutes = minutes % 60;
   if (remainingMinutes === 0) return `About ${hours} hour${hours > 1 ? 's' : ''}`;
   return `About ${hours}h ${remainingMinutes}m`;
+}
+
+// Helper function to calculate sequential time slot based on token number
+function calculateSequentialTimeSlot(tokenNumber, sessionType, slotDuration) {
+  // Extract the numeric part from token number (e.g., T001 -> 1, T002 -> 2)
+  const tokenNum = parseInt(tokenNumber.replace('T', ''));
+  
+  // Define session start times
+  let sessionStartTime;
+  switch (sessionType) {
+    case 'morning':
+      sessionStartTime = '09:00';
+      break;
+    case 'afternoon':
+      sessionStartTime = '14:00';
+      break;
+    case 'evening':
+      sessionStartTime = '18:00';
+      break;
+    default:
+      sessionStartTime = '09:00';
+  }
+  
+  // Calculate the time slot based on token number and slot duration
+  // Token 1 = session start time, Token 2 = session start + slot duration, etc.
+  const totalMinutes = (tokenNum - 1) * slotDuration;
+  
+  // Parse session start time
+  const [startHours, startMinutes] = sessionStartTime.split(':').map(Number);
+  const startTimeInMinutes = startHours * 60 + startMinutes;
+  
+  // Calculate the actual time
+  const actualTimeInMinutes = startTimeInMinutes + totalMinutes;
+  
+  // Convert back to HH:MM format
+  const hours = Math.floor(actualTimeInMinutes / 60);
+  const minutes = actualTimeInMinutes % 60;
+  
+  return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
 }
 
 // Get single appointment by id (for reschedule prefill)
@@ -2202,6 +2676,7 @@ router.post('/appointments/:appointmentId/cancel', authMiddleware, patientMiddle
     let refundEligible = false;
     let refundAmount = 0;
     let refundStatus = 'none';
+    let effectiveMethod = 'upi'; // Default refund method
 
     // Cancellation Policy Logic
     if (isBeforeConsultation && !hasConsultationStarted) {
@@ -2244,7 +2719,7 @@ router.post('/appointments/:appointmentId/cancel', authMiddleware, patientMiddle
     if (refundEligible && appointment.payment_status === 'paid') {
       // Normalize original method to concrete handler
       const methodLower = String(appointment.paymentMethod || '').toLowerCase();
-      const effectiveMethod = methodLower.includes('upi') ? 'upi'
+      effectiveMethod = methodLower.includes('upi') ? 'upi'
         : (methodLower.includes('card') || methodLower.includes('credit') || methodLower.includes('debit')) ? 'card'
         : methodLower.includes('wallet') ? 'wallet'
         : methodLower.includes('cash') ? 'cash'
@@ -2274,7 +2749,7 @@ router.post('/appointments/:appointmentId/cancel', authMiddleware, patientMiddle
     const refundInfo = {
       eligible: refundEligible,
       amount: refundAmount,
-      method: refundMethod,
+      method: effectiveMethod,
       status: refundResult?.success ? 'processed' : 'failed'
     };
     
@@ -2298,11 +2773,11 @@ router.post('/appointments/:appointmentId/cancel', authMiddleware, patientMiddle
       response.refund = {
         eligible: true,
         amount: refundAmount,
-        method: refundMethod,
+        method: effectiveMethod,
         status: refundResult?.success ? 'processed' : 'failed',
         reference: updateData.refund_reference,
         message: refundResult?.success ? 
-          `Refund of ₹${refundAmount} will be processed to your ${refundMethod} account` :
+          `Refund of ₹${refundAmount} will be processed to your ${effectiveMethod} account` :
           'Refund processing failed. Please contact support.'
       };
     } else {
@@ -2400,7 +2875,7 @@ router.get('/appointments/active-department-check', authMiddleware, patientMiddl
       try {
         familyMember = await FamilyMember.findOne({
           _id: familyMemberId,
-          patientId: req.patient._id,
+          patient_id: req.patient._id,
           isActive: true
         });
         if (!familyMember) {
@@ -2724,8 +3199,8 @@ router.post('/appointments/:id/reschedule', authMiddleware, patientMiddleware, a
       return res.status(400).json({ message: 'Selected time slot is no longer available' });
     }
 
-    // Generate new token number for rescheduled appointment
-    const newTokenNumber = `T${Date.now().toString().slice(-4)}`;
+    // Generate new token number for rescheduled appointment using the same sequential system
+    const newTokenNumber = await generateSequentialTokenNumber(doctorId, selectedDate, sessionType, req.patient._id, appointment.family_member_id);
 
     appointment.doctor_id = doctorId;
     appointment.booking_date = selectedDate;
@@ -2733,6 +3208,60 @@ router.post('/appointments/:id/reschedule', authMiddleware, patientMiddleware, a
     appointment.status = 'booked';
     appointment.token_number = newTokenNumber;
     await appointment.save();
+
+    // Create in-app notifications for rescheduling
+    try {
+      const patientName = appointment.family_member_id ? 
+        appointment.family_member_id.name : 
+        appointment.patient_id.name;
+      
+      const doctorName = doctor.name;
+      const dateStr = new Date(selectedDate).toLocaleDateString('en-IN', {
+        weekday: 'long',
+        year: 'numeric',
+        month: 'long',
+        day: 'numeric'
+      });
+
+      // Create notification for patient
+      await notificationService.createNotification({
+        recipient_id: appointment.patient_id._id,
+        recipient_type: 'patient',
+        title: 'Appointment Rescheduled',
+        message: `Your appointment with Dr. ${doctorName} has been rescheduled to ${dateStr} at ${newTime}. New Token: ${newTokenNumber}`,
+        type: 'appointment',
+        priority: 'normal',
+        related_id: appointment._id,
+        related_type: 'appointment',
+        metadata: {
+          doctorName,
+          appointmentDate: dateStr,
+          appointmentTime: newTime,
+          tokenNumber: newTokenNumber,
+          patientName
+        }
+      });
+
+      // Create notification for doctor
+      await notificationService.createNotification({
+        recipient_id: appointment.doctor_id._id,
+        recipient_type: 'doctor',
+        title: 'Appointment Rescheduled',
+        message: `${patientName} has rescheduled their appointment to ${dateStr} at ${newTime}. New Token: ${newTokenNumber}`,
+        type: 'appointment',
+        priority: 'normal',
+        related_id: appointment._id,
+        related_type: 'appointment',
+        metadata: {
+          patientName,
+          appointmentDate: dateStr,
+          appointmentTime: newTime,
+          tokenNumber: newTokenNumber
+        }
+      });
+    } catch (notificationError) {
+      console.error('Error creating reschedule notifications:', notificationError);
+    }
 
     // Notify patient & doctor via email (best-effort)
     try {
@@ -2755,7 +3284,9 @@ router.post('/appointments/:id/reschedule', authMiddleware, patientMiddleware, a
           text: `A patient has rescheduled to ${dateStr} at ${newTime}. Token: ${newTokenNumber}`
         }).catch(() => {});
       }
-    } catch {}
+    } catch (e) {
+      console.error('Email notification error:', e);
+    }
 
     res.json({ message: 'Appointment rescheduled successfully', tokenNumber: newTokenNumber });
   } catch (error) {
@@ -2816,7 +3347,9 @@ router.post('/dev/seed-appointments', authMiddleware, patientMiddleware, async (
     ];
 
     for (const item of items) {
-      const tokenNumber = `T${Date.now().toString().slice(-4)}${Math.floor(Math.random()*90+10)}`;
+      // Generate sequential token number for test data
+      const sessionInfo = getSessionInfo(item.time_slot);
+      const tokenNumber = await generateSequentialTokenNumber(doctor._id, item.booking_date, sessionInfo.type, req.patient._id, null);
       const tok = new Token({
         patient_id: req.patient._id,
         family_member_id: null,
@@ -3571,6 +4104,384 @@ router.get('/invoices/:invoiceId/download', authMiddleware, patientMiddleware, a
   }
 });
 
+// Send invoice via email
+router.post('/invoices/:invoiceId/email', authMiddleware, patientMiddleware, async (req, res) => {
+  let browser;
+  try {
+    const { invoiceId } = req.params;
+    
+    const appointment = await Token.findById(invoiceId)
+      .populate('doctor_id', 'name doctor_info')
+      .populate('patient_id', 'name email phone');
+
+    if (!appointment) {
+      return res.status(404).json({ message: 'Invoice not found' });
+    }
+
+    // Verify ownership
+    if (appointment.patient_id._id.toString() !== req.patient._id.toString()) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    const invoiceData = {
+      invoiceNumber: `INV-${appointment.token_number || appointment._id.toString().slice(-6)}`,
+      date: appointment.createdAt.toLocaleDateString('en-IN'),
+      patientName: appointment.patient_name,
+      patientEmail: appointment.patient_email,
+      doctorName: appointment.doctor_id?.name || 'Unknown Doctor',
+      department: appointment.department,
+      appointmentDate: appointment.booking_date.toLocaleDateString('en-IN'),
+      timeSlot: appointment.time_slot,
+      amount: appointment.consultation_fee || 500,
+      status: appointment.payment_status,
+      transactionId: appointment._id.toString().slice(-8).toUpperCase(),
+      currentDate: new Date().toLocaleDateString('en-IN'),
+      currentTime: new Date().toLocaleTimeString('en-IN')
+    };
+
+    // Generate professional HTML content for PDF
+    const htmlContent = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <title>Invoice ${invoiceData.invoiceNumber}</title>
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body { 
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+                line-height: 1.6; 
+                color: #333; 
+                background: #fff;
+                font-size: 14px;
+                padding: 20px;
+            }
+            .invoice-container { 
+                max-width: 800px; 
+                margin: 0 auto; 
+                background: white; 
+                box-shadow: 0 0 20px rgba(0,0,0,0.1); 
+                border-radius: 8px; 
+                overflow: hidden;
+            }
+            .header { 
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+                color: white; 
+                padding: 30px; 
+                text-align: center; 
+            }
+            .header h1 { 
+                font-size: 28px; 
+                margin-bottom: 10px; 
+                font-weight: 700; 
+            }
+            .header p { 
+                font-size: 16px; 
+                opacity: 0.9; 
+            }
+            .invoice-details { 
+                padding: 30px; 
+                background: #f8fafc; 
+                border-bottom: 1px solid #e2e8f0; 
+            }
+            .invoice-number { 
+                font-size: 24px; 
+                font-weight: 700; 
+                color: #1f2937; 
+                margin-bottom: 20px; 
+            }
+            .invoice-meta { 
+                display: grid; 
+                grid-template-columns: 1fr 1fr; 
+                gap: 20px; 
+                margin-bottom: 20px; 
+            }
+            .meta-item { 
+                background: white; 
+                padding: 15px; 
+                border-radius: 6px; 
+                border-left: 4px solid #3b82f6; 
+            }
+            .meta-label { 
+                font-size: 12px; 
+                color: #6b7280; 
+                text-transform: uppercase; 
+                font-weight: 600; 
+                margin-bottom: 5px; 
+            }
+            .meta-value { 
+                font-size: 16px; 
+                color: #1f2937; 
+                font-weight: 600; 
+            }
+            .content { 
+                padding: 30px; 
+            }
+            .section { 
+                margin-bottom: 30px; 
+            }
+            .section-title { 
+                font-size: 18px; 
+                font-weight: 700; 
+                color: #1f2937; 
+                margin-bottom: 20px; 
+                border-bottom: 2px solid #e5e7eb; 
+                padding-bottom: 8px; 
+            }
+            .info-grid { 
+                display: grid; 
+                grid-template-columns: 1fr 1fr; 
+                gap: 30px; 
+                margin-bottom: 25px; 
+            }
+            .info-item { 
+                padding: 15px;
+                background: #f9fafb;
+                border-radius: 6px;
+                border-left: 4px solid #2563eb;
+            }
+            .info-label { 
+                font-size: 11px; 
+                color: #6b7280; 
+                text-transform: uppercase; 
+                font-weight: 600; 
+                margin-bottom: 5px; 
+            }
+            .info-value { 
+                font-size: 14px; 
+                color: #1f2937; 
+                font-weight: 600; 
+            }
+            .amount-section { 
+                background: #f0f9ff; 
+                padding: 25px; 
+                border-radius: 8px; 
+                border: 2px solid #0ea5e9; 
+                text-align: center; 
+                margin: 30px 0; 
+            }
+            .amount-label { 
+                font-size: 14px; 
+                color: #0369a1; 
+                margin-bottom: 10px; 
+                font-weight: 600; 
+            }
+            .amount-value { 
+                font-size: 32px; 
+                color: #0c4a6e; 
+                font-weight: 800; 
+                margin-bottom: 5px; 
+            }
+            .amount-currency { 
+                font-size: 16px; 
+                color: #0369a1; 
+                font-weight: 600; 
+            }
+            .status-badge { 
+                display: inline-block; 
+                padding: 8px 16px; 
+                border-radius: 20px; 
+                font-size: 12px; 
+                font-weight: 600; 
+                text-transform: uppercase; 
+                margin-top: 10px; 
+            }
+            .status-paid { 
+                background: #dcfce7; 
+                color: #166534; 
+            }
+            .status-pending { 
+                background: #fef3c7; 
+                color: #92400e; 
+            }
+            .footer { 
+                background: #1f2937; 
+                color: white; 
+                padding: 25px; 
+                text-align: center; 
+            }
+            .footer p { 
+                margin-bottom: 10px; 
+                opacity: 0.8; 
+            }
+            .footer .highlight { 
+                color: #60a5fa; 
+                font-weight: 600; 
+            }
+        </style>
+    </head>
+    <body>
+        <div class="invoice-container">
+            <div class="header">
+                <h1>Medical Invoice</h1>
+                <p>Professional Healthcare Services</p>
+            </div>
+            
+            <div class="invoice-details">
+                <div class="invoice-number">Invoice #${invoiceData.invoiceNumber}</div>
+                <div class="invoice-meta">
+                    <div class="meta-item">
+                        <div class="meta-label">Invoice Date</div>
+                        <div class="meta-value">${invoiceData.currentDate}</div>
+                    </div>
+                    <div class="meta-item">
+                        <div class="meta-label">Transaction ID</div>
+                        <div class="meta-value">${invoiceData.transactionId}</div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="content">
+                <div class="section">
+                    <div class="section-title">Patient Information</div>
+                    <div class="info-grid">
+                        <div class="info-item">
+                            <div class="info-label">Patient Name</div>
+                            <div class="info-value">${invoiceData.patientName}</div>
+                        </div>
+                        <div class="info-item">
+                            <div class="info-label">Email Address</div>
+                            <div class="info-value">${invoiceData.patientEmail}</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="section">
+                    <div class="section-title">Appointment Details</div>
+                    <div class="info-grid">
+                        <div class="info-item">
+                            <div class="info-label">Doctor</div>
+                            <div class="info-value">Dr. ${invoiceData.doctorName}</div>
+                        </div>
+                        <div class="info-item">
+                            <div class="info-label">Department</div>
+                            <div class="info-value">${invoiceData.department}</div>
+                        </div>
+                        <div class="info-item">
+                            <div class="info-label">Appointment Date</div>
+                            <div class="info-value">${invoiceData.appointmentDate}</div>
+                        </div>
+                        <div class="info-item">
+                            <div class="info-label">Time Slot</div>
+                            <div class="info-value">${invoiceData.timeSlot}</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="amount-section">
+                    <div class="amount-label">Total Amount</div>
+                    <div class="amount-value">₹${invoiceData.amount}</div>
+                    <div class="amount-currency">Indian Rupees</div>
+                    <div class="status-badge status-${invoiceData.status}">${invoiceData.status.toUpperCase()}</div>
+                </div>
+            </div>
+            
+            <div class="footer">
+                <p>Thank you for choosing our healthcare services!</p>
+                <p>For any queries, please contact our support team.</p>
+                <p>Generated on <span class="highlight">${invoiceData.currentDate}</span> at <span class="highlight">${invoiceData.currentTime}</span></p>
+            </div>
+        </div>
+    </body>
+    </html>
+    `;
+
+    // Generate PDF using Puppeteer
+    browser = await puppeteer.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox']
+    });
+    
+    const page = await browser.newPage();
+    await page.setContent(htmlContent, { waitUntil: 'networkidle0' });
+    
+    const pdfBuffer = await page.pdf({
+      format: 'A4',
+      printBackground: true,
+      margin: {
+        top: '20px',
+        right: '20px',
+        bottom: '20px',
+        left: '20px'
+      }
+    });
+
+    await browser.close();
+
+    // Send email with PDF attachment
+    await emailService.sendEmail({
+      to: appointment.patient_id.email,
+      subject: `Invoice ${invoiceData.invoiceNumber} - MediQ Healthcare Services`,
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+          <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 10px 10px 0 0; text-align: center;">
+            <h1 style="margin: 0; font-size: 24px;">Invoice ${invoiceData.invoiceNumber}</h1>
+            <p style="margin: 10px 0 0 0; opacity: 0.9;">Your medical consultation invoice</p>
+          </div>
+          
+          <div style="background: white; padding: 30px; border-radius: 0 0 10px 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+            <div style="text-align: center; margin-bottom: 30px;">
+              <div style="width: 80px; height: 80px; background: #f3f4f6; border-radius: 50%; margin: 0 auto 20px; display: flex; align-items: center; justify-content: center;">
+                <span style="font-size: 32px;">📄</span>
+              </div>
+              <h2 style="color: #1f2937; margin: 0 0 10px 0;">Invoice Sent Successfully</h2>
+              <p style="color: #6b7280; margin: 0;">Your invoice has been sent to your email address.</p>
+            </div>
+            
+            <div class="invoice-details" style="background: #f9fafb; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
+              <h3 style="color: #1f2937; margin: 0 0 15px 0;">📋 Invoice Details</h3>
+              <p style="margin: 5px 0; color: #374151;"><strong>Invoice Number:</strong> ${invoiceData.invoiceNumber}</p>
+              <p style="margin: 5px 0; color: #374151;"><strong>Patient:</strong> ${invoiceData.patientName}</p>
+              <p style="margin: 5px 0; color: #374151;"><strong>Doctor:</strong> Dr. ${invoiceData.doctorName}</p>
+              <p style="margin: 5px 0; color: #374151;"><strong>Department:</strong> ${invoiceData.department}</p>
+              <p style="margin: 5px 0; color: #374151;"><strong>Date:</strong> ${invoiceData.appointmentDate}</p>
+              <p style="margin: 5px 0; color: #374151;"><strong>Time:</strong> ${invoiceData.timeSlot}</p>
+              <p style="margin: 5px 0; color: #374151;"><strong>Amount:</strong> ₹${invoiceData.amount}</p>
+              <p style="margin: 5px 0; color: #374151;"><strong>Status:</strong> <span style="color: ${invoiceData.status === 'paid' ? '#16a34a' : '#d97706'};">${invoiceData.status.toUpperCase()}</span></p>
+            </div>
+            
+            <div style="background: #fef3c7; border: 1px solid #f59e0b; border-radius: 8px; padding: 15px; margin-bottom: 20px;">
+              <h4 style="color: #92400e; margin: 0 0 10px 0;">📧 Email Delivery</h4>
+              <p style="color: #92400e; margin: 0;">Your invoice has been sent to: <strong>${appointment.patient_id.email}</strong></p>
+              <p style="color: #92400e; margin: 5px 0 0 0; font-size: 14px;">Please check your inbox and spam folder if you don't see it within a few minutes.</p>
+            </div>
+            
+            <div style="text-align: center; margin-top: 30px;">
+              <p style="color: #6b7280; font-size: 14px;">Thank you for using MediQ for your healthcare needs.</p>
+              <p style="color: #6b7280; font-size: 14px;">If you have any questions, please contact our support team.</p>
+            </div>
+          </div>
+        </div>
+      `,
+      attachments: [
+        {
+          filename: `Invoice-${invoiceData.invoiceNumber}.pdf`,
+          content: pdfBuffer,
+          contentType: 'application/pdf'
+        }
+      ]
+    });
+
+    res.json({
+      success: true,
+      message: 'Invoice sent successfully to your email address',
+      invoiceNumber: invoiceData.invoiceNumber,
+      email: appointment.patient_id.email
+    });
+    
+  } catch (error) {
+    if (browser) {
+      await browser.close();
+    }
+    console.error('Send invoice email error:', error);
+    res.status(500).json({ 
+      success: false,
+      message: 'Failed to send invoice email. Please try again.', 
+      error: error.message 
+    });
+  }
+});
+
 // Test PDF generation endpoint
 router.get('/test-pdf', async (req, res) => {
   try {
@@ -3721,27 +4632,47 @@ router.put('/settings', authMiddleware, patientMiddleware, async (req, res) => {
 // Get patient invoices for settings page
 router.get('/settings/invoices', authMiddleware, patientMiddleware, async (req, res) => {
   try {
-    const invoices = await Appointment.find({
-      patient_id: req.patient._id,
-      paymentStatus: { $in: ['paid', 'pending'] }
+    console.log('Fetching invoices for settings page - patient:', req.patient._id);
+    
+    // Get all appointments for the patient from Token model (same as working invoices endpoint)
+    const appointments = await Token.find({
+      $or: [
+        { patient_id: req.patient._id },
+        { 'family_member_id.patientId': req.patient._id }
+      ]
     })
     .populate('doctor_id', 'name email')
-    .populate('department_id', 'name')
-    .sort({ createdAt: -1 })
-    .select('_id appointmentDate appointmentTime paymentStatus amount doctor_id department_id createdAt');
+    .sort({ createdAt: -1 });
 
-    const formattedInvoices = invoices.map(appointment => ({
-      id: appointment._id,
-      invoice_number: `INV-${appointment._id.toString().slice(-8).toUpperCase()}`,
-      amount: appointment.amount || 500,
-      payment_status: appointment.paymentStatus,
-      created_at: appointment.createdAt,
-      appointment: {
-        appointmentDate: appointment.appointmentDate,
-        doctorName: appointment.doctor_id?.name || 'Unknown Doctor',
-        departmentName: appointment.department_id?.name || 'Unknown Department'
+    console.log('Found appointments for settings invoices:', appointments.length);
+
+    const formattedInvoices = appointments.map(apt => {
+      // Determine payment status based on appointment status
+      let paymentStatus = apt.payment_status || 'pending';
+      if (apt.status === 'cancelled') {
+        paymentStatus = 'cancelled';
+      } else if (apt.status === 'consulted' && apt.payment_status === 'paid') {
+        paymentStatus = 'paid';
       }
-    }));
+
+      return {
+        id: apt._id,
+        invoice_number: `INV-${apt._id.toString().slice(-8).toUpperCase()}`,
+        amount: apt.amount || 500,
+        payment_status: paymentStatus,
+        created_at: apt.createdAt,
+        appointment: {
+          appointmentDate: apt.booking_date,
+          appointmentTime: apt.time_slot,
+          doctorName: apt.doctor_id?.name || 'Unknown Doctor',
+          departmentName: apt.department || 'Unknown Department'
+        },
+        patient_name: apt.family_member_id ? apt.family_member_id.name : (apt.patient_id?.name || 'Unknown Patient'),
+        status: apt.status
+      };
+    });
+
+    console.log('Generated formatted invoices for settings:', formattedInvoices.length);
 
     res.json({
       success: true,
@@ -3751,7 +4682,8 @@ router.get('/settings/invoices', authMiddleware, patientMiddleware, async (req, 
     console.error('Error fetching invoices for settings:', error);
     res.status(500).json({
       success: false,
-      message: 'Failed to fetch invoices'
+      message: 'Failed to fetch invoices',
+      error: error.message
     });
   }
 });
@@ -3759,23 +4691,35 @@ router.get('/settings/invoices', authMiddleware, patientMiddleware, async (req, 
 // Get patient appointments for settings page
 router.get('/settings/appointments', authMiddleware, patientMiddleware, async (req, res) => {
   try {
-    const appointments = await Appointment.find({
-      patient_id: req.patient._id,
-      status: { $in: ['confirmed', 'pending'] }
+    console.log('Fetching appointments for patient:', req.patient._id);
+    
+    // Use Token model for consistency with other routes
+    const appointments = await Token.find({
+      $or: [
+        { patient_id: req.patient._id },
+        { 'family_member_id.patientId': req.patient._id }
+      ],
+      status: { $in: ['booked', 'in_queue'] }
     })
     .populate('doctor_id', 'name email')
-    .populate('department_id', 'name')
-    .sort({ appointmentDate: 1, appointmentTime: 1 })
-    .select('_id appointmentDate appointmentTime status doctor_id department_id');
+    .populate('patient_id', 'name email')
+    .populate('family_member_id', 'name relation patientId')
+    .sort({ booking_date: 1, time_slot: 1 });
+
+    console.log('Found appointments:', appointments.length);
 
     const formattedAppointments = appointments.map(appointment => ({
       id: appointment._id,
-      appointmentDate: appointment.appointmentDate,
-      appointmentTime: appointment.appointmentTime,
+      appointmentDate: appointment.booking_date,
+      appointmentTime: appointment.time_slot,
       status: appointment.status,
       doctorName: appointment.doctor_id?.name || 'Unknown Doctor',
-      departmentName: appointment.department_id?.name || 'Unknown Department'
+      departmentName: appointment.department || 'Unknown Department',
+      tokenNumber: appointment.token_number,
+      symptoms: appointment.symptoms
     }));
+
+    console.log('Formatted appointments:', formattedAppointments.length);
 
     res.json({
       success: true,
@@ -3793,23 +4737,32 @@ router.get('/settings/appointments', authMiddleware, patientMiddleware, async (r
 // Get consulted appointments for settings page
 router.get('/settings/consulted-appointments', authMiddleware, patientMiddleware, async (req, res) => {
   try {
-    const appointments = await Appointment.find({
-      patient_id: req.patient._id,
+    const appointments = await Token.find({
+      $or: [
+        { patient_id: req.patient._id },
+        { 'family_member_id.patientId': req.patient._id }
+      ],
       status: 'consulted'
     })
     .populate('doctor_id', 'name email')
-    .populate('department_id', 'name')
-    .sort({ appointmentDate: -1 })
-    .select('_id appointmentDate appointmentTime status doctor_id department_id diagnosis');
+    .populate('patient_id', 'name email')
+    .populate('family_member_id', 'name')
+    .sort({ consultation_completed_at: -1, booking_date: -1 })
+    .select('_id booking_date time_slot status doctor_id department diagnosis consultation_completed_at appointment_type meeting_link consultationData');
 
     const formattedAppointments = appointments.map(appointment => ({
       id: appointment._id,
-      appointmentDate: appointment.appointmentDate,
-      appointmentTime: appointment.appointmentTime,
+      appointmentDate: appointment.booking_date,
+      appointmentTime: appointment.time_slot,
       status: appointment.status,
       doctorName: appointment.doctor_id?.name || 'Unknown Doctor',
-      departmentName: appointment.department_id?.name || 'Unknown Department',
-      diagnosis: appointment.diagnosis || null
+      departmentName: appointment.department || 'Unknown Department',
+      diagnosis: appointment.diagnosis || null,
+      consultationCompletedAt: appointment.consultation_completed_at,
+      appointmentType: appointment.appointment_type,
+      isVideoConsultation: appointment.appointment_type === 'video',
+      meetingLink: appointment.meeting_link,
+      consultationData: appointment.consultationData
     }));
 
     res.json({
@@ -3828,24 +4781,36 @@ router.get('/settings/consulted-appointments', authMiddleware, patientMiddleware
 // Get cancelled appointments for settings page
 router.get('/settings/cancelled-appointments', authMiddleware, patientMiddleware, async (req, res) => {
   try {
-    const appointments = await Appointment.find({
-      patient_id: req.patient._id,
+    console.log('Fetching cancelled appointments for patient:', req.patient._id);
+    
+    // Use Token model (same as cancel route) instead of Appointment model
+    const appointments = await Token.find({
+      $or: [
+        { patient_id: req.patient._id },
+        { 'family_member_id.patientId': req.patient._id }
+      ],
       status: 'cancelled'
     })
     .populate('doctor_id', 'name email')
-    .populate('department_id', 'name')
-    .sort({ appointmentDate: -1 })
-    .select('_id appointmentDate appointmentTime status doctor_id department_id cancellationReason');
+    .populate('patient_id', 'name email')
+    .populate('family_member_id', 'name relation patientId')
+    .sort({ booking_date: -1, createdAt: -1 });
+
+    console.log('Found cancelled appointments:', appointments.length);
 
     const formattedAppointments = appointments.map(appointment => ({
       id: appointment._id,
-      appointmentDate: appointment.appointmentDate,
-      appointmentTime: appointment.appointmentTime,
+      appointmentDate: appointment.booking_date,
+      appointmentTime: appointment.time_slot,
       status: appointment.status,
       doctorName: appointment.doctor_id?.name || 'Unknown Doctor',
-      departmentName: appointment.department_id?.name || 'Unknown Department',
-      cancellationReason: appointment.cancellationReason || null
+      departmentName: appointment.department || 'Unknown Department',
+      cancellationReason: appointment.cancellation_reason || null,
+      cancelledAt: appointment.cancelled_at,
+      cancelledBy: appointment.cancelled_by
     }));
+
+    console.log('Formatted cancelled appointments:', formattedAppointments.length);
 
     res.json({
       success: true,

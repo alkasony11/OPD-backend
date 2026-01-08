@@ -119,84 +119,94 @@ function getBookingCutoffMessage(sessionName, currentTime) {
 }
 
 /**
- * Generate sequential token number based on session type and existing appointments
- * Token numbers reset to 1-20 for each new day
+ * Generate sequential token number based on existing appointments
+ * Token numbers are continuous across all departments for each day (T001, T002, T003...)
  * @param {string} doctorId - Doctor ID
  * @param {Date} appointmentDate - Appointment date
  * @param {string} sessionType - 'morning', 'afternoon', or 'evening'
- * @returns {Promise<string>} - Sequential token number (T001-T020)
+ * @returns {Promise<string>} - Sequential token number (T001-T999)
  */
-async function generateSequentialTokenNumber(doctorId, appointmentDate, sessionType) {
+async function generateSequentialTokenNumber(doctorId, appointmentDate, sessionType, patientId, familyMemberId = null) {
+  const { Token, Counter } = require('../models/User');
   const mongoose = require('mongoose');
-  const Token = mongoose.model('Token');
   
   // Normalize appointment date to start of day for consistent comparison
   const appointmentDay = new Date(appointmentDate);
   appointmentDay.setHours(0, 0, 0, 0);
   
-  // Calculate exact date range for this specific day only
-  const startOfDay = new Date(appointmentDay);
-  const endOfDay = new Date(appointmentDay);
-  endOfDay.setHours(23, 59, 59, 999);
+  // Determine the user identifier (patient or family member)
+  const userId = familyMemberId || patientId;
+  const userType = familyMemberId ? 'family_member' : 'patient';
   
-  console.log(`[TOKEN-GEN] Generating token for doctor ${doctorId} on ${appointmentDay.toDateString()} for ${sessionType} session`);
+  console.log(`[TOKEN-GEN] Generating global token for ${userType} ${userId} with doctor ${doctorId} on ${appointmentDay.toDateString()} for ${sessionType} session`);
   
-  // Get all existing appointments for this doctor on this specific date only
-  const existingAppointments = await Token.find({
-    doctor_id: doctorId,
-    booking_date: { $gte: startOfDay, $lte: endOfDay },
-    status: { $nin: ['cancelled', 'missed'] }
-  }).sort({ created_at: 1 }); // Sort by creation time to maintain order
+  // Create a unique counter key for the date (global across all departments)
+  const counterKey = `token_${appointmentDay.toISOString().split('T')[0]}`;
   
-  console.log(`[TOKEN-GEN] Found ${existingAppointments.length} existing appointments for this date`);
-  
-  // Determine the base number and range for the session
-  let baseNumber, maxNumber;
-  if (sessionType === 'morning') {
-    baseNumber = 1;  // Morning: T001-T010
-    maxNumber = 10;
-  } else if (sessionType === 'afternoon') {
-    baseNumber = 11; // Afternoon: T011-T020
-    maxNumber = 20;
-  } else if (sessionType === 'evening') {
-    baseNumber = 21; // Evening: T021-T030
-    maxNumber = 30;
-  } else {
-    // For 'other' session type, use working hours range
-    baseNumber = 1;
-    maxNumber = 20;
+  // Use atomic findAndModify to get the next sequential number
+  const maxRetries = 10;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`[TOKEN-GEN] Attempt ${attempt}: Getting next token number for counter: ${counterKey}`);
+      
+      // Atomically increment the counter and get the new value
+      const counter = await Counter.findOneAndUpdate(
+        { key: counterKey },
+        { $inc: { count: 1 } },
+        { 
+          upsert: true, 
+          new: true, 
+          setDefaultsOnInsert: true 
+        }
+      );
+      
+      const nextNumber = counter.count;
+      console.log(`[TOKEN-GEN] Counter returned number: ${nextNumber}`);
+      
+      // Ensure we don't exceed reasonable limits (T001-T999)
+      if (nextNumber > 999) {
+        throw new Error(`No more tokens available for ${appointmentDay.toDateString()}. Maximum 999 tokens per day.`);
+      }
+      
+      const tokenNumber = `T${nextNumber.toString().padStart(3, '0')}`;
+      console.log(`[TOKEN-GEN] Generated token: ${tokenNumber} for ${userType} ${userId} (attempt ${attempt})`);
+      
+      // Verify the token number is unique by attempting to find an existing one
+      const existingToken = await Token.findOne({ token_number: tokenNumber });
+      if (existingToken) {
+        console.log(`[TOKEN-GEN] Token ${tokenNumber} already exists, retrying...`);
+        if (attempt === maxRetries) {
+          throw new Error(`Failed to generate unique token number after ${maxRetries} attempts. Please try again.`);
+        }
+        // Wait a bit before retrying
+        await new Promise(resolve => setTimeout(resolve, 50 * attempt));
+        continue;
+      }
+      
+      return tokenNumber;
+      
+    } catch (error) {
+      console.error(`[TOKEN-GEN] Attempt ${attempt} failed:`, error.message);
+      
+      if (error.code === 11000 && error.keyPattern?.token_number) {
+        // Duplicate key error - token number already exists
+        console.log(`[TOKEN-GEN] Duplicate token number detected, retrying...`);
+        if (attempt === maxRetries) {
+          throw new Error(`Failed to generate unique token number after ${maxRetries} attempts. Please try again.`);
+        }
+        // Wait a bit before retrying to avoid race conditions
+        await new Promise(resolve => setTimeout(resolve, 100 * attempt));
+        continue;
+      } else if (attempt === maxRetries) {
+        // Final attempt failed
+        throw new Error(`Failed to generate token number: ${error.message}`);
+      } else {
+        // Wait before retrying for other errors
+        await new Promise(resolve => setTimeout(resolve, 100 * attempt));
+        continue;
+      }
+    }
   }
-  
-  // Find used token numbers for this session on this specific date
-  const usedNumbers = existingAppointments
-    .filter(apt => {
-      const aptSessionType = getSessionInfo(apt.time_slot).type;
-      return aptSessionType === sessionType;
-    })
-    .map(apt => {
-      // Extract number from token_number (e.g., "T001" -> 1)
-      const match = apt.token_number?.match(/T(\d+)/);
-      return match ? parseInt(match[1]) : null;
-    })
-    .filter(num => num !== null && num >= baseNumber && num <= maxNumber);
-  
-  console.log(`[TOKEN-GEN] Used numbers for ${sessionType} session: [${usedNumbers.join(', ')}]`);
-  
-  // Find the next available number in the session range
-  let nextNumber = baseNumber;
-  
-  while (nextNumber <= maxNumber && usedNumbers.includes(nextNumber)) {
-    nextNumber++;
-  }
-  
-  if (nextNumber > maxNumber) {
-    throw new Error(`No more tokens available for ${sessionType} session on ${appointmentDay.toDateString()}. Maximum ${maxNumber} tokens per session.`);
-  }
-  
-  const tokenNumber = `T${nextNumber.toString().padStart(3, '0')}`;
-  console.log(`[TOKEN-GEN] Generated token: ${tokenNumber} for ${sessionType} session`);
-  
-  return tokenNumber;
 }
 
 module.exports = {

@@ -194,20 +194,26 @@ class WhatsAppBotService {
       const tokenNumber = appointment.token_number;
       const department = appointment.department;
 
-      const message = `✅ *Appointment Confirmed!*\n\n` +
-        `Hello ${patientName},\n\n` +
-        `Your appointment has been successfully booked:\n\n` +
+      const message = `🏥 *MediQ Hospital - Appointment Confirmed*\n\n` +
+        `Dear ${patientName},\n\n` +
+        `✅ Your appointment has been successfully booked!\n\n` +
+        `📋 *Appointment Details:*\n` +
         `📅 Date: ${appointmentDate}\n` +
         `🕐 Time: ${appointmentTime}\n` +
         `👨‍⚕️ Doctor: Dr. ${doctorName}\n` +
         `🏥 Department: ${department}\n` +
-        `🎫 Token: #${tokenNumber}\n\n` +
-        `We'll send you a reminder 24 hours before your appointment.\n\n` +
-        `To manage your appointment, reply with:\n` +
-        `• "My Appointments" - to view all appointments\n` +
-        `• "Reschedule" - to change this appointment\n` +
-        `• "Cancel" - to cancel this appointment\n\n` +
-        `Need help? Just type "Help" or visit our website.`;
+        `🎫 Token Number: #${tokenNumber}\n\n` +
+        `📱 *Important Reminders:*\n` +
+        `• Please arrive 15 minutes early\n` +
+        `• Bring a valid ID and insurance card\n` +
+        `• We'll send you a reminder 24 hours before\n\n` +
+        `🤖 *Quick Actions (Reply with):*\n` +
+        `• "My Appointments" - View all appointments\n` +
+        `• "Reschedule" - Change this appointment\n` +
+        `• "Cancel" - Cancel this appointment\n` +
+        `• "Directions" - Get hospital location\n` +
+        `• "Help" - Get assistance\n\n` +
+        `Thank you for choosing MediQ Hospital! 🏥`;
 
       return await this.sendMessage(`whatsapp:${appointment.patient_id.phone}`, message);
     } catch (error) {
@@ -235,24 +241,30 @@ class WhatsAppBotService {
       const appointmentDate = new Date(appointment.booking_date).toLocaleDateString();
       const appointmentTime = appointment.time_slot;
 
-      let message = `❌ *Appointment Cancelled*\n\n` +
-        `Hello ${patientName},\n\n` +
-        `Your appointment has been cancelled:\n\n` +
+      let message = `🏥 *MediQ Hospital - Appointment Cancelled*\n\n` +
+        `Dear ${patientName},\n\n` +
+        `❌ Your appointment has been cancelled:\n\n` +
+        `📋 *Cancelled Appointment Details:*\n` +
         `📅 Date: ${appointmentDate}\n` +
         `🕐 Time: ${appointmentTime}\n` +
         `👨‍⚕️ Doctor: Dr. ${doctorName}\n\n`;
 
       if (refundInfo && refundInfo.eligible) {
-        message += `💰 Refund Information:\n` +
+        message += `💰 *Refund Information:*\n` +
           `Amount: ₹${refundInfo.amount}\n` +
           `Method: ${refundInfo.method}\n` +
-          `Status: ${refundInfo.status}\n\n`;
+          `Status: ${refundInfo.status}\n` +
+          `Reference: ${refundInfo.reference || 'N/A'}\n\n`;
       }
 
-      message += `To book a new appointment, reply with:\n` +
-        `• "Book Appointment" - to schedule a new visit\n` +
-        `• "My Appointments" - to view all appointments\n\n` +
-        `Need help? Just type "Help" or visit our website.`;
+      message += `🔄 *What's Next?*\n` +
+        `We're sorry for any inconvenience. You can:\n\n` +
+        `🤖 *Quick Actions (Reply with):*\n` +
+        `• "Book Appointment" - Schedule a new visit\n` +
+        `• "My Appointments" - View all appointments\n` +
+        `• "Available Doctors" - See available doctors\n` +
+        `• "Help" - Get assistance\n\n` +
+        `Thank you for choosing MediQ Hospital! 🏥`;
 
       return await this.sendMessage(`whatsapp:${appointment.patient_id.phone}`, message);
     } catch (error) {
@@ -293,6 +305,194 @@ class WhatsAppBotService {
     } catch (error) {
       console.error('Error sending queue update:', error);
     }
+  }
+
+  // Send rescheduling confirmation
+  async sendReschedulingConfirmation(appointmentId, oldDate, oldTime) {
+    try {
+      const appointment = await Token.findById(appointmentId)
+        .populate('patient_id', 'name phone')
+        .populate('doctor_id', 'name')
+        .populate('family_member_id', 'name');
+
+      if (!appointment || !appointment.patient_id.phone) {
+        return;
+      }
+
+      const patientName = appointment.family_member_id ? 
+        appointment.family_member_id.name : 
+        appointment.patient_id.name;
+      
+      const doctorName = appointment.doctor_id.name;
+      const newAppointmentDate = new Date(appointment.booking_date).toLocaleDateString();
+      const newAppointmentTime = appointment.time_slot;
+      const tokenNumber = appointment.token_number;
+      const department = appointment.department;
+
+      const message = `🏥 *MediQ Hospital - Appointment Rescheduled*\n\n` +
+        `Dear ${patientName},\n\n` +
+        `🔄 Your appointment has been successfully rescheduled!\n\n` +
+        `📋 *Previous Appointment:*\n` +
+        `📅 Date: ${oldDate}\n` +
+        `🕐 Time: ${oldTime}\n\n` +
+        `✅ *New Appointment Details:*\n` +
+        `📅 Date: ${newAppointmentDate}\n` +
+        `🕐 Time: ${newAppointmentTime}\n` +
+        `👨‍⚕️ Doctor: Dr. ${doctorName}\n` +
+        `🏥 Department: ${department}\n` +
+        `🎫 Token Number: #${tokenNumber}\n\n` +
+        `📱 *Important Reminders:*\n` +
+        `• Please arrive 15 minutes early\n` +
+        `• Bring a valid ID and insurance card\n` +
+        `• We'll send you a reminder 24 hours before\n\n` +
+        `🤖 *Quick Actions (Reply with):*\n` +
+        `• "My Appointments" - View all appointments\n` +
+        `• "Reschedule" - Change this appointment again\n` +
+        `• "Cancel" - Cancel this appointment\n` +
+        `• "Directions" - Get hospital location\n` +
+        `• "Help" - Get assistance\n\n` +
+        `Thank you for choosing MediQ Hospital! 🏥`;
+
+      return await this.sendMessage(`whatsapp:${appointment.patient_id.phone}`, message);
+    } catch (error) {
+      console.error('Error sending rescheduling confirmation:', error);
+    }
+  }
+
+  // Send leave cancellation notification
+  async sendLeaveCancellation(appointmentId, leaveInfo) {
+    try {
+      const appointment = await Token.findById(appointmentId)
+        .populate('patient_id', 'name phone')
+        .populate('doctor_id', 'name')
+        .populate('family_member_id', 'name');
+
+      if (!appointment || !appointment.patient_id.phone) {
+        return;
+      }
+
+      const patientName = appointment.family_member_id ? 
+        appointment.family_member_id.name : 
+        appointment.patient_id.name;
+      
+      const doctorName = appointment.doctor_id.name;
+      const appointmentDate = new Date(appointment.booking_date).toLocaleDateString();
+      const appointmentTime = appointment.time_slot;
+
+      const message = `❌ *Appointment Cancelled - Doctor Leave*\n\n` +
+        `Hello ${patientName},\n\n` +
+        `We regret to inform you that your appointment has been cancelled due to Dr. ${doctorName}'s approved leave:\n\n` +
+        `📅 Date: ${appointmentDate}\n` +
+        `🕐 Time: ${appointmentTime}\n` +
+        `👨‍⚕️ Doctor: Dr. ${doctorName}\n\n` +
+        `📋 *Leave Information:*\n` +
+        `• Reason: ${leaveInfo.reason || 'Doctor leave'}\n` +
+        `• Type: ${leaveInfo.leave_type === 'full_day' ? 'Full Day' : 'Half Day'}\n` +
+        `${leaveInfo.leave_type === 'half_day' ? `• Session: ${leaveInfo.session} session\n` : ''}\n` +
+        `🔄 *Your Options:*\n` +
+        `• Reschedule with Dr. ${doctorName} for a later date\n` +
+        `• Choose another doctor from the same department\n` +
+        `• Request a full refund\n\n` +
+        `To book a new appointment, reply with:\n` +
+        `• "Book Appointment" - to schedule a new visit\n` +
+        `• "My Appointments" - to view all appointments\n\n` +
+        `We sincerely apologize for this inconvenience.\n\n` +
+        `Need help? Just type "Help" or visit our website.`;
+
+      return await this.sendMessage(`whatsapp:${appointment.patient_id.phone}`, message);
+    } catch (error) {
+      console.error('Error sending leave cancellation:', error);
+    }
+  }
+
+  // Send professional appointment status update
+  async sendAppointmentStatusUpdate(appointmentId, status, additionalInfo = {}) {
+    try {
+      const appointment = await Token.findById(appointmentId)
+        .populate('patient_id', 'name phone')
+        .populate('doctor_id', 'name')
+        .populate('family_member_id', 'name');
+
+      if (!appointment || !appointment.patient_id.phone) {
+        return;
+      }
+
+      const patientName = appointment.family_member_id ? 
+        appointment.family_member_id.name : 
+        appointment.patient_id.name;
+      
+      const doctorName = appointment.doctor_id.name;
+      const appointmentDate = new Date(appointment.booking_date).toLocaleDateString();
+      const appointmentTime = appointment.time_slot;
+      const tokenNumber = appointment.token_number;
+      const department = appointment.department;
+
+      let message = `🏥 *MediQ Hospital - Appointment Update*\n\n` +
+        `Dear ${patientName},\n\n`;
+
+      switch (status) {
+        case 'confirmed':
+          message += `✅ Your appointment has been confirmed:\n\n`;
+          break;
+        case 'completed':
+          message += `✅ Your appointment has been completed:\n\n`;
+          break;
+        case 'missed':
+          message += `⚠️ Your appointment was missed:\n\n`;
+          break;
+        case 'cancelled_by_hospital':
+          message += `❌ Your appointment has been cancelled by the hospital:\n\n`;
+          break;
+        default:
+          message += `📋 Your appointment status has been updated:\n\n`;
+      }
+
+      message += `📋 *Appointment Details:*\n` +
+        `📅 Date: ${appointmentDate}\n` +
+        `🕐 Time: ${appointmentTime}\n` +
+        `👨‍⚕️ Doctor: Dr. ${doctorName}\n` +
+        `🏥 Department: ${department}\n` +
+        `🎫 Token: #${tokenNumber}\n\n`;
+
+      if (additionalInfo.message) {
+        message += `📝 *Additional Information:*\n${additionalInfo.message}\n\n`;
+      }
+
+      message += `🤖 *Quick Actions (Reply with):*\n` +
+        `• "My Appointments" - View all appointments\n` +
+        `• "Book Appointment" - Schedule new visit\n` +
+        `• "Help" - Get assistance\n\n` +
+        `Thank you for choosing MediQ Hospital! 🏥`;
+
+      return await this.sendMessage(`whatsapp:${appointment.patient_id.phone}`, message);
+    } catch (error) {
+      console.error('Error sending appointment status update:', error);
+    }
+  }
+
+  // Send professional welcome message for new users
+  async sendWelcomeMessage(phoneNumber, patientName) {
+    const message = `🏥 *Welcome to MediQ Hospital!*\n\n` +
+      `Dear ${patientName},\n\n` +
+      `Welcome to MediQ Hospital! We're excited to have you as our patient.\n\n` +
+      `🤖 *I'm your personal assistant and I can help you with:*\n` +
+      `• Book appointments\n` +
+      `• Check appointment status\n` +
+      `• Reschedule appointments\n` +
+      `• Cancel appointments\n` +
+      `• Get hospital information\n` +
+      `• Find doctors\n` +
+      `• Emergency contacts\n\n` +
+      `*Just type any of these commands:*\n` +
+      `• "Book Appointment"\n` +
+      `• "My Appointments"\n` +
+      `• "Available Doctors"\n` +
+      `• "Hospital Info"\n` +
+      `• "Emergency"\n` +
+      `• "Help"\n\n` +
+      `I'm here 24/7 to assist you! 🏥✨`;
+
+    return await this.sendMessage(`whatsapp:${phoneNumber}`, message);
   }
 
   // Send emergency contact information

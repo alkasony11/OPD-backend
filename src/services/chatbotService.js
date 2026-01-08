@@ -143,9 +143,10 @@ class ChatbotService {
     // 8. Account help patterns - specific account/profile queries
     if ((msg.match(/\b(profile|account|password|family\s+member|patient\s+id|forgot)\b/) ||
         msg.match(/\b(how\s+to\s+)?(update|change|modify)\s+(profile|account|password|information)\b/) ||
-        msg.match(/\b(add|manage)\s+(family\s+member|family\s+members)\b/) ||
+        msg.match(/\b(add|manage)\s+(family\s+member|family\s+members|account)\b/) ||
         msg.match(/\b(patient\s+id|forgot\s+password|reset\s+password)\b/) ||
-        msg.match(/\b(update|change)\s+(my\s+)?(profile|account|password)\b/)) &&
+        msg.match(/\b(update|change)\s+(my\s+)?(profile|account|password)\b/) ||
+        msg.match(/\bmanage\s+account\b/)) &&
         !msg.match(/\b(appointment|booking|schedule)\b/)) {
       return 'account_help';
     }
@@ -565,6 +566,22 @@ class ChatbotService {
   handleAccountHelp(message) {
     const msg = message.toLowerCase();
     
+    // Handle "manage account" specifically
+    if (msg.includes('manage account') || msg.includes('manage my account')) {
+      return this.createResponse(
+        "I can help you manage your account! Here's what you can do:\n\n" +
+        "**Account Management Features:**\n" +
+        "• Update your personal information\n" +
+        "• Manage family members\n" +
+        "• Change your password\n" +
+        "• View your Patient ID\n" +
+        "• Update emergency contacts\n" +
+        "• Manage notification preferences\n\n" +
+        "Click here to access your account management: [Manage Account](/manage-account)",
+        'account_redirect'
+      );
+    }
+    
     if (msg.includes('profile') || msg.includes('update')) {
       return this.createResponse(
         "To update your profile:\n" +
@@ -572,8 +589,9 @@ class ChatbotService {
         "2. Click on 'Profile' or 'My Account'\n" +
         "3. Update the information you need\n" +
         "4. Click 'Save Changes'\n\n" +
-        "You can update your name, phone, address, emergency contact, and medical information.",
-        'help'
+        "You can update your name, phone, address, emergency contact, and medical information.\n\n" +
+        "Click here to manage your account: [Manage Account](/manage-account)",
+        'account_redirect'
       );
     }
     
@@ -585,8 +603,9 @@ class ChatbotService {
         "3. Click 'Add Family Member' to add someone\n" +
         "4. Fill in their details and medical history\n" +
         "5. You can book appointments for family members\n\n" +
-        "You can add parents, spouse, children, and other family members.",
-        'help'
+        "You can add parents, spouse, children, and other family members.\n\n" +
+        "Click here to manage your account: [Manage Account](/manage-account)",
+        'account_redirect'
       );
     }
     
@@ -598,8 +617,9 @@ class ChatbotService {
         "3. Enter your current password\n" +
         "4. Enter your new password\n" +
         "5. Confirm the new password\n\n" +
-        "If you forgot your password, click 'Forgot Password' on the login page.",
-        'help'
+        "If you forgot your password, click 'Forgot Password' on the login page.\n\n" +
+        "Click here to manage your account: [Manage Account](/manage-account)",
+        'account_redirect'
       );
     }
     
@@ -619,8 +639,9 @@ class ChatbotService {
       "• Changing your password\n" +
       "• Finding your Patient ID\n" +
       "• Account settings\n\n" +
+      "Click here to manage your account: [Manage Account](/manage-account)\n\n" +
       "What specific account help do you need?",
-      'help'
+      'account_redirect'
     );
   }
 

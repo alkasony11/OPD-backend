@@ -203,6 +203,17 @@ class RealtimeSyncService {
       this.io.to('doctor').emit('appointment-status-changed', eventData);
       this.io.to(`doctor-${doctorId}`).emit('your-appointment-updated', eventData);
 
+      // If this is a doctor join video event, notify the specific patient
+      if (appointmentData.type === 'doctor_joined_video' && appointmentData.patientId) {
+        this.io.to(`patient-${appointmentData.patientId}`).emit('your-appointment-updated', {
+          type: 'doctor_joined_video',
+          message: appointmentData.message,
+          meetingUrl: appointmentData.meetingUrl,
+          appointmentId: appointmentData.appointmentId,
+          timestamp: new Date()
+        });
+      }
+
       console.log(`📡 Appointment update broadcasted for doctor ${doctorId}:`, appointmentData);
     } catch (error) {
       console.error('Error emitting appointment update:', error);

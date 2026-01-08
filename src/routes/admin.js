@@ -113,7 +113,7 @@ router.get('/users', adminMiddleware, async (req, res) => {
     }
 
     const pageNum = Math.max(1, parseInt(page));
-    const pageSize = Math.max(1, Math.min(100, parseInt(limit)));
+    const pageSize = Math.max(1, Math.min(1000, parseInt(limit)));
 
     const total = await User.countDocuments(query);
     const users = await User.find(query)
@@ -490,11 +490,13 @@ router.get('/appointments', adminMiddleware, async (req, res) => {
     const rows = appointments.map(apt => ({
       id: apt._id,
       patientId: apt.family_member_id?.patientId || apt.patient_id?.patientId || null,
+      patient_id: apt.patient_id?._id || null,
       patientName: apt.family_member_id?.name || apt.patient_id?.name || 'Unknown',
       patientEmail: apt.patient_id?.email || '',
       patientPhone: apt.patient_id?.phone || '',
       linkedAccount: apt.family_member_id ? (apt.patient_id?.name || 'Main Account') : '',
       doctor: apt.doctor_id?.name || 'Unknown',
+      doctor_id: apt.doctor_id?._id || null,
       department: apt.department || apt.doctor_id?.doctor_info?.department?.name || 'Unknown',
       date: apt.booking_date,
       time: apt.time_slot || '',
@@ -1197,6 +1199,20 @@ router.put('/patients/:patientId/appointments/:appointmentId/cancel', adminMiddl
 
     await appointment.save();
 
+    // Send WhatsApp cancellation confirmation
+    const whatsappBotService = require('../services/whatsappBotService');
+    const refundInfo = {
+      eligible: appointment.payment_status === 'refunded',
+      amount: appointment.refund_amount || 0,
+      method: appointment.refund_method || 'original',
+      status: appointment.payment_status === 'refunded' ? 'processed' : 'none'
+    };
+    whatsappBotService.sendCancellationConfirmation(appointment._id, refundInfo).then(() => {
+      console.log('✅ WhatsApp cancellation confirmation sent successfully');
+    }).catch((error) => {
+      console.error('❌ Error sending WhatsApp cancellation confirmation:', error);
+    });
+
     // Realtime sync
     try {
       const io = req.app.get('io');
@@ -1250,6 +1266,10 @@ router.put('/patients/:patientId/appointments/:appointmentId/reschedule', adminM
       return res.status(403).json({ message: 'Appointment does not belong to this patient' });
     }
 
+    // Store old date and time for WhatsApp message
+    const oldDate = new Date(appointment.booking_date).toLocaleDateString();
+    const oldTime = appointment.time_slot;
+
     // Apply new schedule
     appointment.booking_date = new Date(appointmentDate);
     appointment.time_slot = appointmentTime;
@@ -1260,6 +1280,14 @@ router.put('/patients/:patientId/appointments/:appointmentId/reschedule', adminM
       appointment.cancelled_by = undefined;
     }
     await appointment.save();
+
+    // Send WhatsApp rescheduling confirmation
+    const whatsappBotService = require('../services/whatsappBotService');
+    whatsappBotService.sendReschedulingConfirmation(appointment._id, oldDate, oldTime).then(() => {
+      console.log('✅ WhatsApp rescheduling confirmation sent successfully');
+    }).catch((error) => {
+      console.error('❌ Error sending WhatsApp rescheduling confirmation:', error);
+    });
 
     res.json({ message: 'Appointment rescheduled successfully' });
   } catch (error) {

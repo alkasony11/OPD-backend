@@ -6,6 +6,45 @@ const DoctorSchedule = require('../models/DoctorSchedule');
 const { authMiddleware } = require('../middleware/authMiddleware');
 const { getSessionInfo, parseTime, generateSequentialTokenNumber } = require('../utils/bookingUtils');
 
+// Helper function to calculate sequential time slot based on token number
+function calculateSequentialTimeSlot(tokenNumber, sessionType, slotDuration) {
+  // Extract the numeric part from token number (e.g., T001 -> 1, T002 -> 2)
+  const tokenNum = parseInt(tokenNumber.replace('T', ''));
+  
+  // Define session start times
+  let sessionStartTime;
+  switch (sessionType) {
+    case 'morning':
+      sessionStartTime = '09:00';
+      break;
+    case 'afternoon':
+      sessionStartTime = '14:00';
+      break;
+    case 'evening':
+      sessionStartTime = '18:00';
+      break;
+    default:
+      sessionStartTime = '09:00';
+  }
+  
+  // Calculate the time slot based on token number and slot duration
+  // Token 1 = session start time, Token 2 = session start + slot duration, etc.
+  const totalMinutes = (tokenNum - 1) * slotDuration;
+  
+  // Parse session start time
+  const [startHours, startMinutes] = sessionStartTime.split(':').map(Number);
+  const startTimeInMinutes = startHours * 60 + startMinutes;
+  
+  // Calculate the actual time
+  const actualTimeInMinutes = startTimeInMinutes + totalMinutes;
+  
+  // Convert back to HH:MM format
+  const hours = Math.floor(actualTimeInMinutes / 60);
+  const minutes = actualTimeInMinutes % 60;
+  
+  return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
+}
+
 // Middleware to check if user is a receptionist
 const receptionistMiddleware = async (req, res, next) => {
   try {
@@ -270,6 +309,16 @@ router.patch('/appointments/:id/reschedule', authMiddleware, receptionistMiddlew
     .populate('patient_id', 'name email phone')
     .populate('doctor_id', 'name')
     .populate('family_member_id', 'name age relation');
+
+    // Send WhatsApp rescheduling confirmation
+    const whatsappBotService = require('../services/whatsappBotService');
+    const oldDate = new Date(appointment.booking_date).toLocaleDateString();
+    const oldTime = appointment.time_slot;
+    whatsappBotService.sendReschedulingConfirmation(updatedAppointment._id, oldDate, oldTime).then(() => {
+      console.log('✅ WhatsApp rescheduling confirmation sent successfully');
+    }).catch((error) => {
+      console.error('❌ Error sending WhatsApp rescheduling confirmation:', error);
+    });
 
     res.json({ 
       message: 'Appointment rescheduled successfully',
@@ -561,10 +610,11 @@ router.post('/appointments', authMiddleware, receptionistMiddleware, async (req,
       });
     }
 
-    // Block multiple active appointments in the same department (for self or same family member)
+    // Block multiple active appointments in the same department on the same date (for self or same family member)
     const activeSameDepartmentQuery = {
       patient_id: patientId,
       department: department.name,
+      booking_date: { $gte: selectedDate, $lt: endOfDay }, // Add date check
       status: { $in: ['booked', 'in_queue'] }
     };
     if (familyMemberId && familyMemberId !== 'self') {
@@ -575,7 +625,7 @@ router.post('/appointments', authMiddleware, receptionistMiddleware, async (req,
     const existingActiveSameDept = await Token.findOne(activeSameDepartmentQuery);
     if (existingActiveSameDept) {
       return res.status(400).json({
-        message: 'Cannot book another appointment in the same department until the current one is completed or cancelled'
+        message: 'Cannot book another appointment in the same department on the same date until the current one is completed or cancelled'
       });
     }
 
@@ -595,7 +645,12 @@ router.post('/appointments', authMiddleware, receptionistMiddleware, async (req,
     const sessionType = sessionInfo.type;
 
     // Generate sequential token number based on session type
-    const tokenNumber = await generateSequentialTokenNumber(doctorId, selectedDate, sessionType);
+    const tokenNumber = await generateSequentialTokenNumber(doctorId, selectedDate, sessionType, patientId, familyMemberObjectId);
+
+    // Calculate sequential time slot based on token number and slot duration
+    const slotDuration = schedule?.slot_duration || 30;
+    const sequentialTimeSlot = calculateSequentialTimeSlot(tokenNumber, sessionType, slotDuration);
+    console.log(`[RECEPTIONIST-BOOK] Token: ${tokenNumber}, Original time: ${appointmentTime}, Sequential time: ${sequentialTimeSlot}`);
 
     // Create appointment
     const appointment = new Token({
@@ -607,7 +662,7 @@ router.post('/appointments', authMiddleware, receptionistMiddleware, async (req,
       department: department.name,
       symptoms: symptoms && String(symptoms).trim().length > 0 ? symptoms : 'Not provided',
       booking_date: selectedDate,
-      time_slot: appointmentTime,
+      time_slot: sequentialTimeSlot,
       status: 'booked',
       token_number: tokenNumber,
       payment_status: 'pending',
@@ -625,6 +680,14 @@ router.post('/appointments', authMiddleware, receptionistMiddleware, async (req,
       patientId,
       { $push: { 'patient_info.booking_history': appointment._id } }
     );
+
+    // Send WhatsApp confirmation
+    const whatsappBotService = require('../services/whatsappBotService');
+    whatsappBotService.sendBookingConfirmation(appointment._id).then(() => {
+      console.log('✅ WhatsApp booking confirmation sent successfully');
+    }).catch((error) => {
+      console.error('❌ Error sending WhatsApp booking confirmation:', error);
+    });
 
     res.status(201).json({
       message: 'Appointment created successfully',
@@ -736,6 +799,368 @@ router.patch('/billing/appointments/:id/payment', authMiddleware, receptionistMi
       return res.status(404).json({ message: 'Appointment not found' });
     }
 
+    // Send automatic invoice email if payment status is 'paid'
+    let invoiceSent = false;
+    if (paymentStatus === 'paid') {
+      try {
+        console.log('🔍 Receptionist payment - Sending automatic invoice email for appointment:', id);
+        
+        const invoiceData = {
+          invoiceNumber: `INV-${appointment.token_number || appointment._id.toString().slice(-6)}`,
+          date: appointment.createdAt.toLocaleDateString('en-IN'),
+          patientName: appointment.family_member_id ? appointment.family_member_id.name : appointment.patient_id.name,
+          patientEmail: appointment.patient_id.email,
+          doctorName: appointment.doctor_id?.name || 'Unknown Doctor',
+          department: appointment.department,
+          appointmentDate: appointment.booking_date.toLocaleDateString('en-IN'),
+          timeSlot: appointment.time_slot,
+          amount: appointment.paid_amount || 500,
+          status: 'paid',
+          transactionId: appointment.payment_reference || `PAY${Date.now().toString().slice(-8)}`,
+          currentDate: new Date().toLocaleDateString('en-IN'),
+          currentTime: new Date().toLocaleTimeString('en-IN')
+        };
+
+        // Generate professional HTML content for PDF (same as patient route)
+        const htmlContent = `
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <title>Invoice ${invoiceData.invoiceNumber}</title>
+            <style>
+                * { margin: 0; padding: 0; box-sizing: border-box; }
+                body { 
+                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+                    line-height: 1.6; 
+                    color: #333; 
+                    background: #fff;
+                    font-size: 14px;
+                    padding: 20px;
+                }
+                .invoice-container { 
+                    max-width: 800px; 
+                    margin: 0 auto; 
+                    background: white; 
+                    box-shadow: 0 0 20px rgba(0,0,0,0.1); 
+                    border-radius: 8px; 
+                    overflow: hidden;
+                }
+                .header { 
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+                    color: white; 
+                    padding: 30px; 
+                    text-align: center; 
+                }
+                .header h1 { 
+                    font-size: 28px; 
+                    margin-bottom: 10px; 
+                    font-weight: 700; 
+                }
+                .header p { 
+                    font-size: 16px; 
+                    opacity: 0.9; 
+                }
+                .invoice-details { 
+                    padding: 30px; 
+                    background: #f8fafc; 
+                    border-bottom: 1px solid #e2e8f0; 
+                }
+                .invoice-number { 
+                    font-size: 24px; 
+                    font-weight: 700; 
+                    color: #1f2937; 
+                    margin-bottom: 20px; 
+                }
+                .invoice-meta { 
+                    display: grid; 
+                    grid-template-columns: 1fr 1fr; 
+                    gap: 20px; 
+                    margin-bottom: 20px; 
+                }
+                .meta-item { 
+                    background: white; 
+                    padding: 15px; 
+                    border-radius: 6px; 
+                    border-left: 4px solid #3b82f6; 
+                }
+                .meta-label { 
+                    font-size: 12px; 
+                    color: #6b7280; 
+                    text-transform: uppercase; 
+                    font-weight: 600; 
+                    margin-bottom: 5px; 
+                }
+                .meta-value { 
+                    font-size: 16px; 
+                    color: #1f2937; 
+                    font-weight: 600; 
+                }
+                .content { 
+                    padding: 30px; 
+                }
+                .section { 
+                    margin-bottom: 30px; 
+                }
+                .section-title { 
+                    font-size: 18px; 
+                    font-weight: 700; 
+                    color: #1f2937; 
+                    margin-bottom: 20px; 
+                    border-bottom: 2px solid #e5e7eb; 
+                    padding-bottom: 8px; 
+                }
+                .info-grid { 
+                    display: grid; 
+                    grid-template-columns: 1fr 1fr; 
+                    gap: 30px; 
+                    margin-bottom: 25px; 
+                }
+                .info-item { 
+                    padding: 15px;
+                    background: #f9fafb;
+                    border-radius: 6px;
+                    border-left: 4px solid #2563eb;
+                }
+                .info-label { 
+                    font-size: 11px; 
+                    color: #6b7280; 
+                    text-transform: uppercase; 
+                    font-weight: 600; 
+                    margin-bottom: 5px; 
+                }
+                .info-value { 
+                    font-size: 14px; 
+                    color: #1f2937; 
+                    font-weight: 600; 
+                }
+                .amount-section { 
+                    background: #f0f9ff; 
+                    padding: 25px; 
+                    border-radius: 8px; 
+                    border: 2px solid #0ea5e9; 
+                    text-align: center; 
+                    margin: 30px 0; 
+                }
+                .amount-label { 
+                    font-size: 14px; 
+                    color: #0369a1; 
+                    margin-bottom: 10px; 
+                    font-weight: 600; 
+                }
+                .amount-value { 
+                    font-size: 32px; 
+                    color: #0c4a6e; 
+                    font-weight: 800; 
+                    margin-bottom: 5px; 
+                }
+                .amount-currency { 
+                    font-size: 16px; 
+                    color: #0369a1; 
+                    font-weight: 600; 
+                }
+                .status-badge { 
+                    display: inline-block; 
+                    padding: 8px 16px; 
+                    border-radius: 20px; 
+                    font-size: 12px; 
+                    font-weight: 600; 
+                    text-transform: uppercase; 
+                    margin-top: 10px; 
+                }
+                .status-paid { 
+                    background: #dcfce7; 
+                    color: #166534; 
+                }
+                .footer { 
+                    background: #1f2937; 
+                    color: white; 
+                    padding: 25px; 
+                    text-align: center; 
+                }
+                .footer p { 
+                    margin-bottom: 10px; 
+                    opacity: 0.8; 
+                }
+                .footer .highlight { 
+                    color: #60a5fa; 
+                    font-weight: 600; 
+                }
+            </style>
+        </head>
+        <body>
+            <div class="invoice-container">
+                <div class="header">
+                    <h1>Medical Invoice</h1>
+                    <p>Professional Healthcare Services</p>
+                </div>
+                
+                <div class="invoice-details">
+                    <div class="invoice-number">Invoice #${invoiceData.invoiceNumber}</div>
+                    <div class="invoice-meta">
+                        <div class="meta-item">
+                            <div class="meta-label">Invoice Date</div>
+                            <div class="meta-value">${invoiceData.currentDate}</div>
+                        </div>
+                        <div class="meta-item">
+                            <div class="meta-label">Transaction ID</div>
+                            <div class="meta-value">${invoiceData.transactionId}</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="content">
+                    <div class="section">
+                        <div class="section-title">Patient Information</div>
+                        <div class="info-grid">
+                            <div class="info-item">
+                                <div class="info-label">Patient Name</div>
+                                <div class="info-value">${invoiceData.patientName}</div>
+                            </div>
+                            <div class="info-item">
+                                <div class="info-label">Email Address</div>
+                                <div class="info-value">${invoiceData.patientEmail}</div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="section">
+                        <div class="section-title">Appointment Details</div>
+                        <div class="info-grid">
+                            <div class="info-item">
+                                <div class="info-label">Doctor</div>
+                                <div class="info-value">Dr. ${invoiceData.doctorName}</div>
+                            </div>
+                            <div class="info-item">
+                                <div class="info-label">Department</div>
+                                <div class="info-value">${invoiceData.department}</div>
+                            </div>
+                            <div class="info-item">
+                                <div class="info-label">Appointment Date</div>
+                                <div class="info-value">${invoiceData.appointmentDate}</div>
+                            </div>
+                            <div class="info-item">
+                                <div class="info-label">Time Slot</div>
+                                <div class="info-value">${invoiceData.timeSlot}</div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="amount-section">
+                        <div class="amount-label">Total Amount</div>
+                        <div class="amount-value">₹${invoiceData.amount}</div>
+                        <div class="amount-currency">Indian Rupees</div>
+                        <div class="status-badge status-paid">PAID</div>
+                    </div>
+                </div>
+                
+                <div class="footer">
+                    <p>Thank you for choosing our healthcare services!</p>
+                    <p>For any queries, please contact our support team.</p>
+                    <p>Generated on <span class="highlight">${invoiceData.currentDate}</span> at <span class="highlight">${invoiceData.currentTime}</span></p>
+                </div>
+            </div>
+        </body>
+        </html>
+        `;
+
+        // Generate PDF using Puppeteer
+        const puppeteer = require('puppeteer');
+        let browser = await puppeteer.launch({
+          headless: true,
+          args: ['--no-sandbox', '--disable-setuid-sandbox']
+        });
+        
+        const page = await browser.newPage();
+        await page.setContent(htmlContent, { waitUntil: 'networkidle0' });
+        
+        const pdfBuffer = await page.pdf({
+          format: 'A4',
+          printBackground: true,
+          margin: {
+            top: '20px',
+            right: '20px',
+            bottom: '20px',
+            left: '20px'
+          }
+        });
+
+        await browser.close();
+
+        // Send email with PDF attachment
+        const emailService = require('../services/emailService');
+        await emailService.sendEmail({
+          to: appointment.patient_id.email,
+          subject: `Payment Confirmation & Invoice ${invoiceData.invoiceNumber} - MediQ Healthcare Services`,
+          html: `
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+              <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 10px 10px 0 0; text-align: center;">
+                <h1 style="margin: 0; font-size: 24px;">Payment Successful! 🎉</h1>
+                <p style="margin: 10px 0 0 0; opacity: 0.9;">Your payment has been processed successfully</p>
+              </div>
+              
+              <div style="background: white; padding: 30px; border-radius: 0 0 10px 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+                <div style="text-align: center; margin-bottom: 30px;">
+                  <div style="width: 80px; height: 80px; background: #dcfce7; border-radius: 50%; margin: 0 auto 20px; display: flex; align-items: center; justify-content: center;">
+                    <span style="font-size: 32px;">✅</span>
+                  </div>
+                  <h2 style="color: #1f2937; margin: 0 0 10px 0;">Payment Confirmed</h2>
+                  <p style="color: #6b7280; margin: 0;">Your payment of ₹${invoiceData.amount} has been successfully processed.</p>
+                </div>
+                
+                <div class="invoice-details" style="background: #f9fafb; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
+                  <h3 style="color: #1f2937; margin: 0 0 15px 0;">📋 Payment Details</h3>
+                  <p style="margin: 5px 0; color: #374151;"><strong>Invoice Number:</strong> ${invoiceData.invoiceNumber}</p>
+                  <p style="margin: 5px 0; color: #374151;"><strong>Patient:</strong> ${invoiceData.patientName}</p>
+                  <p style="margin: 5px 0; color: #374151;"><strong>Doctor:</strong> Dr. ${invoiceData.doctorName}</p>
+                  <p style="margin: 5px 0; color: #374151;"><strong>Department:</strong> ${invoiceData.department}</p>
+                  <p style="margin: 5px 0; color: #374151;"><strong>Date:</strong> ${invoiceData.appointmentDate}</p>
+                  <p style="margin: 5px 0; color: #374151;"><strong>Time:</strong> ${invoiceData.timeSlot}</p>
+                  <p style="margin: 5px 0; color: #374151;"><strong>Amount Paid:</strong> ₹${invoiceData.amount}</p>
+                  <p style="margin: 5px 0; color: #374151;"><strong>Transaction ID:</strong> ${invoiceData.transactionId}</p>
+                  <p style="margin: 5px 0; color: #374151;"><strong>Status:</strong> <span style="color: #16a34a;">PAID</span></p>
+                </div>
+                
+                <div style="background: #dbeafe; border: 1px solid #3b82f6; border-radius: 8px; padding: 15px; margin-bottom: 20px;">
+                  <h4 style="color: #1e40af; margin: 0 0 10px 0;">📄 Invoice Attached</h4>
+                  <p style="color: #1e40af; margin: 0;">Your detailed invoice has been attached to this email as a PDF document.</p>
+                  <p style="color: #1e40af; margin: 5px 0 0 0; font-size: 14px;">You can download and save it for your records.</p>
+                </div>
+                
+                <div style="background: #fef3c7; border: 1px solid #f59e0b; border-radius: 8px; padding: 15px; margin-bottom: 20px;">
+                  <h4 style="color: #92400e; margin: 0 0 10px 0;">📅 Next Steps</h4>
+                  <ul style="color: #92400e; margin: 0; padding-left: 20px;">
+                    <li>Your appointment is confirmed for ${invoiceData.appointmentDate} at ${invoiceData.timeSlot}</li>
+                    <li>Please arrive 15 minutes before your scheduled time</li>
+                    <li>Bring a valid ID and any relevant medical documents</li>
+                    <li>Contact us if you need to reschedule or have any questions</li>
+                  </ul>
+                </div>
+                
+                <div style="text-align: center; margin-top: 30px;">
+                  <p style="color: #6b7280; font-size: 14px;">Thank you for choosing MediQ for your healthcare needs.</p>
+                  <p style="color: #6b7280; font-size: 14px;">If you have any questions, please contact our support team.</p>
+                </div>
+              </div>
+            </div>
+          `,
+          attachments: [
+            {
+              filename: `Invoice-${invoiceData.invoiceNumber}.pdf`,
+              content: pdfBuffer,
+              contentType: 'application/pdf'
+            }
+          ]
+        });
+
+        console.log('✅ Receptionist payment - Invoice email sent successfully to:', appointment.patient_id.email);
+        invoiceSent = true;
+      } catch (emailError) {
+        console.error('❌ Receptionist payment - Failed to send automatic invoice email:', emailError);
+        // Don't fail the payment process if email fails
+      }
+    }
+
     res.json({
       message: 'Payment status updated successfully',
       appointment: {
@@ -746,7 +1171,8 @@ router.patch('/billing/appointments/:id/payment', authMiddleware, receptionistMi
         paymentStatus: appointment.payment_status,
         paidAmount: appointment.paid_amount,
         paymentMethod: appointment.payment_method
-      }
+      },
+      invoiceSent: invoiceSent
     });
   } catch (error) {
     console.error('Update payment status error:', error);

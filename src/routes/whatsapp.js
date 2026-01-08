@@ -227,6 +227,105 @@ router.post('/send-hospital-info', async (req, res) => {
   }
 });
 
+// Send rescheduling confirmation
+router.post('/send-rescheduling/:appointmentId', async (req, res) => {
+  try {
+    const { appointmentId } = req.params;
+    const { oldDate, oldTime } = req.body;
+    
+    if (!oldDate || !oldTime) {
+      return res.status(400).json({ error: 'Old date and time are required' });
+    }
+    
+    const result = await whatsappBotService.sendReschedulingConfirmation(appointmentId, oldDate, oldTime);
+    
+    res.json({
+      success: true,
+      message: 'Rescheduling confirmation sent successfully',
+      result
+    });
+  } catch (error) {
+    console.error('Send rescheduling confirmation error:', error);
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to send rescheduling confirmation'
+    });
+  }
+});
+
+// Send leave cancellation
+router.post('/send-leave-cancellation/:appointmentId', async (req, res) => {
+  try {
+    const { appointmentId } = req.params;
+    const { leaveInfo } = req.body;
+    
+    const result = await whatsappBotService.sendLeaveCancellation(appointmentId, leaveInfo);
+    
+    res.json({
+      success: true,
+      message: 'Leave cancellation notification sent successfully',
+      result
+    });
+  } catch (error) {
+    console.error('Send leave cancellation error:', error);
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to send leave cancellation notification'
+    });
+  }
+});
+
+// Send welcome message to new user
+router.post('/send-welcome', async (req, res) => {
+  try {
+    const { phoneNumber, patientName } = req.body;
+    
+    if (!phoneNumber || !patientName) {
+      return res.status(400).json({ error: 'Phone number and patient name are required' });
+    }
+    
+    const result = await whatsappBotService.sendWelcomeMessage(phoneNumber, patientName);
+    
+    res.json({
+      success: true,
+      message: 'Welcome message sent successfully',
+      result
+    });
+  } catch (error) {
+    console.error('Send welcome message error:', error);
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to send welcome message'
+    });
+  }
+});
+
+// Send appointment status update
+router.post('/send-status-update/:appointmentId', async (req, res) => {
+  try {
+    const { appointmentId } = req.params;
+    const { status, additionalInfo } = req.body;
+    
+    if (!status) {
+      return res.status(400).json({ error: 'Status is required' });
+    }
+    
+    const result = await whatsappBotService.sendAppointmentStatusUpdate(appointmentId, status, additionalInfo);
+    
+    res.json({
+      success: true,
+      message: 'Appointment status update sent successfully',
+      result
+    });
+  } catch (error) {
+    console.error('Send appointment status update error:', error);
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to send appointment status update'
+    });
+  }
+});
+
 // Get WhatsApp bot status
 router.get('/status', (req, res) => {
   res.json({
@@ -238,9 +337,13 @@ router.get('/status', (req, res) => {
       'Send appointment reminders',
       'Send booking confirmations',
       'Send cancellation confirmations',
+      'Send rescheduling confirmations',
+      'Send leave cancellation notifications',
       'Send queue updates',
       'Send emergency information',
-      'Send hospital information'
+      'Send hospital information',
+      'Send welcome messages',
+      'Send appointment status updates'
     ]
   });
 });
