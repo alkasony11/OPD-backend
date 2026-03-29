@@ -1,0 +1,7 @@
+{
+  "sinu_id": "68f665a6574fa2c4b6bbcdbe",
+  "sinu_patient_id": "68f663de574fa2c4b6bbcd53",
+  "sinu_owner": "Albeena",
+  "albeena_id": "68f663de574fa2c4b6bbcd53",
+  "ashna_id": "68f5c483b460d171676b35b6"
+}
